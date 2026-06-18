@@ -1,0 +1,4 @@
+stage,total_steps,full_forwards,skips,rejections,rejection_rate,mean_residual_at_rejection,max_residual_at_rejection,max_skip_rejects,threshold_rejects
+Early (Noise),16,4,12,3,0.188,0.05129,0.053315,3,0
+Middle (Structure),16,4,12,4,0.25,0.053825,0.05508,4,0
+Late (Details),18,5,13,5,0.278,0.08421,0.123703,4,1

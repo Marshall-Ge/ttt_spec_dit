@@ -1,0 +1,96 @@
+{
+  "config": {
+    "gamma": 0.1,
+    "max_skip": 3,
+    "total_full_forwards": 13,
+    "total_skips": 37,
+    "total_rejections": 12,
+    "skip_ratio": 0.74
+  },
+  "rejections": [
+    {
+      "step": 4,
+      "timestep": 919,
+      "reason": "max_skip",
+      "residual": 0.05035942420363426,
+      "consecutive_skips_before_reject": 3
+    },
+    {
+      "step": 8,
+      "timestep": 839,
+      "reason": "max_skip",
+      "residual": 0.050194431096315384,
+      "consecutive_skips_before_reject": 3
+    },
+    {
+      "step": 12,
+      "timestep": 759,
+      "reason": "max_skip",
+      "residual": 0.05331509932875633,
+      "consecutive_skips_before_reject": 3
+    },
+    {
+      "step": 16,
+      "timestep": 679,
+      "reason": "max_skip",
+      "residual": 0.05507989972829819,
+      "consecutive_skips_before_reject": 3
+    },
+    {
+      "step": 20,
+      "timestep": 599,
+      "reason": "max_skip",
+      "residual": 0.053483180701732635,
+      "consecutive_skips_before_reject": 3
+    },
+    {
+      "step": 24,
+      "timestep": 519,
+      "reason": "max_skip",
+      "residual": 0.05279499664902687,
+      "consecutive_skips_before_reject": 3
+    },
+    {
+      "step": 28,
+      "timestep": 440,
+      "reason": "max_skip",
+      "residual": 0.053941383957862854,
+      "consecutive_skips_before_reject": 3
+    },
+    {
+      "step": 32,
+      "timestep": 360,
+      "reason": "max_skip",
+      "residual": 0.058480896055698395,
+      "consecutive_skips_before_reject": 3
+    },
+    {
+      "step": 36,
+      "timestep": 280,
+      "reason": "max_skip",
+      "residual": 0.06586791574954987,
+      "consecutive_skips_before_reject": 3
+    },
+    {
+      "step": 40,
+      "timestep": 200,
+      "reason": "max_skip",
+      "residual": 0.0780104473233223,
+      "consecutive_skips_before_reject": 3
+    },
+    {
+      "step": 44,
+      "timestep": 120,
+      "reason": "max_skip",
+      "residual": 0.09498909115791321,
+      "consecutive_skips_before_reject": 3
+    },
+    {
+      "step": 48,
+      "timestep": 40,
+      "reason": "residual_threshold",
+      "residual": 0.12370344996452332,
+      "consecutive_skips_before_reject": 3
+    }
+  ]
+}

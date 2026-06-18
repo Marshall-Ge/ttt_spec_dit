@@ -1,6 +1,6 @@
 models/
 data/
-output/
+**/*.png
 
 **/__pycache__
 .DS_Store

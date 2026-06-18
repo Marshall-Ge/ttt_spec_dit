@@ -1,0 +1,452 @@
+[
+  {
+    "step": 0,
+    "timestep": 999,
+    "stage": "Early (Noise)",
+    "decision": "full_forward",
+    "latency_ms": 34.97,
+    "residual": null,
+    "consecutive_skips": 0
+  },
+  {
+    "step": 1,
+    "timestep": 979,
+    "stage": "Early (Noise)",
+    "decision": "skip",
+    "latency_ms": 55.71,
+    "residual": 0.01186316,
+    "consecutive_skips": 1
+  },
+  {
+    "step": 2,
+    "timestep": 959,
+    "stage": "Early (Noise)",
+    "decision": "skip",
+    "latency_ms": 47.78,
+    "residual": 0.02250074,
+    "consecutive_skips": 2
+  },
+  {
+    "step": 3,
+    "timestep": 939,
+    "stage": "Early (Noise)",
+    "decision": "skip",
+    "latency_ms": 48.36,
+    "residual": 0.03560269,
+    "consecutive_skips": 3
+  },
+  {
+    "step": 4,
+    "timestep": 919,
+    "stage": "Early (Noise)",
+    "decision": "rejection",
+    "latency_ms": 33.11,
+    "residual": 0.05035942,
+    "consecutive_skips": 0
+  },
+  {
+    "step": 5,
+    "timestep": 899,
+    "stage": "Early (Noise)",
+    "decision": "skip",
+    "latency_ms": 47.38,
+    "residual": 0.01302885,
+    "consecutive_skips": 1
+  },
+  {
+    "step": 6,
+    "timestep": 879,
+    "stage": "Early (Noise)",
+    "decision": "skip",
+    "latency_ms": 47.37,
+    "residual": 0.02645767,
+    "consecutive_skips": 2
+  },
+  {
+    "step": 7,
+    "timestep": 859,
+    "stage": "Early (Noise)",
+    "decision": "skip",
+    "latency_ms": 49.23,
+    "residual": 0.04287998,
+    "consecutive_skips": 3
+  },
+  {
+    "step": 8,
+    "timestep": 839,
+    "stage": "Early (Noise)",
+    "decision": "rejection",
+    "latency_ms": 34.01,
+    "residual": 0.05019443,
+    "consecutive_skips": 0
+  },
+  {
+    "step": 9,
+    "timestep": 819,
+    "stage": "Early (Noise)",
+    "decision": "skip",
+    "latency_ms": 47.74,
+    "residual": 0.01255828,
+    "consecutive_skips": 1
+  },
+  {
+    "step": 10,
+    "timestep": 799,
+    "stage": "Early (Noise)",
+    "decision": "skip",
+    "latency_ms": 47.62,
+    "residual": 0.02638792,
+    "consecutive_skips": 2
+  },
+  {
+    "step": 11,
+    "timestep": 779,
+    "stage": "Early (Noise)",
+    "decision": "skip",
+    "latency_ms": 47.3,
+    "residual": 0.03936844,
+    "consecutive_skips": 3
+  },
+  {
+    "step": 12,
+    "timestep": 759,
+    "stage": "Early (Noise)",
+    "decision": "rejection",
+    "latency_ms": 34.54,
+    "residual": 0.0533151,
+    "consecutive_skips": 0
+  },
+  {
+    "step": 13,
+    "timestep": 739,
+    "stage": "Early (Noise)",
+    "decision": "skip",
+    "latency_ms": 47.98,
+    "residual": 0.01430113,
+    "consecutive_skips": 1
+  },
+  {
+    "step": 14,
+    "timestep": 719,
+    "stage": "Early (Noise)",
+    "decision": "skip",
+    "latency_ms": 47.13,
+    "residual": 0.02741539,
+    "consecutive_skips": 2
+  },
+  {
+    "step": 15,
+    "timestep": 699,
+    "stage": "Early (Noise)",
+    "decision": "skip",
+    "latency_ms": 47.52,
+    "residual": 0.04094896,
+    "consecutive_skips": 3
+  },
+  {
+    "step": 16,
+    "timestep": 679,
+    "stage": "Middle (Structure)",
+    "decision": "rejection",
+    "latency_ms": 32.87,
+    "residual": 0.0550799,
+    "consecutive_skips": 0
+  },
+  {
+    "step": 17,
+    "timestep": 659,
+    "stage": "Middle (Structure)",
+    "decision": "skip",
+    "latency_ms": 48.48,
+    "residual": 0.01325044,
+    "consecutive_skips": 1
+  },
+  {
+    "step": 18,
+    "timestep": 639,
+    "stage": "Middle (Structure)",
+    "decision": "skip",
+    "latency_ms": 47.24,
+    "residual": 0.02558913,
+    "consecutive_skips": 2
+  },
+  {
+    "step": 19,
+    "timestep": 619,
+    "stage": "Middle (Structure)",
+    "decision": "skip",
+    "latency_ms": 46.79,
+    "residual": 0.03933124,
+    "consecutive_skips": 3
+  },
+  {
+    "step": 20,
+    "timestep": 599,
+    "stage": "Middle (Structure)",
+    "decision": "rejection",
+    "latency_ms": 32.83,
+    "residual": 0.05348318,
+    "consecutive_skips": 0
+  },
+  {
+    "step": 21,
+    "timestep": 579,
+    "stage": "Middle (Structure)",
+    "decision": "skip",
+    "latency_ms": 47.3,
+    "residual": 0.01353563,
+    "consecutive_skips": 1
+  },
+  {
+    "step": 22,
+    "timestep": 559,
+    "stage": "Middle (Structure)",
+    "decision": "skip",
+    "latency_ms": 48.53,
+    "residual": 0.02597779,
+    "consecutive_skips": 2
+  },
+  {
+    "step": 23,
+    "timestep": 539,
+    "stage": "Middle (Structure)",
+    "decision": "skip",
+    "latency_ms": 47.62,
+    "residual": 0.03910054,
+    "consecutive_skips": 3
+  },
+  {
+    "step": 24,
+    "timestep": 519,
+    "stage": "Middle (Structure)",
+    "decision": "rejection",
+    "latency_ms": 33.07,
+    "residual": 0.052795,
+    "consecutive_skips": 0
+  },
+  {
+    "step": 25,
+    "timestep": 500,
+    "stage": "Middle (Structure)",
+    "decision": "skip",
+    "latency_ms": 47.23,
+    "residual": 0.01296082,
+    "consecutive_skips": 1
+  },
+  {
+    "step": 26,
+    "timestep": 480,
+    "stage": "Middle (Structure)",
+    "decision": "skip",
+    "latency_ms": 47.0,
+    "residual": 0.02591213,
+    "consecutive_skips": 2
+  },
+  {
+    "step": 27,
+    "timestep": 460,
+    "stage": "Middle (Structure)",
+    "decision": "skip",
+    "latency_ms": 48.61,
+    "residual": 0.03993466,
+    "consecutive_skips": 3
+  },
+  {
+    "step": 28,
+    "timestep": 440,
+    "stage": "Middle (Structure)",
+    "decision": "rejection",
+    "latency_ms": 35.23,
+    "residual": 0.05394138,
+    "consecutive_skips": 0
+  },
+  {
+    "step": 29,
+    "timestep": 420,
+    "stage": "Middle (Structure)",
+    "decision": "skip",
+    "latency_ms": 47.35,
+    "residual": 0.0143293,
+    "consecutive_skips": 1
+  },
+  {
+    "step": 30,
+    "timestep": 400,
+    "stage": "Middle (Structure)",
+    "decision": "skip",
+    "latency_ms": 47.36,
+    "residual": 0.02761163,
+    "consecutive_skips": 2
+  },
+  {
+    "step": 31,
+    "timestep": 380,
+    "stage": "Middle (Structure)",
+    "decision": "skip",
+    "latency_ms": 47.83,
+    "residual": 0.0423799,
+    "consecutive_skips": 3
+  },
+  {
+    "step": 32,
+    "timestep": 360,
+    "stage": "Late (Details)",
+    "decision": "rejection",
+    "latency_ms": 33.34,
+    "residual": 0.0584809,
+    "consecutive_skips": 0
+  },
+  {
+    "step": 33,
+    "timestep": 340,
+    "stage": "Late (Details)",
+    "decision": "skip",
+    "latency_ms": 47.02,
+    "residual": 0.0160733,
+    "consecutive_skips": 1
+  },
+  {
+    "step": 34,
+    "timestep": 320,
+    "stage": "Late (Details)",
+    "decision": "skip",
+    "latency_ms": 48.23,
+    "residual": 0.03175794,
+    "consecutive_skips": 2
+  },
+  {
+    "step": 35,
+    "timestep": 300,
+    "stage": "Late (Details)",
+    "decision": "skip",
+    "latency_ms": 47.43,
+    "residual": 0.04794878,
+    "consecutive_skips": 3
+  },
+  {
+    "step": 36,
+    "timestep": 280,
+    "stage": "Late (Details)",
+    "decision": "rejection",
+    "latency_ms": 33.98,
+    "residual": 0.06586792,
+    "consecutive_skips": 0
+  },
+  {
+    "step": 37,
+    "timestep": 260,
+    "stage": "Late (Details)",
+    "decision": "skip",
+    "latency_ms": 47.63,
+    "residual": 0.01829103,
+    "consecutive_skips": 1
+  },
+  {
+    "step": 38,
+    "timestep": 240,
+    "stage": "Late (Details)",
+    "decision": "skip",
+    "latency_ms": 47.43,
+    "residual": 0.03651983,
+    "consecutive_skips": 2
+  },
+  {
+    "step": 39,
+    "timestep": 220,
+    "stage": "Late (Details)",
+    "decision": "skip",
+    "latency_ms": 48.94,
+    "residual": 0.05664951,
+    "consecutive_skips": 3
+  },
+  {
+    "step": 40,
+    "timestep": 200,
+    "stage": "Late (Details)",
+    "decision": "rejection",
+    "latency_ms": 33.19,
+    "residual": 0.07801045,
+    "consecutive_skips": 0
+  },
+  {
+    "step": 41,
+    "timestep": 180,
+    "stage": "Late (Details)",
+    "decision": "skip",
+    "latency_ms": 47.76,
+    "residual": 0.02165103,
+    "consecutive_skips": 1
+  },
+  {
+    "step": 42,
+    "timestep": 160,
+    "stage": "Late (Details)",
+    "decision": "skip",
+    "latency_ms": 48.02,
+    "residual": 0.04397756,
+    "consecutive_skips": 2
+  },
+  {
+    "step": 43,
+    "timestep": 140,
+    "stage": "Late (Details)",
+    "decision": "skip",
+    "latency_ms": 48.95,
+    "residual": 0.06826271,
+    "consecutive_skips": 3
+  },
+  {
+    "step": 44,
+    "timestep": 120,
+    "stage": "Late (Details)",
+    "decision": "rejection",
+    "latency_ms": 32.98,
+    "residual": 0.09498909,
+    "consecutive_skips": 0
+  },
+  {
+    "step": 45,
+    "timestep": 100,
+    "stage": "Late (Details)",
+    "decision": "skip",
+    "latency_ms": 49.36,
+    "residual": 0.02568631,
+    "consecutive_skips": 1
+  },
+  {
+    "step": 46,
+    "timestep": 80,
+    "stage": "Late (Details)",
+    "decision": "skip",
+    "latency_ms": 47.36,
+    "residual": 0.05426018,
+    "consecutive_skips": 2
+  },
+  {
+    "step": 47,
+    "timestep": 60,
+    "stage": "Late (Details)",
+    "decision": "skip",
+    "latency_ms": 47.49,
+    "residual": 0.08702952,
+    "consecutive_skips": 3
+  },
+  {
+    "step": 48,
+    "timestep": 40,
+    "stage": "Late (Details)",
+    "decision": "rejection",
+    "latency_ms": 34.25,
+    "residual": 0.12370345,
+    "consecutive_skips": 0
+  },
+  {
+    "step": 49,
+    "timestep": 20,
+    "stage": "Late (Details)",
+    "decision": "skip",
+    "latency_ms": 48.22,
+    "residual": 0.03921314,
+    "consecutive_skips": 1
+  }
+]
