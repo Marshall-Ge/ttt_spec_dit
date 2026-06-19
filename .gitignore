@@ -1,7 +1,8 @@
-models/
-data/
 **/*.png
-
+**/*.jpg
 **/__pycache__
 .DS_Store
 .vscode/
+*.pdf
+**/__trash__
+output/
