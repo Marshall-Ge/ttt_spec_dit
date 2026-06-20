@@ -53,7 +53,7 @@ class FIDISComputer(Metric):
         """
         self._init_dirs()
         if image.dim() == 4:
-            image = image.squeeze(0)
+            image = image[0]
         # Resize to 299×299 if needed
         if image.shape[-1] != 299 or image.shape[-2] != 299:
             pil = Image.fromarray(

@@ -2,7 +2,7 @@
 """Abstract base classes for diffusion models and acceleration methods."""
 
 from abc import ABC, abstractmethod
-from typing import Tuple
+from typing import List, Tuple, Union
 
 import torch
 
@@ -19,8 +19,14 @@ class DiffusionGenerator(ABC):
         ...
 
     @abstractmethod
-    def generate(self, prompt: str, seed: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Generate an image from a text prompt.
+    def generate(self, prompt: Union[str, List[str]],
+                 seed: Union[int, List[int]],
+                 guidance_scale: float = 4.5) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Generate image(s) from prompt(s).
+
+        When *prompt* is a list, each entry is a different prompt; *seed*
+        must then be a matching list so every element gets independent
+        initial noise.  The batch dimension is ``len(prompts)``.
 
         Returns (latent, image_tensor), image in [0,1].
         """

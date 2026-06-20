@@ -355,7 +355,7 @@ class GenEvalScorer(Metric):
 
         # Convert tensor to PIL
         if image.dim() == 4:
-            image = image.squeeze(0)
+            image = image[0]
         arr = (image.cpu().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
         pil = Image.fromarray(arr)
 
@@ -377,6 +377,27 @@ class GenEvalScorer(Metric):
             if tag not in self._per_task:
                 self._per_task[tag] = []
             self._per_task[tag].append(s)
+
+    def add_batch(self, images: torch.Tensor, prompts: list):
+        """Add scores for a batch of (image, prompt) pairs.
+
+        Parameters
+        ----------
+        images : torch.Tensor
+            (B, 3, H, W) in [0,1].
+        prompts : list of str
+            Length B text prompts.
+        """
+        for i in range(images.shape[0]):
+            s = self.score(prompts[i], images[i:i+1])
+            self._scores.append(s)
+            # Track per-task
+            meta = self._metadata.get(prompts[i] or "")
+            if meta is not None:
+                tag = meta["tag"]
+                if tag not in self._per_task:
+                    self._per_task[tag] = []
+                self._per_task[tag].append(s)
 
     def compute(self) -> dict:
         result = {}

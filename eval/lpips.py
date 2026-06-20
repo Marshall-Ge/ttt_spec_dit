@@ -49,6 +49,20 @@ class LPIPSScorer(Metric):
         s = self.score(image, reference)
         self._scores.append(s)
 
+    def add_batch(self, images: torch.Tensor, references: torch.Tensor):
+        """Add scores for a batch of image-reference pairs.
+
+        Parameters
+        ----------
+        images : torch.Tensor
+            (B, 3, H, W) in [0,1].
+        references : torch.Tensor
+            (B, 3, H, W) in [0,1].
+        """
+        for i in range(images.shape[0]):
+            s = self.score(images[i:i+1], references[i:i+1])
+            self._scores.append(s)
+
     def compute(self) -> dict:
         if not self._scores:
             return {"lpips_mean": float("nan"), "lpips_std": float("nan")}

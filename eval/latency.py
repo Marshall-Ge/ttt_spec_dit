@@ -29,6 +29,19 @@ class LatencyMetric(Metric):
         self._vanilla.append(vanilla_s)
         self._accel.append(accel_s)
 
+    def add_pairs_batch(self, vanilla_list, accel_list):
+        """Add latency pairs for a batch in one call.
+
+        Parameters
+        ----------
+        vanilla_list : list of float
+            Length B, vanilla latencies.
+        accel_list : list of float
+            Length B, accelerated latencies.
+        """
+        self._vanilla.extend(vanilla_list)
+        self._accel.extend(accel_list)
+
     def add(self, image: torch.Tensor, prompt: str = None,
             reference: torch.Tensor = None):
         pass  # use add_pair() instead
@@ -98,9 +111,11 @@ class FLOPsMetric(Metric):
             return
 
         from torch.utils.flop_counter import FlopCounterMode
+        from models.dit import DiTGenerator
         transformer = self._gen.transformer
         device = self._gen.device
         dtype = self._gen.dtype
+        is_dit = isinstance(self._gen, DiTGenerator)
 
         # Build scheduler to get a valid timestep
         self._gen._build_scheduler()
@@ -115,26 +130,37 @@ class FLOPsMetric(Metric):
         latent_input = self._gen.scheduler.scale_model_input(latents, t)
         current_t = t.expand(1).to(torch.int64)
 
-        # Real prompt embeddings (correct shapes for caption_projection)
-        prompt_embeds, attn_mask = self._gen.encode_prompt("test")
-        added = {"resolution": None, "aspect_ratio": None}
+        if is_dit:
+            # DiT: forward(hidden_states, timestep, class_labels)
+            class_labels = self._gen.encode_prompt(0)  # class 0
+            with FlopCounterMode(display=False) as fcm:
+                _ = transformer(
+                    latent_input,
+                    timestep=current_t,
+                    class_labels=class_labels,
+                    return_dict=False,
+                )
+            self._flops_full = fcm.get_total_flops()
+            self._flops_skip = _profile_tail_flops_dit(
+                transformer, latent_input, current_t, class_labels, device, dtype)
+        else:
+            # PixArt
+            prompt_embeds, attn_mask = self._gen.encode_prompt("test")
+            added = {"resolution": None, "aspect_ratio": None}
 
-        # (A) Full transformer forward (28 blocks + tail)
-        with FlopCounterMode(display=False) as fcm:
-            _ = transformer(
-                latent_input,
-                encoder_hidden_states=prompt_embeds,
-                encoder_attention_mask=attn_mask,
-                timestep=current_t,
-                added_cond_kwargs=added,
-                return_dict=False,
-            )
-        self._flops_full = fcm.get_total_flops()
-
-        # (B) Tail-only forward (bypass all blocks, only norm_out+proj_out+unpatchify)
-        self._flops_skip = _profile_tail_flops(transformer, latent_input,
-                                                prompt_embeds, attn_mask,
-                                                current_t, added, device, dtype)
+            with FlopCounterMode(display=False) as fcm:
+                _ = transformer(
+                    latent_input,
+                    encoder_hidden_states=prompt_embeds,
+                    encoder_attention_mask=attn_mask,
+                    timestep=current_t,
+                    added_cond_kwargs=added,
+                    return_dict=False,
+                )
+            self._flops_full = fcm.get_total_flops()
+            self._flops_skip = _profile_tail_flops(transformer, latent_input,
+                                                    prompt_embeds, attn_mask,
+                                                    current_t, added, device, dtype)
 
         self._flops_vanilla_step = self._flops_full
         self._profiled = True
@@ -250,6 +276,44 @@ def _profile_tail_flops(transformer, latent_input, prompt_embeds, attn_mask,
             shape=(-1, transformer.out_channels,
                    height * transformer.config.patch_size,
                    width * transformer.config.patch_size)
+        )
+        return output
+
+    with FlopCounterMode(display=False) as fcm:
+        _ = tail_only_forward(latent_input)
+    return fcm.get_total_flops()
+
+
+def _profile_tail_flops_dit(transformer, latent_input, current_t, class_labels,
+                             device, dtype):
+    """Run a forward that skips all DiT transformer blocks, counting only the tail."""
+    from torch.utils.flop_counter import FlopCounterMode
+    from torch.nn.functional import silu
+
+    height = latent_input.shape[-2] // transformer.patch_size
+    width = latent_input.shape[-1] // transformer.patch_size
+
+    def tail_only_forward(hidden_states):
+        """Only run pos_embed + tail for DiT (no blocks)."""
+        hidden_states = transformer.pos_embed(hidden_states)
+
+        # ── BLOCKS SKIPPED ──
+
+        # DiT tail
+        conditioning = transformer.transformer_blocks[0].norm1.emb(
+            current_t, class_labels, hidden_dtype=hidden_states.dtype)
+        shift, scale = transformer.proj_out_1(silu(conditioning)).chunk(2, dim=1)
+        hidden_states = transformer.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        hidden_states = transformer.proj_out_2(hidden_states)
+
+        hidden_states = hidden_states.reshape(
+            shape=(-1, height, width, transformer.patch_size,
+                   transformer.patch_size, transformer.out_channels)
+        )
+        hidden_states = torch.einsum("nhwpqc->nchpwq", hidden_states)
+        output = hidden_states.reshape(
+            shape=(-1, transformer.out_channels,
+                   height * transformer.patch_size, width * transformer.patch_size)
         )
         return output
 

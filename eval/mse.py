@@ -42,6 +42,22 @@ class MSEMetric(Metric):
         s = self._compute_fn(image, reference)
         self._scores.append(s)
 
+    def add_batch(self, images: torch.Tensor, references: torch.Tensor):
+        """Add MSE scores for a batch of (image, reference) pairs.
+
+        Parameters
+        ----------
+        images : torch.Tensor
+            (B, 3, H, W) in [0,1].
+        references : torch.Tensor
+            (B, 3, H, W) in [0,1].
+        """
+        if images.shape[0] != references.shape[0]:
+            return
+        diff = (images.float().detach().cpu() - references.float().detach().cpu()) ** 2
+        per_image_mse = diff.flatten(1).mean(1)  # (B,)
+        self._scores.extend(per_image_mse.tolist())
+
     def compute(self) -> dict:
         if not self._scores:
             key = f"{self.which}_mse_mean"

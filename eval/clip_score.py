@@ -52,7 +52,7 @@ class CLIPScorer(Metric):
         if self._load_failed or self._model is None:
             return float("nan")
         if image.dim() == 4:
-            image = image.squeeze(0)
+            image = image[0]
         pil_image = latent_to_pil(image)
         inputs = self._processor(text=[prompt], images=[pil_image],
                                  return_tensors="pt", padding="max_length",
@@ -70,6 +70,45 @@ class CLIPScorer(Metric):
     def add(self, image: torch.Tensor, prompt: str = None, reference: torch.Tensor = None):
         s = self.score(prompt, image)
         self._scores.append(s)
+
+    @torch.no_grad()
+    def add_batch(self, images: torch.Tensor, prompts: list):
+        """Add scores for a batch of (image, prompt) pairs using batched CLIP forward.
+
+        Parameters
+        ----------
+        images : torch.Tensor
+            (B, 3, H, W) in [0,1].
+        prompts : list of str
+            Length B text prompts.
+        """
+        self._lazy_load()
+        if self._load_failed or self._model is None:
+            for _ in range(images.shape[0]):
+                self._scores.append(float("nan"))
+            return
+
+        from utils import latent_to_pil
+        pil_list = []
+        for i in range(images.shape[0]):
+            img = images[i]
+            if img.dim() == 3:
+                pil_list.append(latent_to_pil(img))
+            else:
+                pil_list.append(latent_to_pil(img[0] if img.dim() == 4 else img))
+
+        inputs = self._processor(text=prompts, images=pil_list,
+                                 return_tensors="pt", padding=True,
+                                 truncation=True, max_length=77)
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        outputs = self._model(**inputs)
+        img_emb = outputs.image_embeds  # (B, D)
+        txt_emb = outputs.text_embeds   # (B, D)
+        img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
+        txt_emb = txt_emb / txt_emb.norm(dim=-1, keepdim=True)
+        cosines = (img_emb * txt_emb).sum(dim=-1)  # (B,)
+        for c in cosines:
+            self._scores.append(float(c.item() * 100.0))
 
     def compute(self) -> dict:
         if not self._scores:

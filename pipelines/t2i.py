@@ -23,7 +23,9 @@ from config import (OUTPUT_DIR, DEFAULT_REL_L1_THRESH, DEFAULT_NUM_STEPS,
 from utils import CudaTimer, decode_latent, save_image
 
 from models.pixart import PixArtGenerator
-from models.teacache import TeaCacheAccelerator
+from models.dit import DiTGenerator
+from accelerators.teacache import TeaCacheAccelerator
+from accelerators.speca import SpecAAccelerator
 
 from eval.image_reward import ImageRewardScorer
 from eval.gen_eval import GenEvalScorer
@@ -58,6 +60,7 @@ def run_t2i(args) -> Dict:
     dict with keys: config, aggregate, per_prompt, [geneval]
     """
     dataset_name = args.dataset
+    model_name = getattr(args, "model", "pixart")
     if dataset_name not in T2I_VALID_METRICS:
         raise ValueError(
             f"Unknown t2i dataset: {dataset_name}. "
@@ -77,8 +80,11 @@ def run_t2i(args) -> Dict:
     dtype = torch.float16
 
     # --- Output dir ---
+    # Append num_steps for ddim to avoid DDIM@10/DDIM@20 collision.
+    # Keep baseline/teacache dir names unchanged (their results already exist).
+    dir_suffix = f"{args.method}_{args.num_steps}" if args.method == "ddim" else args.method
     output_dir = args.output_dir or os.path.join(
-        OUTPUT_DIR, f"t2i_{dataset_name}_{args.method}")
+        OUTPUT_DIR, f"t2i_{model_name}_{dataset_name}_{dir_suffix}")
     os.makedirs(output_dir, exist_ok=True)
 
     # --- Seeds ---
@@ -89,8 +95,9 @@ def run_t2i(args) -> Dict:
 
     coefficients = load_coefficients(args.coef_path) if args.coef_path else load_coefficients()
 
+    model_label = {"pixart": "PixArt-α", "dit": "DiT-2-256"}.get(model_name, model_name)
     print("=" * 70)
-    print(f"PixArt-α T2I Evaluation — {dataset_name.upper()}")
+    print(f"{model_label} T2I Evaluation — {dataset_name.upper()}")
     print(f"  Method:   {args.method}")
     print(f"  Dataset:  {dataset_name}")
     print(f"  N:        {args.n_prompts}")
@@ -100,6 +107,11 @@ def run_t2i(args) -> Dict:
     if args.method == "teacache":
         print(f"  γ:        {args.thresh}")
         print(f"  Coef:     pixart_coef.json")
+    if args.method == "speca":
+        print(f"  SpecA:    base_thresh={args.speca_base_threshold} "
+              f"decay={args.speca_decay_rate} "
+              f"taylor=[{args.speca_min_taylor_steps},{args.speca_max_taylor_steps}] "
+              f"metric={getattr(args, 'speca_error_metric', 'relative_l1')}")
     print("=" * 70)
 
     # =====================================================================
@@ -122,9 +134,16 @@ def run_t2i(args) -> Dict:
     # =====================================================================
     # 2. Load model
     # =====================================================================
-    print("\n[2] Loading PixArt-α model...")
-    generator = PixArtGenerator(
-        num_steps=args.num_steps, device=device, dtype=dtype)
+    if model_name == "pixart":
+        print("\n[2] Loading PixArt-α model...")
+        generator = PixArtGenerator(
+            num_steps=args.num_steps, device=device, dtype=dtype)
+    elif model_name == "dit":
+        print("\n[2] Loading DiT-2-256 model...")
+        generator = DiTGenerator(
+            num_steps=args.num_steps, device=device, dtype=dtype)
+    else:
+        raise ValueError(f"Unknown model: {model_name}")
     generator.load()
 
     # =====================================================================
@@ -159,57 +178,89 @@ def run_t2i(args) -> Dict:
         )
         accelerator.install(generator)
         print(f"  TeaCache installed (γ={args.thresh})")
+    elif args.method == "ddim":
+        print(f"  DDIM sampling ({args.num_steps} steps, no caching)")
+    elif args.method == "speca":
+        accelerator = SpecAAccelerator(
+            num_steps=args.num_steps,
+            base_threshold=args.speca_base_threshold,
+            decay_rate=args.speca_decay_rate,
+            min_taylor_steps=args.speca_min_taylor_steps,
+            max_taylor_steps=args.speca_max_taylor_steps,
+            error_metric=getattr(args, "speca_error_metric", "relative_l1"),
+        )
+        accelerator.install(generator)
+        print(f"  SpecA installed (base_thresh={args.speca_base_threshold})")
     else:
         print(f"  Baseline (no TeaCache)")
 
     # =====================================================================
-    # 5. Generate + score
+    # 5. Generate + score  (batch = different prompts in parallel)
     # =====================================================================
-    print(f"\n[4] Generating {n} images ({args.method})...")
+    total_images = n  # one image per prompt
+    bs = args.batch_size
+    print(f"\n[4] Generating {total_images} images ({args.method}, "
+          f"{n} prompts in batches of ≤{bs})...")
     t_start = time.time()
 
     all_results = []
-    for i in tqdm(range(n), desc=f"t2i/{dataset_name}", ncols=80):
-        prompt, seed, tag = items[i]
+    batch_count = 0
+    for batch_start in tqdm(range(0, n, bs), desc=f"t2i/{dataset_name}", ncols=80):
+        batch_end = min(batch_start + bs, n)
+        batch_items = items[batch_start:batch_end]
+        batch_prompts = [it[0] for it in batch_items]
+        batch_seeds   = [it[1] for it in batch_items]
+        actual_bs = len(batch_prompts)
 
-        # --- Generate ---
+        # --- Generate one batch ---
         t0 = time.time()
-        if args.method == "teacache":
+        if args.method in ("teacache", "speca"):
             accelerator.reset()
-            latent, img = generator.generate_teacache(
-                prompt, seed, accelerator.teacache)
+        if args.method == "ddim":
+            latent, img = generator.generate_ddim(
+                batch_prompts, batch_seeds,
+                guidance_scale=args.guidance_scale)
         else:
-            latent, img = generator.generate(prompt, seed)
+            latent, img = generator.generate(
+                batch_prompts, batch_seeds,
+                guidance_scale=args.guidance_scale)
         wall_s = time.time() - t0
 
-        # --- Score ---
-        result = {"prompt": prompt, "seed": seed, "wall_s": wall_s}
-        if tag is not None:
-            result["tag"] = tag
+        per_img_s = wall_s / actual_bs
 
+        # --- Batch eval (no per-image loop for scoring) ---
         if need_imagereward:
-            result["imagereward"] = metrics["imagereward"].score(prompt, img)
-            metrics["imagereward"].add(img, prompt=prompt)
+            metrics["imagereward"].add_batch(img, prompts=batch_prompts)
 
         if need_geneval:
-            result["geneval"] = metrics["geneval"].score(prompt, img)
-            metrics["geneval"].add(img, prompt=prompt)
+            metrics["geneval"].add_batch(img, prompts=batch_prompts)
 
         if need_latency:
-            # For baseline we pass wall_s as both vanilla and accel
-            # (the report will show absolute numbers)
-            metrics["latency"].add_pair(wall_s, wall_s)
+            metrics["latency"].add_pairs_batch([per_img_s] * actual_bs,
+                                               [per_img_s] * actual_bs)
 
+        # --- Per-prompt results (wall_s, metadata only) ---
+        for b, (prompt, seed, tag) in enumerate(batch_items):
+            result = {"prompt": prompt, "seed": seed, "wall_s": wall_s,
+                      "images": 1}
+            if tag is not None:
+                result["tag"] = tag
+            all_results.append(result)
+
+        # FLOPs accounting (per batch, once per generate call)
         if need_flops:
             if args.method == "teacache":
                 metrics["flops"].add_generation(accelerator.teacache)
+            elif args.method == "speca":
+                metrics["flops"].add_generation(accelerator.speca)
             else:
                 metrics["flops"].add_vanilla_steps(args.num_steps)
 
-        all_results.append(result)
+        batch_count += 1
 
     elapsed = time.time() - t_start
-    print(f"\n  Total time: {elapsed/60:.1f} min ({elapsed/n:.2f} s/image)")
+    print(f"\n  Total time: {elapsed/60:.1f} min "
+          f"({elapsed/total_images:.2f} s/image, {batch_count} batches)")
 
     # =====================================================================
     # 6. Aggregate metrics
@@ -228,27 +279,42 @@ def run_t2i(args) -> Dict:
     if need_flops:
         agg.update(metrics["flops"].compute())
 
-    # Skip ratio (TeaCache only)
+    # Skip ratio
     if args.method == "teacache" and accelerator is not None:
         st = accelerator.stats
         agg["skip_ratio"] = st.get("skip_ratio", 0.0)
         agg["total_calc"] = st.get("total_calc", 0)
         agg["total_skip"] = st.get("total_skip", 0)
+    elif args.method == "speca" and accelerator is not None:
+        st = accelerator.stats
+        agg["skip_ratio"] = st.get("skip_ratio", 0.0)
+        agg["taylor_steps"] = st.get("total_taylor", 0)
+        agg["full_steps"] = st.get("total_full", 0)
+        agg["total_calc"] = st.get("total_full", 0)
+        agg["total_skip"] = st.get("total_taylor", 0)
 
-    # Speed (images/sec) from wall time
+    # Speed (images/sec) — deduplicate wall_s per batch
     if "speed" in selected and all_results:
-        wall_times = [r["wall_s"] for r in all_results]
-        agg["speed_img_per_s"] = float(1.0 / np.mean(wall_times)) if wall_times else 0.0
+        unique_walls = list(dict.fromkeys(r["wall_s"] for r in all_results))
+        agg["speed_img_per_s"] = float(n / np.sum(unique_walls)) if unique_walls else 0.0
 
     results = {
         "config": {
+            "model": model_name,
             "task": "t2i",
             "dataset": dataset_name,
             "method": args.method,
             "n_prompts": n,
+            "batch_size": args.batch_size,
+            "total_images": total_images,
             "num_steps": args.num_steps,
             "rel_l1_thresh": args.thresh if args.method == "teacache" else None,
             "coefficients": coefficients if args.method == "teacache" else None,
+            "speca_base_threshold": args.speca_base_threshold if args.method == "speca" else None,
+            "speca_decay_rate": args.speca_decay_rate if args.method == "speca" else None,
+            "speca_min_taylor_steps": args.speca_min_taylor_steps if args.method == "speca" else None,
+            "speca_max_taylor_steps": args.speca_max_taylor_steps if args.method == "speca" else None,
+            "speca_error_metric": getattr(args, "speca_error_metric", "relative_l1") if args.method == "speca" else None,
         },
         "aggregate": agg,
         "per_prompt": all_results,
@@ -306,15 +372,22 @@ def _build_t2i_report(results: Dict) -> str:
     cfg = results.get("config", {})
     dataset_name = cfg.get("dataset", "?").upper()
     method = cfg.get("method", "?")
+    model = cfg.get("model", "pixart")
+    model_display = {"pixart": "PixArt-XL-2 512×512", "dit": "DiT-2-256"}.get(model, model)
 
-    lines.append(f"# PixArt-α T2I Evaluation: {dataset_name}\n")
-    lines.append(f"**Model:** PixArt-XL-2 512×512 | "
+    lines.append(f"# {model_display} T2I Evaluation: {dataset_name}\n")
+    lines.append(f"**Model:** {model_display} | "
                  f"**Method:** {method} | "
                  f"**Steps:** {cfg.get('num_steps')} | "
                  f"**N:** {cfg.get('n_prompts', '?')}\n")
     if method == "teacache":
         lines.append(f"**γ:** {cfg.get('rel_l1_thresh')} | "
                      f"**Coefficients:** `{cfg.get('coefficients')}`\n")
+    elif method == "speca":
+        lines.append(f"**Base thresh:** {cfg.get('speca_base_threshold', 0.1)} | "
+                     f"**Decay:** {cfg.get('speca_decay_rate', 0.01)} | "
+                     f"**Taylor steps:** {cfg.get('speca_min_taylor_steps', 2)}–"
+                     f"{cfg.get('speca_max_taylor_steps', 5)}\n")
     lines.append("---\n")
 
     agg = results.get("aggregate", {})
@@ -373,9 +446,15 @@ def _build_t2i_report(results: Dict) -> str:
     lines.append("")
     lines.append("## Method\n")
     if method == "teacache":
-        lines.append("TeaCache (Liu et al., CVPR 2025) accelerated PixArt-α generation.\n")
+        lines.append(f"TeaCache (Liu et al., CVPR 2025) accelerated {model_display} generation.\n")
+    elif method == "ddim":
+        lines.append("DDIM (Song et al., 2021) step-skipping baseline — full 28-block forward every step, "
+                     f"only the number of sampling steps is reduced to {cfg.get('num_steps')}.\n")
+    elif method == "speca":
+        lines.append("SpecA (Speculative Acceleration) — Taylor-series feature prediction "
+                     "with adaptive full/Taylor step selection and last-block error checking.\n")
     else:
-        lines.append("PixArt-α DPMSolver++ baseline (all steps computed).\n")
+        lines.append(f"{model_display} baseline (all steps computed).\n")
 
     return "\n".join(lines)
 
@@ -423,6 +502,9 @@ def _print_t2i_summary(results: Dict, selected_metrics: List[str], method: str):
     if method == "teacache":
         sr = agg.get("skip_ratio", 0)
         print(f"  Skip ratio:      {sr:.0%}")
+    elif method == "speca":
+        sr = agg.get("skip_ratio", 0)
+        print(f"  Taylor ratio:    {sr:.0%} ({agg.get('taylor_steps', 0)}/{agg.get('taylor_steps', 0) + agg.get('full_steps', 0)})")
     print("=" * 70)
 
 

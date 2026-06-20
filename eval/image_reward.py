@@ -65,7 +65,7 @@ class ImageRewardScorer(Metric):
 
         from utils import latent_to_pil
         if image.dim() == 4:
-            image = image.squeeze(0)
+            image = image[0]
         pil = latent_to_pil(image)
         s = self._model.score(prompt, pil)
         return float(s) if isinstance(s, (int, float)) else float(s[0])
@@ -77,6 +77,31 @@ class ImageRewardScorer(Metric):
     def add(self, image: torch.Tensor, prompt: str = None,
             reference: torch.Tensor = None):
         self._scores.append(self.score(prompt, image))
+
+    def add_batch(self, images: torch.Tensor, prompts: list):
+        """Add scores for a batch of (image, prompt) pairs.
+
+        Parameters
+        ----------
+        images : torch.Tensor
+            (B, 3, H, W) in [0,1].
+        prompts : list of str
+            Length B text prompts.
+        """
+        self._lazy_load()
+        if not self._available or self._model is None:
+            for _ in range(images.shape[0]):
+                self._scores.append(float("nan"))
+            return
+
+        from utils import latent_to_pil
+        for i in range(images.shape[0]):
+            img = images[i]
+            if img.dim() == 4:
+                img = img[0]
+            pil = latent_to_pil(img)
+            s = self._model.score(prompts[i], pil)
+            self._scores.append(float(s) if isinstance(s, (int, float)) else float(s[0]))
 
     def compute(self) -> dict:
         if not self._scores:

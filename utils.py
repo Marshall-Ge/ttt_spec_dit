@@ -49,9 +49,9 @@ def decode_latent(vae, latents: torch.Tensor, scaling_factor: float = 0.18215,
 # ---------------------------------------------------------------------------
 
 def latent_to_pil(image_tensor: torch.Tensor) -> Image.Image:
-    """[3, H, W] (or [1,3,H,W]) in [0,1] → PIL Image."""
+    """[3,H,W] or [B,3,H,W] in [0,1] → PIL Image. Batched → first image."""
     if image_tensor.dim() == 4:
-        image_tensor = image_tensor.squeeze(0)
+        image_tensor = image_tensor[0]
     arr = (image_tensor.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
     return Image.fromarray(arr)
 
@@ -67,9 +67,9 @@ def pil_to_tensor(pil_image: Image.Image) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 def save_image(tensor: torch.Tensor, path: str):
-    """Save [3,H,W] or [1,3,H,W] float [0,1] tensor as PNG."""
+    """Save [3,H,W] or [B,3,H,W] float [0,1] tensor as PNG. Batched → saves first image."""
     if tensor.dim() == 4:
-        tensor = tensor.squeeze(0)
+        tensor = tensor[0]
     arr = (tensor.cpu().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
     Image.fromarray(arr).save(path)
 

@@ -129,7 +129,7 @@ class ImageNetDataset:
 
     def __getitem__(self, idx):
         img_path, prompt, class_idx = self.items[idx]
-        return img_path, prompt
+        return img_path, prompt, class_idx
 
     def image_dir_for_fid(self) -> str:
         """Pre-resize all real images to 299×299 for FID computation.
