@@ -1,419 +1,334 @@
 # -*- coding: utf-8 -*-
-"""DiT-2-256 generator: loading, class-label encoding, vanilla generation."""
+"""Explicit DiT-2-256 transformer (class-conditional, ada_norm_zero).
 
-import os
+This module exposes a hand-written transformer whose forward signature is
+explicit about acceleration state::
+
+    DiTTransformer2D.forward(x, t, current, cache_dic, teacache_state, class_labels)
+
+The block loop and full/Taylor/TeaCache branching are visible line-by-line;
+there is no monkeypatching. Submodules reuse the diffusers ``Transformer2DModel``
+building blocks (``AdaLayerNormZero``, ``BasicTransformerBlock``-style attn/ff),
+so the existing ``diffusion_pytorch_model.bin`` checkpoint loads directly and
+``eval/latency.py``'s tail-profiler (which indexes
+``transformer.transformer_blocks[0].norm1.emb`` / ``proj_out_1`` / ``proj_out_2``)
+keeps working unchanged.
+
+Block module-name convention (keys into ``cache_dic['cache'][-1][layer]``):
+  - 'attn' : self-attention output (modulated)
+  - 'mlp'  : feed-forward output (modulated)
+"""
+
+from typing import Optional
+
 import torch
-from typing import List, Tuple, Union
+import torch.nn as nn
+import torch.nn.functional as F
 
-from diffusers import DiTPipeline, DDIMScheduler
+from diffusers.models.transformers.transformer_2d import Transformer2DModel
 
-from config import DIT_REPO, HF_CACHE_DIR
-from utils import CudaTimer, decode_latent
-from .base import DiffusionGenerator
+from accelerators.speca import (
+    speca_cal_type,
+    taylor_cache_init,
+    derivative_approximation,
+    cache_step_dit,
+    compute_error_gate,
+)
+from accelerators.teacache import (
+    teacache_decide,
+    teacache_cache_residual,
+    teacache_apply_residual,
+    compute_modulated_input_dit,
+)
 
 
-class DiTGenerator(DiffusionGenerator):
-    """DiT-2-256 class-conditional image generator.
+class DiTTransformer2D(nn.Module):
+    """Explicit DiT-2-256 transformer with SpecA + TeaCache-aware forward.
 
-    Parameters
-    ----------
-    num_steps : int
-        Number of denoising steps.
-    device : str
-    dtype : torch.dtype
+    The submodule tree is built by instantiating a diffusers
+    ``Transformer2DModel`` (norm_type='ada_norm_zero') and borrowing its
+    children, so state_dict keys line up exactly with the released
+    ``diffusion_pytorch_model.bin``.
     """
 
-    def __init__(self, num_steps: int = 20, device: str = "cuda",
-                 dtype: torch.dtype = torch.float16):
-        self.num_steps = num_steps
-        self.device = device
-        self.dtype = dtype
-        self._pipe = None
-        self._scheduler = None
-        self._latent_shape = None
-        self._id2label = None
-        self.null_class = 1000  # overridden in load() from model config
+    def __init__(self,
+                 num_attention_heads: int = 16,
+                 attention_head_dim: int = 72,
+                 in_channels: int = 4,
+                 out_channels: int = 8,
+                 num_layers: int = 28,
+                 sample_size: int = 32,
+                 patch_size: int = 2,
+                 num_embeds_ada_norm: int = 1000):
+        super().__init__()
 
-    # ------------------------------------------------------------------
-    # Load / unload
-    # ------------------------------------------------------------------
-
-    def load(self):
-        """Load DiTPipeline from local model directory."""
-        if self._pipe is not None:
-            return
-        self._pipe = DiTPipeline.from_pretrained(
-            DIT_REPO, cache_dir=HF_CACHE_DIR, torch_dtype=self.dtype,
-            local_files_only=True,
-        ).to(self.device)
-        self._pipe.transformer.eval()
-        self._pipe.vae.eval()
-        sample_size = self._pipe.transformer.config.sample_size
-        self._latent_shape = (1, 4, sample_size, sample_size)
-        self.null_class = self._pipe.transformer.config.num_embeds_ada_norm  # typically 1000
-        # Load id2label from model_index.json (not exposed as pipe attribute)
-        import json
-        model_index_path = os.path.join(DIT_REPO, "model_index.json")
-        if os.path.exists(model_index_path):
-            with open(model_index_path) as f:
-                self._id2label = json.load(f).get("id2label", {})
-        else:
-            self._id2label = {}
-        self._build_scheduler()
-        print(f"  [DiT] loaded. blocks={len(self._pipe.transformer.transformer_blocks)}")
-
-    def unload(self):
-        """Free GPU memory."""
-        if self._pipe is not None:
-            del self._pipe
-            self._pipe = None
-            torch.cuda.empty_cache()
-
-    @property
-    def transformer(self):
-        if self._pipe is None:
-            raise RuntimeError("DiTGenerator not loaded. Call .load() first.")
-        return self._pipe.transformer
-
-    @property
-    def vae(self):
-        if self._pipe is None:
-            raise RuntimeError("DiTGenerator not loaded. Call .load() first.")
-        return self._pipe.vae
-
-    @property
-    def scheduler(self):
-        return self._scheduler
-
-    @property
-    def latent_shape(self):
-        return self._latent_shape
-
-    @property
-    def id2label(self):
-        return self._id2label
-
-    def _build_scheduler(self):
-        """Build DDIM scheduler from config."""
-        sched = DDIMScheduler.from_config(
-            self._pipe.scheduler.config)
-        sched.set_timesteps(self.num_steps, device=self.device)
-        self._scheduler = sched
-
-    def rebuild_scheduler(self):
-        """Rebuild scheduler (call after changing num_steps)."""
-        self._build_scheduler()
-
-    # ------------------------------------------------------------------
-    # Prompt encoding (class label → tensor)
-    # ------------------------------------------------------------------
-
-    def encode_prompt(self, prompt):
-        """Convert prompt(s) to class-label tensor(s).
-
-        Parameters
-        ----------
-        prompt : int, str, or list of int/str
-            Single label → tensor of shape (1,).
-            List of labels → tensor of shape (B,).
-
-        Returns
-        -------
-        torch.LongTensor of shape (B,) on the correct device.
-        """
-        if isinstance(prompt, list):
-            labels = [self._encode_single(p) for p in prompt]
-            return torch.cat(labels, dim=0)
-        return self._encode_single(prompt)
-
-    def _encode_single(self, prompt):
-        """Convert a single prompt to a class-label tensor of shape (1,)."""
-        if isinstance(prompt, int):
-            return torch.tensor([prompt], device=self.device, dtype=torch.long)
-
-        # Try parsing as integer string
-        try:
-            return torch.tensor([int(prompt)], device=self.device, dtype=torch.long)
-        except (ValueError, TypeError):
-            pass
-
-        # Reverse lookup by class name
-        if self._id2label is not None:
-            for idx, name in self._id2label.items():
-                if prompt.lower() in name.lower():
-                    return torch.tensor([int(idx)], device=self.device, dtype=torch.long)
-
-        raise ValueError(
-            f"Could not convert prompt '{prompt}' to a class label. "
-            f"Provide an int (0–999) or a valid ImageNet class name.")
-
-    # ------------------------------------------------------------------
-    # Generation
-    # ------------------------------------------------------------------
-
-    @torch.no_grad()
-    def generate(self, prompt, seed: Union[int, List[int]],
-                 guidance_scale: float = 4.0) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Vanilla DDIM generation with CFG.
-
-        Parameters
-        ----------
-        prompt : int, str, or list of int/str
-            Single class label or list of *different* class labels (batch).
-        seed : int or list[int]
-            One seed or one seed per prompt.  Must match prompt cardinality.
-        guidance_scale : float
-            CFG scale (>1.0 = enabled).  Default 4.0.
-
-        Returns (latent, image_tensor), latent shape (B, 4, H, W),
-        image in [0,1].
-
-        The transformer.forward may be monkeypatched by an accelerator;
-        this method is agnostic to the actual forward implementation.
-        """
-        self._build_scheduler()
-
-        # --- Normalise ---
-        if isinstance(prompt, list):
-            prompts = prompt
-            seeds = seed if isinstance(seed, list) else [seed] * len(prompts)
-        else:
-            prompts = [prompt]
-            seeds = [seed] if isinstance(seed, int) else seed
-        B = len(prompts)
-
-        cond_labels = self.encode_prompt(prompts)  # (B,)
-
-        # CFG: double once — cat([cond, null]) → cond at index 0
-        if guidance_scale > 1.0:
-            null_labels = torch.full((B,), self.null_class, device=self.device, dtype=torch.long)
-            class_labels = torch.cat([cond_labels, null_labels], dim=0)
-        else:
-            class_labels = cond_labels
-
-        latent = self._denoise_vanilla(class_labels, seeds, guidance_scale=guidance_scale)
-
-        # Unchunk: cond half (index 0 — cond comes first in cat)
-        if guidance_scale > 1.0:
-            latent = latent.chunk(2, dim=0)[0]
-
-        # DiT uses standard SD VAE with scaling_factor=0.18215
-        scaling_factor = getattr(self.vae.config, "scaling_factor", 0.18215)
-        image = decode_latent(self.vae, latent, scaling_factor, self.dtype)
-        return latent, image
-
-    @torch.no_grad()
-    def generate_timed(self, prompt, seed: Union[int, List[int]],
-                       guidance_scale: float = 4.0) -> Tuple[torch.Tensor, float]:
-        """Vanilla generation with CUDA-event timing. Returns (latent, time_s)."""
-        self._build_scheduler()
-
-        if isinstance(prompt, list):
-            prompts = prompt
-            seeds = seed if isinstance(seed, list) else [seed] * len(prompts)
-        else:
-            prompts = [prompt]
-            seeds = [seed] if isinstance(seed, int) else seed
-        B = len(prompts)
-
-        cond_labels = self.encode_prompt(prompts)  # (B,)
-
-        if guidance_scale > 1.0:
-            null_labels = torch.full((B,), self.null_class, device=self.device, dtype=torch.long)
-            class_labels = torch.cat([cond_labels, null_labels], dim=0)
-        else:
-            class_labels = cond_labels
-
-        transformer = self.transformer
-        base_bs = class_labels.shape[0] // 2 if guidance_scale > 1.0 else class_labels.shape[0]
-
-        if isinstance(seeds, list):
-            assert len(seeds) == base_bs
-            generators = [torch.Generator(device=self.device).manual_seed(s) for s in seeds]
-        else:
-            generators = torch.Generator(device=self.device).manual_seed(seeds)
-        latents = self._init_latents(base_bs, generators)
-
-        # CFG doubling
-        if guidance_scale > 1.0:
-            latents = torch.cat([latents, latents], dim=0)
-
-        timer = CudaTimer(self.device)
-        for t in self.scheduler.timesteps:
-            latent_input = self.scheduler.scale_model_input(latents, t)
-            current_t = t.expand(latents.shape[0]).to(torch.int64)
-            with timer:
-                noise_pred = transformer(
-                    latent_input, timestep=current_t,
-                    class_labels=class_labels, return_dict=False,
-                )[0]
-            if transformer.config.out_channels // 2 == self._latent_shape[1]:
-                noise_pred = noise_pred.chunk(2, dim=1)[0]
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
-        # Unchunk
-        if guidance_scale > 1.0:
-            latents = latents.chunk(2, dim=0)[0]
-
-        return latents, timer.total_ms / 1000.0
-
-    # ------------------------------------------------------------------
-    # Internal: vanilla denoising loop
-    # ------------------------------------------------------------------
-
-    def _init_latents(self, base_batch: int,
-                       generators: Union[torch.Generator, List[torch.Generator]]) -> torch.Tensor:
-        """Create initial noise of shape (base_batch, C, H, W).
-
-        When *generators* is a list, each batch element gets independent noise
-        from its own :class:`torch.Generator` (different seeds).
-        """
-        if isinstance(generators, list):
-            assert len(generators) == base_batch
-            noises = []
-            for g in generators:
-                shape_one = (1,) + self._latent_shape[1:]
-                noises.append(
-                    torch.randn(shape_one, device=self.device, dtype=self.dtype,
-                                generator=g))
-            return torch.cat(noises, dim=0) * self.scheduler.init_noise_sigma
-        else:
-            shape = (base_batch,) + self._latent_shape[1:]
-            return torch.randn(shape, device=self.device, dtype=self.dtype,
-                              generator=generators) * self.scheduler.init_noise_sigma
-
-    @torch.no_grad()
-    def _denoise_vanilla(self, class_labels: torch.Tensor,
-                         seed: Union[int, List[int]],
-                         guidance_scale: float = 1.0) -> torch.Tensor:
-        """Run vanilla denoising loop, returns final latent.
-
-        The *base* batch size is inferred from ``class_labels``:
-        if CFG doubles the batch, we revert to pre-doubling size.
-
-        When *seed* is a list, each batch element gets independent noise.
-        """
-        transformer = self.transformer
-        base_bs = class_labels.shape[0] // 2 if guidance_scale > 1.0 else class_labels.shape[0]
-
-        if isinstance(seed, list):
-            assert len(seed) == base_bs, f"seed list length {len(seed)} != base batch {base_bs}"
-            generators = [torch.Generator(device=self.device).manual_seed(s) for s in seed]
-        else:
-            generators = torch.Generator(device=self.device).manual_seed(seed)
-        latents = self._init_latents(base_bs, generators)
-
-        # CFG doubling — once before the loop; loop is completely CFG-agnostic
-        if guidance_scale > 1.0:
-            latents = torch.cat([latents, latents], dim=0)
-
-        for t in self.scheduler.timesteps:
-            latent_input = self.scheduler.scale_model_input(latents, t)
-            current_t = t.expand(latents.shape[0]).to(torch.int64)
-            noise_pred = transformer(
-                latent_input, timestep=current_t,
-                class_labels=class_labels, return_dict=False,
-            )[0]
-            if transformer.config.out_channels // 2 == self._latent_shape[1]:
-                noise_pred = noise_pred.chunk(2, dim=1)[0]
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-        return latents
-
-    # ------------------------------------------------------------------
-    # DDIM sampling (reduced steps; no block caching)
-    # ------------------------------------------------------------------
-
-    @torch.no_grad()
-    def generate_ddim(self, prompt, seed: Union[int, List[int]],
-                      num_steps: int = None,
-                      guidance_scale: float = 4.0) -> Tuple[torch.Tensor, torch.Tensor]:
-        """DDIM deterministic sampling with reduced steps and CFG.
-
-        Each step is a full 28-block forward (no block caching) — only the
-        number of sampling steps is reduced.
-
-        Parameters
-        ----------
-        prompt : int, str, or list of int/str
-            Single class label or list of *different* class labels (batch).
-        seed : int or list[int]
-            One seed or one seed per prompt.  Must match prompt cardinality.
-        num_steps : int, optional
-            Override the scheduler step count. Defaults to ``self.num_steps``.
-        guidance_scale : float
-            CFG scale (>1.0 = enabled). Default 4.0 for DiT.
-
-        Returns (latent, image_tensor), image in [0,1].
-        """
-        n = num_steps if num_steps is not None else self.num_steps
-
-        if isinstance(prompt, list):
-            prompts = prompt
-            seeds = seed if isinstance(seed, list) else [seed] * len(prompts)
-        else:
-            prompts = [prompt]
-            seeds = [seed] if isinstance(seed, int) else seed
-        B = len(prompts)
-
-        cond_labels = self.encode_prompt(prompts)  # (B,)
-
-        if guidance_scale > 1.0:
-            null_labels = torch.full((B,), self.null_class, device=self.device, dtype=torch.long)
-            class_labels = torch.cat([cond_labels, null_labels], dim=0)
-        else:
-            class_labels = cond_labels
-
-        latent = self._denoise_ddim(class_labels, seeds, n, guidance_scale=guidance_scale)
-
-        if guidance_scale > 1.0:
-            latent = latent.chunk(2, dim=0)[0]
-
-        scaling_factor = getattr(self.vae.config, "scaling_factor", 0.18215)
-        image = decode_latent(self.vae, latent, scaling_factor, self.dtype)
-        return latent, image
-
-    @torch.no_grad()
-    def _denoise_ddim(self, class_labels: torch.Tensor,
-                      seed: Union[int, List[int]],
-                      num_steps: int, guidance_scale: float = 1.0) -> torch.Tensor:
-        """Run the DDIM denoising loop with a fresh scheduler."""
-        transformer = self.transformer
-        scheduler = DDIMScheduler.from_config(
-            self._pipe.scheduler.config, clip_sample=False,
+        # Build a stock diffusers Transformer2DModel purely to harvest its
+        # submodule tree (names + shapes match the checkpoint exactly).
+        ref = Transformer2DModel(
+            num_attention_heads=num_attention_heads,
+            attention_head_dim=attention_head_dim,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            num_layers=num_layers,
+            sample_size=sample_size,
+            patch_size=patch_size,
+            num_embeds_ada_norm=num_embeds_ada_norm,
+            activation_fn="gelu-approximate",
+            attention_bias=True,
+            norm_elementwise_affine=False,
+            norm_type="ada_norm_zero",
+            cross_attention_dim=None,
         )
-        scheduler.set_timesteps(num_steps, device=self.device)
-        base_bs = class_labels.shape[0] // 2 if guidance_scale > 1.0 else class_labels.shape[0]
 
-        if isinstance(seed, list):
-            assert len(seed) == base_bs
-            generators = [torch.Generator(device=self.device).manual_seed(s) for s in seed]
+        # Borrow the subtrees so our attribute names match the checkpoint keys.
+        self.pos_embed = ref.pos_embed
+        self.transformer_blocks = ref.transformer_blocks
+        self.norm_out = ref.norm_out
+        self.proj_out_1 = ref.proj_out_1
+        self.proj_out_2 = ref.proj_out_2
+
+        # Expose the diffusers config object so FLOPs tail-profiler
+        # (which reads .patch_size / .out_channels) keeps working.
+        self.config = ref.config
+        self.out_channels = out_channels
+        self.patch_size = patch_size
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    def forward(self,
+                hidden_states: torch.Tensor,
+                timestep: torch.Tensor,
+                current: Optional[dict] = None,
+                cache_dic: Optional[dict] = None,
+                teacache_state: Optional[dict] = None,
+                class_labels: Optional[torch.Tensor] = None,
+                return_dict: bool = True):
+        """Explicit DiT forward with SpecA + TeaCache branching.
+
+        Parameters
+        ----------
+        hidden_states : (B, C, H, W) latent
+        timestep : (B,) timestep indices
+        current, cache_dic : SpecA state dicts (None = vanilla / TeaCache).
+        teacache_state : TeaCache state dict (None = vanilla / SpecA).
+            Only one of (current+cache_dic) or teacache_state should be set.
+            When set, the step counter is NOT advanced here — the caller
+            must call ``teacache_step`` after this forward returns.
+        class_labels : (B,) ImageNet class indices
+        """
+        # Determine mode
+        use_speca = current is not None and cache_dic is not None
+        use_teacache = teacache_state is not None and not use_speca
+
+        if use_speca:
+            speca_cal_type(cache_dic, current)
+        vanilla = not use_speca and not use_teacache
+
+        # 2. Patch embed + positional embed.
+        height, width = (
+            hidden_states.shape[-2] // self.patch_size,
+            hidden_states.shape[-1] // self.patch_size,
+        )
+        hidden_states = self.pos_embed(hidden_states)
+
+        # ---- TeaCache: decide at pos_embed output, before blocks ----
+        if use_teacache:
+            modulated = compute_modulated_input_dit(
+                self, hidden_states, timestep, class_labels)
+            should_calc, _ = teacache_decide(teacache_state, modulated)
+
+            if not should_calc:
+                # Skip all blocks — apply cached residual
+                hidden_states = teacache_apply_residual(
+                    teacache_state, hidden_states)
+                # Jump directly to tail
+                conditioning = self.transformer_blocks[0].norm1.emb(
+                    timestep, class_labels, hidden_dtype=hidden_states.dtype)
+                shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
+                hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+                hidden_states = self.proj_out_2(hidden_states)
+                hidden_states = hidden_states.reshape(
+                    shape=(-1, height, width, self.patch_size,
+                           self.patch_size, self.out_channels)
+                )
+                hidden_states = torch.einsum("nhwpqc->nchpwq", hidden_states)
+                output = hidden_states.reshape(
+                    shape=(-1, self.out_channels,
+                           height * self.patch_size, width * self.patch_size)
+                )
+                if not return_dict:
+                    return (output,)
+                from diffusers.models.modeling_outputs import Transformer2DModelOutput
+                return Transformer2DModelOutput(sample=output)
+
+            # Should calc: save input for residual caching
+            ori_hidden = hidden_states.clone()
+
+        # 3. Block loop (visible, no monkeypatch).
+        for layer_idx, block in enumerate(self.transformer_blocks):
+            if use_speca:
+                current['layer'] = layer_idx
+            step_type = 'full' if (vanilla or use_teacache) else current['type']
+
+            # adaLN-Zero: returns (norm_hidden, gate_msa, shift_mlp, scale_mlp, gate_mlp)
+            norm_hidden, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.norm1(
+                hidden_states, timestep=timestep, class_labels=class_labels,
+                hidden_dtype=hidden_states.dtype,
+            )
+
+            if step_type == 'full':
+                if use_speca:
+                    current['module'] = 'attn'
+                    taylor_cache_init(cache_dic, current)
+                attn_out = block.attn1(norm_hidden)
+                if use_speca:
+                    derivative_approximation(cache_dic, current, attn_out)
+                hidden_states = hidden_states + gate_msa.unsqueeze(1) * attn_out
+
+                if use_speca:
+                    current['module'] = 'mlp'
+                    taylor_cache_init(cache_dic, current)
+                norm_ff = block.norm3(hidden_states)
+                modulated_ff = norm_ff * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+                ff_out = block.ff(modulated_ff)
+                if use_speca:
+                    derivative_approximation(cache_dic, current, ff_out)
+                hidden_states = hidden_states + gate_mlp.unsqueeze(1) * ff_out
+
+            elif step_type == 'Taylor':
+                distance = current['step'] - current['activated_steps'][-1]
+                check_layer = cache_dic['check_layer']
+                do_check = (layer_idx == check_layer and cache_dic['check'])
+                if do_check:
+                    full_hidden = hidden_states.clone()
+
+                hidden_states = cache_step_dit(
+                    hidden_states,
+                    cache_dic['cache'][-1][layer_idx]['attn'],
+                    cache_dic['cache'][-1][layer_idx]['mlp'],
+                    gate_msa, gate_mlp, distance,
+                )
+
+                if do_check:
+                    fnh, fgate_msa, fshift_mlp, fscale_mlp, fgate_mlp = block.norm1(
+                        full_hidden, timestep=timestep, class_labels=class_labels,
+                        hidden_dtype=full_hidden.dtype,
+                    )
+                    attn_full = block.attn1(fnh)
+                    full_hidden = full_hidden + fgate_msa.unsqueeze(1) * attn_full
+                    norm_ff = block.norm3(full_hidden)
+                    modulated_ff = norm_ff * (1 + fscale_mlp[:, None]) + fshift_mlp[:, None]
+                    ff_full = block.ff(modulated_ff)
+                    full_hidden = full_hidden + fgate_mlp.unsqueeze(1) * ff_full
+
+                    gate_value, _ = compute_error_gate(
+                        hidden_states, full_hidden,
+                        metric=cache_dic['error_metric'],
+                    )
+                    current['last_layer_error'] = gate_value
+
+        # ---- TeaCache: save residual after blocks complete ----
+        if use_teacache:
+            teacache_cache_residual(teacache_state, hidden_states, ori_hidden)
+
+        # 4. Output (norm_out + proj_out_1/2 + unpatchify) — always runs.
+        conditioning = self.transformer_blocks[0].norm1.emb(
+            timestep, class_labels, hidden_dtype=hidden_states.dtype)
+        shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
+        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        hidden_states = self.proj_out_2(hidden_states)
+
+        hidden_states = hidden_states.reshape(
+            shape=(-1, height, width, self.patch_size,
+                   self.patch_size, self.out_channels)
+        )
+        hidden_states = torch.einsum("nhwpqc->nchpwq", hidden_states)
+        output = hidden_states.reshape(
+            shape=(-1, self.out_channels,
+                   height * self.patch_size, width * self.patch_size)
+        )
+
+        if not return_dict:
+            return (output,)
+        from diffusers.models.modeling_outputs import Transformer2DModelOutput
+        return Transformer2DModelOutput(sample=output)
+
+    # ------------------------------------------------------------------
+    # Classifier-free guidance wrapper.
+    # ------------------------------------------------------------------
+
+    def forward_with_cfg(self,
+                         hidden_states: torch.Tensor,
+                         timestep: torch.Tensor,
+                         current: Optional[dict],
+                         cache_dic: Optional[dict],
+                         teacache_state: Optional[dict] = None,
+                         class_labels: torch.Tensor = None,
+                         cfg_scale: float = 4.0):
+        half = hidden_states[: len(hidden_states) // 2]
+        combined = torch.cat([half, half], dim=0)
+        model_out = self.forward(combined, timestep, current, cache_dic,
+                                 teacache_state=teacache_state,
+                                 class_labels=class_labels, return_dict=False)[0]
+        # CFG only on noise channels; variance (learned sigma) passes through.
+        # noise channels = config.in_channels (= 4 for SD VAE latent).
+        eps, rest = model_out[:, :self.config.in_channels], model_out[:, self.config.in_channels:]
+        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+        eps = torch.cat([half_eps, half_eps], dim=0)
+        return torch.cat([eps, rest], dim=1)
+
+    # ------------------------------------------------------------------
+    # Checkpoint loading
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_pretrained(cls, path: str, **kwargs) -> "DiTTransformer2D":
+        """Load weights from a diffusers ``diffusion_pytorch_model.bin``.
+
+        ``path`` may point at the ``.bin`` file, the transformer directory,
+        or the pipeline root (containing a ``transformer/`` subdirectory).
+        """
+        import os
+        if os.path.isdir(path):
+            t_dir = os.path.join(path, "transformer")
+            if os.path.isdir(t_dir):
+                path = t_dir
+
+        if os.path.isdir(path):
+            bin_path = os.path.join(path, "diffusion_pytorch_model.bin")
+            cfg_path = os.path.join(path, "config.json")
         else:
-            generators = torch.Generator(device=self.device).manual_seed(seed)
+            bin_path = path
+            cfg_path = os.path.join(os.path.dirname(path), "config.json")
 
-        if isinstance(generators, list):
-            noises = []
-            for g in generators:
-                shape_one = (1,) + self._latent_shape[1:]
-                noises.append(torch.randn(shape_one, device=self.device, dtype=self.dtype,
-                                          generator=g))
-            latents = torch.cat(noises, dim=0) * scheduler.init_noise_sigma
-        else:
-            shape = (base_bs,) + self._latent_shape[1:]
-            latents = torch.randn(shape, device=self.device, dtype=self.dtype,
-                                  generator=generators) * scheduler.init_noise_sigma
+        import json
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        model = cls(
+            num_attention_heads=cfg.get("num_attention_heads", 16),
+            attention_head_dim=cfg.get("attention_head_dim", 72),
+            in_channels=cfg.get("in_channels", 4),
+            out_channels=cfg.get("out_channels", 8),
+            num_layers=cfg.get("num_layers", 28),
+            sample_size=cfg.get("sample_size", 32),
+            patch_size=cfg.get("patch_size", 2),
+            num_embeds_ada_norm=cfg.get("num_embeds_ada_norm", 1000),
+        )
 
-        # CFG doubling
-        if guidance_scale > 1.0:
-            latents = torch.cat([latents, latents], dim=0)
+        state_dict = torch.load(bin_path, map_location="cpu")
+        model.load_state_dict(state_dict, strict=True)
+        return model
 
-        for t in scheduler.timesteps:
-            latent_input = scheduler.scale_model_input(latents, t)
-            current_t = t.expand(latents.shape[0]).to(torch.int64)
-            noise_pred = transformer(
-                latent_input, timestep=current_t,
-                class_labels=class_labels, return_dict=False,
-            )[0]
-            if transformer.config.out_channels // 2 == self._latent_shape[1]:
-                noise_pred = noise_pred.chunk(2, dim=1)[0]
-            latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-        return latents
+
+# ------------------------------------------------------------------
+# Deferred re-export for eval/latency.py compatibility.
+# ------------------------------------------------------------------
+
+def __getattr__(name):
+    if name == 'DiTGenerator':
+        from run_dit import DiTGenerator as _Gen
+        return _Gen
+    raise AttributeError(f"module 'models.dit' has no attribute {name!r}")

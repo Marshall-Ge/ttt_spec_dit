@@ -46,25 +46,28 @@ class FIDISComputer(Metric):
         os.makedirs(self.gen_dir, exist_ok=True)
         self._did_init = True
 
-    def add(self, image: torch.Tensor, prompt: str = None, reference: torch.Tensor = None):
+    def add(self, image: torch.Tensor, prompt: str = None, reference: torch.Tensor = None, tag: str = None):
         """Save one generated image as 299×299 PNG to gen_dir.
 
         image: [3,H,W] or [1,3,H,W] in [0,1].
+        tag: optional suffix for filename (e.g. class name).
         """
         self._init_dirs()
         if image.dim() == 4:
             image = image[0]
+        suffix = f"_{tag}" if tag else ""
+        fname = f"{self._counter:06d}{suffix}.png"
         # Resize to 299×299 if needed
         if image.shape[-1] != 299 or image.shape[-2] != 299:
             pil = Image.fromarray(
                 (image.cpu().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype("uint8")
             )
             pil = pil.resize((299, 299), Image.BICUBIC)
-            out_path = os.path.join(self.gen_dir, f"{self._counter:06d}.png")
+            out_path = os.path.join(self.gen_dir, fname)
             pil.save(out_path)
         else:
             from utils import save_image
-            out_path = os.path.join(self.gen_dir, f"{self._counter:06d}.png")
+            out_path = os.path.join(self.gen_dir, fname)
             save_image(image, out_path)
         self._counter += 1
 
@@ -127,3 +130,10 @@ class FIDISComputer(Metric):
                 if f.endswith('.png'):
                     os.remove(os.path.join(self.gen_dir, f))
         self._did_init = False
+
+    def cleanup(self):
+        """Remove gen_dir entirely after FID computation."""
+        import shutil
+        if self.gen_dir and os.path.isdir(self.gen_dir):
+            shutil.rmtree(self.gen_dir)
+            self._did_init = False

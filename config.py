@@ -33,6 +33,8 @@ DIT_LATENT_SIZE = 32
 # ---------------------------------------------------------------------------
 COCO_DIR = "/root/autodl-fs/data/coco"
 IMAGENET_DIR = "/root/autodl-fs/data/imagenet"
+IMAGENET_299_DIR = "/root/autodl-fs/data/imagenet/val_299"
+COCO_299_DIR = "/root/autodl-fs/data/coco/val_299"
 DRAWBENCH_PATH = os.path.join(os.path.dirname(__file__), "drawbench200.txt")
 
 # ---------------------------------------------------------------------------
@@ -62,7 +64,7 @@ DDIM_FLOP_MATCHED_STEPS = 10
 SPECA_DEFAULT_BASE_THRESHOLD = 0.01       # cosine error scale [0, 1]
 SPECA_DEFAULT_DECAY_RATE = 0.01
 SPECA_DEFAULT_MIN_TAYLOR_STEPS = 1
-SPECA_DEFAULT_MAX_TAYLOR_STEPS = 2
+SPECA_DEFAULT_MAX_TAYLOR_STEPS = 4
 SPECA_DEFAULT_MAX_ORDER = 4
 SPECA_DEFAULT_ERROR_METRIC = "cosine_similarity"   # catches FF errors at check_layer
 

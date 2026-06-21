@@ -209,12 +209,22 @@ def main():
         sys.exit(1)
 
     # ---- Dispatch ----
-    if args.task == "t2i":
-        from pipelines.t2i import run_t2i
-        run_t2i(args)
-    elif args.task == "c2i":
-        from pipelines.c2i import run_c2i
+    if args.model == "dit":
+        from run_dit import run_c2i
         run_c2i(args)
+    elif args.model == "pixart":
+        if args.task == "t2i":
+            from run_pixart import run_t2i
+            run_t2i(args)
+        elif args.task == "c2i":
+            from run_pixart import run_c2i
+            run_c2i(args)
+        else:
+            print(f"[ERROR] Unknown task: {args.task}")
+            sys.exit(1)
+    else:
+        print(f"[ERROR] Unknown model: {args.model}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -95,29 +95,46 @@ class ImageNetDataset:
         self.val_dir = val_dir
         self.n_images = n_images
 
-        # Load class names
+        # ---- Load ILSVRC2012_ID → DiT class_id mapping ----
+        import json
+        mapping_path = os.path.join(imagenet_dir, "ilsvrc2012_to_dit_id.json")
+        self._dir_to_dit_class = None
+        if os.path.exists(mapping_path):
+            with open(mapping_path) as f:
+                _ilsvrc_to_dit = json.load(f)
+            # key=ILSVRC2012_ID (1-1000), val=DiT class_id (0-999)
+            # dir 0000 = ILSVRC2012_ID 1, dir 0001 = ILSVRC2012_ID 2, ...
+            self._dir_to_dit_class = [None] * 1000
+            for ils_str, dit_id in _ilsvrc_to_dit.items():
+                self._dir_to_dit_class[int(ils_str) - 1] = dit_id
+
+        # ---- Load class names (DiT ordering) ----
         if class_names is not None:
             self.class_names = class_names
         else:
             self.class_names = _load_class_names(imagenet_dir)
 
-        # Build (image_path, class_idx, prompt) list
+        # ---- Build (image_path, prompt, DiT_class_id) list ----
         self.items = []
         class_dirs = sorted(os.listdir(val_dir))
-        for class_idx, class_dir in enumerate(class_dirs):
+        for dir_idx, class_dir in enumerate(class_dirs):
             class_path = os.path.join(val_dir, class_dir)
             if not os.path.isdir(class_path):
                 continue
-            class_name = (self.class_names[class_idx]
-                          if class_idx < len(self.class_names)
+            # Translate directory index → DiT class_id (if mapping exists)
+            dit_class_id = (self._dir_to_dit_class[dir_idx]
+                            if self._dir_to_dit_class is not None
+                            else dir_idx)
+            class_name = (self.class_names[dit_class_id]
+                          if dit_class_id < len(self.class_names)
                           else class_dir)
             for fname in os.listdir(class_path):
                 if fname.lower().endswith(('.jpg', '.jpeg', '.png', '.JPEG')):
                     img_path = os.path.join(class_path, fname)
                     prompt = f"a photo of a {class_name}"
-                    self.items.append((img_path, prompt, class_idx))
+                    self.items.append((img_path, prompt, dit_class_id))
 
-        # Deterministic shuffle + subsample
+        # ---- Deterministic shuffle + subsample ----
         rng = np.random.RandomState(seed)
         rng.shuffle(self.items)
         self.items = self.items[:n_images]
