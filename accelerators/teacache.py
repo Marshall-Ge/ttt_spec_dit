@@ -154,7 +154,7 @@ def teacache_decide(state: Dict, modulated_input: torch.Tensor) -> Tuple[bool, f
             (modulated_input - prev).abs().mean()
             / prev.abs().mean()
         ).detach().float().cpu().item()
-        rescaled = float(state["rescale_func"](raw_diff))
+        rescaled = max(0.0, float(state["rescale_func"](raw_diff)))
         state["accumulated"] += rescaled
         should_calc = state["accumulated"] >= state["rel_l1_thresh"]
         if should_calc:

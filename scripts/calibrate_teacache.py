@@ -232,11 +232,18 @@ def calibrate(model_name, num_steps=20, num_runs=10, target_skip=0.5,
     poly = np.poly1d(coeffs)
     print(f"  Coefficients: {[round(c, 8) for c in coeffs.tolist()]}")
 
+    # Warn if poly oscillates negative outside training range
+    test_d = np.linspace(0, sorted_d.max() * 1.2, 100)
+    neg_n = int((poly(test_d) < 0).sum())
+    if neg_n > 0:
+        print(f"  ⚠  {neg_n}/100 test points negative — poly oscillates below "
+              f"training range. Re-run with --num_steps matching inference steps.")
+
     # 4. Validate
     print(f"\n[4] Validation:")
     for pct in [10, 25, 50, 75, 90]:
         v = np.percentile(sorted_d, pct)
-        print(f"  P{pct}: raw={v:.6f} → rescaled={poly(v):.6f}")
+        print(f"  P{pct}: raw={v:.6f} → rescaled={max(0.0, poly(v)):.6f}")
 
     # 5. Save
     output_path = output_path or os.path.join(
