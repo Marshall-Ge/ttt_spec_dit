@@ -123,6 +123,13 @@ Examples:
     parser.add_argument("--ttt_micro_epochs", type=int, default=3,
                         help="Per calc-step micro-epochs to reuse teacher signal "
                              "(default: 3). 1=single-pass, 3-5=better efficiency.")
+    # ---- VFL (Verification Feedback Loop) ----
+    parser.add_argument("--vfl", action="store_true", default=False,
+                        help="Enable VFL (Verification Feedback Loop) for online "
+                             "cache-decision improvement. Works alongside "
+                             "speca/teacache methods.")
+    parser.add_argument("--vfl_output_dir", type=str, default=None,
+                        help="VFL output directory (default: <output_dir>/vfl)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
     parser.add_argument("--guidance_scale", type=float, default=DEFAULT_GUIDANCE_SCALE,

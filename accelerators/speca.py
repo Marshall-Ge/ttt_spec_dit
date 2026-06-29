@@ -290,11 +290,19 @@ def speca_init(
 # Step-type decision
 # ===========================================================================
 
-def speca_cal_type(cache_dic: Dict, current: Dict) -> None:
+def speca_cal_type(cache_dic: Dict, current: Dict,
+                   calibrator=None) -> None:
     """Decide whether the current step is 'full' or 'Taylor'.
 
     Side-effects: updates ``current['type']`` / ``current['last_type']`` and
     the counters in ``cache_dic``.
+
+    Parameters
+    ----------
+    calibrator : OnlineCalibrator, optional
+        VFL M2 online calibrator. When provided and ready for the current bucket
+        at ``cache_dic['check_layer']``, its ``get_threshold()`` overrides the
+        static ``base_threshold * (decay_rate ** progress)`` formula.
     """
     min_taylor_steps = cache_dic['min_taylor_steps']
     max_taylor_steps = cache_dic['max_taylor_steps']
@@ -316,11 +324,23 @@ def speca_cal_type(cache_dic: Dict, current: Dict) -> None:
         reached_max_taylor = (
             cache_dic['taylor_step_counter'] >= max_taylor_steps
         )
+
+        # ---- Compute threshold: online calibrator > static formula ----
         progress = (current['num_steps'] - current['step']) / current['num_steps']
         base_threshold = cache_dic['base_threshold']
         decay_rate = cache_dic['decay_rate']
         threshold = base_threshold * (decay_rate ** progress)
         threshold = max(threshold, 0.01)
+
+        if calibrator is not None:
+            check_layer = cache_dic.get('check_layer', 27)
+            # Map step_idx to bucket: step counts DOWN in SpecA
+            step_idx = current['num_steps'] - 1 - current['step']
+            timestep_bucket = int(step_idx * 3 / current['num_steps']) if current['num_steps'] > 0 else 0
+            timestep_bucket = min(timestep_bucket, 2)
+            online_thresh = calibrator.get_threshold(
+                check_layer, timestep_bucket, default=threshold)
+            threshold = online_thresh
 
         if cache_dic['taylor_step_counter'] >= min_taylor_steps:
             cache_dic['check'] = True

@@ -35,7 +35,7 @@ from config import (
 )
 from utils import CudaTimer, decode_latent, save_image, pil_to_tensor, ensure_real_299
 
-from models.pixart import PixArtTransformer2D
+from models.pixart import PixArtTransformer2D, set_vfl_step_info
 from accelerators.teacache import (
     teacache_init, teacache_decide, teacache_cache_residual,
     teacache_apply_residual, teacache_step, teacache_reset,
@@ -352,6 +352,8 @@ class PixArtGenerator:
         timer = CudaTimer(self.device)
 
         for step_idx, t in enumerate(sched.timesteps):
+            # VFL: track current step for event recording hooks inside forward()
+            set_vfl_step_info(step_idx, len(sched.timesteps))
             latent_input = sched.scale_model_input(latents, t)
             current_t = t.expand(latents.shape[0]).to(torch.int64)
 
@@ -415,6 +417,8 @@ class PixArtGenerator:
         timesteps = scheduler.timesteps
 
         for step_idx, t in enumerate(timesteps):
+            # VFL: track current step for event recording hooks inside forward()
+            set_vfl_step_info(step_idx, len(timesteps))
             latent_input = scheduler.scale_model_input(latents, t)
             current_t = t.expand(latents.shape[0]).to(torch.int64)
 

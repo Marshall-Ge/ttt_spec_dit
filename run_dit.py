@@ -34,7 +34,7 @@ from config import (
 )
 from utils import CudaTimer, decode_latent, save_image, pil_to_tensor, ensure_real_299
 
-from models.dit import DiTTransformer2D
+from models.dit import DiTTransformer2D, set_vfl_step_info, get_vfl_buffer
 from accelerators.teacache import (
     teacache_init, teacache_decide, teacache_cache_residual,
     teacache_apply_residual, teacache_step, teacache_reset,
@@ -341,6 +341,8 @@ class DiTGenerator:
 
         timesteps = scheduler.timesteps
         for step_idx, t in enumerate(timesteps):
+            # VFL: track current step for event recording hooks inside forward()
+            set_vfl_step_info(step_idx, len(timesteps))
             latent_input = scheduler.scale_model_input(latents, t)
             current_t = t.expand(latents.shape[0]).to(torch.int64)
 
@@ -396,6 +398,18 @@ class DiTGenerator:
             # Learned-sigma: keep noise channels, discard variance channels
             if transformer.config.out_channels // 2 == transformer.config.in_channels:
                 noise_pred = noise_pred[:, :transformer.config.in_channels]
+
+            # ---- VFL: anchor sample collection (low frequency) ----
+            if step_idx % 5 == 0:
+                _vfl_buf = get_vfl_buffer()
+                if _vfl_buf is not None and len(_vfl_buf._anchor_samples) < 50:
+                    _vfl_buf.add_anchor_from_tensors(
+                        prompt=int(class_labels[0].item()) if class_labels is not None else 0,
+                        latent=latent_input.detach(),
+                        timestep=current_t[:1],
+                        target=noise_pred.detach(),
+                        model="dit",
+                    )
 
             latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
@@ -521,6 +535,8 @@ class DiTGenerator:
 
         timesteps = scheduler.timesteps
         for step_idx, t in enumerate(timesteps):
+            # VFL: track current step for event recording hooks inside forward()
+            set_vfl_step_info(step_idx, len(timesteps))
             latent_input = scheduler.scale_model_input(latents, t)
             current_t = t.expand(latents.shape[0]).to(torch.int64)
 
@@ -669,6 +685,37 @@ def run_c2i(args) -> Dict:
             p.requires_grad_(False)
         transformer.eval()
         vae.eval()
+
+    # ---- VFL: Verification Feedback Loop ----
+    vfl_buf = None
+    vfl_cal = None
+    vfl_trainer = None
+    if getattr(args, "vfl", False):
+        from verification_feedback_loop import (
+            StratifiedReplayBuffer, OnlineCalibrator, AsyncTrainer, VFLConfig,
+        )
+        from models.dit import set_vfl_buffer, set_vfl_calibrator
+
+        vfl_cfg = VFLConfig()
+        vfl_cfg.trigger_min_samples = max(10, args.n_prompts // 10)
+        vfl_cfg.top_k_layers = 2
+        vfl_cfg.loRA_rank = 4
+
+        vfl_buf = StratifiedReplayBuffer(
+            capacity_per_stratum=vfl_cfg.buffer_capacity_per_stratum)
+        vfl_cal = OnlineCalibrator(
+            ema_window=100, forget_factor=0.99)
+        set_vfl_buffer(vfl_buf, model_version="dit-v1")
+        set_vfl_calibrator(vfl_cal)
+
+        vfl_output_dir = getattr(args, "vfl_output_dir", None) or \
+            os.path.join(output_dir, "vfl")
+        vfl_trainer = AsyncTrainer(
+            generator.transformer, vfl_buf, config=vfl_cfg,
+            base_model_version="dit-v1", output_dir=vfl_output_dir,
+        )
+        print(f"  VFL enabled: buffer + calibrator + async trainer "
+              f"(trigger ≥{vfl_cfg.trigger_min_samples} samples)")
 
     # ===================================================================
     # 3. Setup metrics
@@ -900,6 +947,14 @@ def run_c2i(args) -> Dict:
     print(f"\n  Total time: {elapsed/60:.1f} min "
           f"({elapsed/total_images:.2f} s/image, {len(wall_times)} batches)")
 
+    # ---- VFL: trigger async training ----
+    if vfl_trainer is not None:
+        print("\n[VFL] Triggering async training check...")
+        train_result = vfl_trainer.maybe_train()
+        if train_result:
+            print(f"  [VFL] Training done: {train_result.get('loss_mean', '?'):.6f} "
+                  f"→ {os.path.basename(train_result.get('checkpoint_path', ''))}")
+
     # ===================================================================
     # 6. FID/IS
     # ===================================================================
@@ -954,6 +1009,18 @@ def run_c2i(args) -> Dict:
         agg["full_steps"] = full_cnt
         agg["total_calc"] = full_cnt
         agg["total_skip"] = taylor_cnt
+
+    # ---- VFL stats ----
+    if vfl_buf is not None:
+        vfl_stats = vfl_buf.stats()
+        agg["vfl_events"] = vfl_stats["total_samples"]
+        agg["vfl_strata"] = vfl_stats["num_strata_nonempty"]
+    if vfl_cal is not None:
+        agg["vfl_calibrator_updates"] = vfl_cal.total_updates
+    if vfl_trainer is not None:
+        ts = vfl_trainer.get_status()
+        agg["vfl_train_steps"] = ts["train_step"]
+        agg["vfl_layers"] = ts["attached_layers"]
 
     if "speed" in selected and all_results:
         unique_walls = list(dict.fromkeys(r["wall_s"] for r in all_results))

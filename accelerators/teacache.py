@@ -129,7 +129,8 @@ def teacache_init(
     }
 
 
-def teacache_decide(state: Dict, modulated_input: torch.Tensor) -> Tuple[bool, float]:
+def teacache_decide(state: Dict, modulated_input: torch.Tensor,
+                    calibrator=None, probe_layer: int = -1) -> Tuple[bool, float]:
     """Decide whether the current step must run the full block stack.
 
     Parameters
@@ -138,12 +139,39 @@ def teacache_decide(state: Dict, modulated_input: torch.Tensor) -> Tuple[bool, f
         TeaCache state (from ``teacache_init``).
     modulated_input : Tensor
         Output of ``compute_modulated_input()`` or ``compute_modulated_input_dit()``.
+    calibrator : OnlineCalibrator, optional
+        VFL M2 online calibrator. When provided and ready for the current bucket,
+        its ``get_rescale_fn()`` and ``get_threshold()`` override the state's
+        static ``rescale_func`` and ``rel_l1_thresh`` respectively.
+    probe_layer : int
+        Layer ID for ``(layer, bucket)`` key. Default -1 = TeaCache's global
+        step-level sentinel. Set to the VFL probe layer (e.g. 20 for DiT) if
+        per-layer calibration is desired.
 
     Returns
     -------
     should_calc : bool
     raw_rel_l1_diff : float
     """
+    # Compute current timestep bucket (0/1/2) from step counter
+    cnt = state["cnt"]
+    num_steps = state["num_steps"]
+    timestep_bucket = int(cnt * 3 / num_steps) if num_steps > 0 else 0
+    timestep_bucket = min(timestep_bucket, 2)
+
+    # ---- Resolve rescale function and threshold ----
+    # TeaCache uses the offline-calibrated poly4 rescale function (state["rescale_func"])
+    # because the RLS-based online rescale predicts true errors which are too small
+    # for the accumulate-vs-threshold mechanism.  The calibrator only adjusts the
+    # threshold (dynamic EMA), making it more or less conservative over time.
+    if calibrator is not None:
+        rescale_fn = state["rescale_func"]
+        threshold = calibrator.get_threshold(probe_layer, timestep_bucket,
+                                              default=state["rel_l1_thresh"])
+    else:
+        rescale_fn = state["rescale_func"]
+        threshold = state["rel_l1_thresh"]
+
     if state["cnt"] == 0 or state["cnt"] == state["num_steps"] - 1:
         should_calc = True
         state["accumulated"] = 0.0
@@ -154,9 +182,9 @@ def teacache_decide(state: Dict, modulated_input: torch.Tensor) -> Tuple[bool, f
             (modulated_input - prev).abs().mean()
             / prev.abs().mean()
         ).detach().float().cpu().item()
-        rescaled = max(0.0, float(state["rescale_func"](raw_diff)))
+        rescaled = max(0.0, float(rescale_fn(raw_diff)))
         state["accumulated"] += rescaled
-        should_calc = state["accumulated"] >= state["rel_l1_thresh"]
+        should_calc = state["accumulated"] >= threshold
         if should_calc:
             state["accumulated"] = 0.0
 
@@ -164,10 +192,12 @@ def teacache_decide(state: Dict, modulated_input: torch.Tensor) -> Tuple[bool, f
     state["accum_history"].append(state["accumulated"])
     state["raw_diff_history"].append(raw_diff)
     state["rescaled_diff_history"].append(
-        float(state["rescale_func"](raw_diff)) if raw_diff > 0 else 0.0
+        float(rescale_fn(raw_diff)) if raw_diff > 0 else 0.0
     )
     state["decisions"].append("calc" if should_calc else "skip")
     state["previous_modulated_input"] = modulated_input.detach()
+    # Stash for VFL calibrator: allows update_with_proxy(raw_diff, error_value)
+    state["last_raw_diff"] = raw_diff
     return should_calc, raw_diff
 
 
