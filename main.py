@@ -114,6 +114,15 @@ Examples:
                                  "cosine_similarity", "all"],
                         help="SpecA error metric for gate/threshold comparison "
                              "(default: relative_l1)")
+    # ---- TTT (Test-Time Training plugin, DiT-only) ----
+    parser.add_argument("--ttt", action="store_true", default=False,
+                        help="Enable online TTT plugin on top of TeaCache "
+                             "(DiT-only). Uses --ttt_lr and --ttt_micro_epochs.")
+    parser.add_argument("--ttt_lr", type=float, default=1e-4,
+                        help="TTT plugin AdamW learning rate (default: 1e-4)")
+    parser.add_argument("--ttt_micro_epochs", type=int, default=3,
+                        help="Per calc-step micro-epochs to reuse teacher signal "
+                             "(default: 3). 1=single-pass, 3-5=better efficiency.")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
     parser.add_argument("--guidance_scale", type=float, default=DEFAULT_GUIDANCE_SCALE,

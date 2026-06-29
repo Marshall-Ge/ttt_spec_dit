@@ -41,6 +41,10 @@ from accelerators.teacache import (
     teacache_stats, compute_modulated_input_dit,
 )
 from accelerators.speca import speca_init
+from models.ttt_plugin import (
+    SessionAdaLNModulator, ttt_state_init, ttt_reset_for_image,
+    ttt_train_step, ttt_record_skip, ttt_session_stats,
+)
 
 from eval.fid_is import FIDISComputer
 from eval.latency import LatencyMetric, FLOPsMetric
@@ -397,6 +401,174 @@ class DiTGenerator:
 
         return latents
 
+    # ==================================================================
+    # Session-TTT generation path (Phase 3)
+    # ==================================================================
+    #
+    # These methods are deliberately SEPARATE from generate / _denoise_loop:
+    #   * they are NOT under ``@torch.no_grad()`` — the plugin (φ) must build
+    #     a graph so its calc-step prediction can be backpropped;
+    #   * they call ``ttt_train_step`` after each calc step (one AdamW update
+    #     on φ only — Θ is frozen via requires_grad_(False) at the runner);
+    #   * they DO NOT disturb the existing 20-combo benchmark path.
+    # All non-plugin work is wrapped in ``torch.no_grad()`` so only φ's graph
+    # survives — keeping memory bounded.
+
+    def generate_ttt(self, prompt: Union[int, str, List],
+                     seed: Union[int, List[int]],
+                     guidance_scale: float = 4.0,
+                     teacache_state: Optional[dict] = None,
+                     ttt_state: Optional[dict] = None,
+                     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Generate one image in Session-TTT mode.
+
+        Mirrors ``generate`` but: (1) no ``@torch.no_grad()`` decorator; (2)
+        threads ``ttt_state`` so calc steps distil the backbone into φ and skip
+        steps route the cache through φ; (3) the caller owns the TeaCache step
+        counter and the γ threshold (set ``teacache_state['rel_l1_thresh']``).
+
+        Returns ``(latent, image)`` — same contract as ``generate``. The latent
+        retains the CFG-doubled batch if guidance is on; the caller takes the
+        cond half for metric comparison.
+        """
+        self._build_scheduler()
+
+        if isinstance(prompt, list):
+            prompts = prompt
+            seeds = seed if isinstance(seed, list) else [seed] * len(prompts)
+        else:
+            prompts = [prompt]
+            seeds = [seed] if isinstance(seed, int) else seed
+        B = len(prompts)
+
+        cond_labels = self.encode_prompt(prompts)
+
+        if guidance_scale > 1.0:
+            null_labels = torch.full((B,), self.null_class,
+                                     device=self.device, dtype=torch.long)
+            class_labels = torch.cat([cond_labels, null_labels], dim=0)
+        else:
+            class_labels = cond_labels
+
+        sched = self._scheduler
+        latent = self._denoise_loop_ttt(
+            class_labels, seeds, guidance_scale, sched,
+            teacache_state=teacache_state, ttt_state=ttt_state,
+        )
+
+        if guidance_scale > 1.0:
+            latent = latent.chunk(2, dim=0)[0]
+
+        scaling_factor = getattr(self.vae.config, "scaling_factor", 0.18215)
+        # VAE decode never needs gradients.
+        with torch.no_grad():
+            image = decode_latent(self.vae, latent, scaling_factor, self._dtype)
+        return latent, image
+
+    def _denoise_loop_ttt(self, class_labels: torch.Tensor,
+                          seed: Union[int, List[int]],
+                          guidance_scale: float,
+                          scheduler,
+                          teacache_state: Optional[dict],
+                          ttt_state: Optional[dict],
+                          ) -> torch.Tensor:
+        """Session-TTT denoise loop — Teacher/Student dispatch per step.
+
+        Loop-level responsibilities (mirrors the ``method == "teacache"``
+        branch of ``_denoise_loop`` but with TTT training):
+
+          * init latents + CFG doubling — under no_grad (no graph needed);
+          * per step: call ``forward_with_cfg_ttt`` (the model decides
+            teacher/student internally based on TeaCache's calc/skip);
+          * calc step → ``ttt_train_step`` (one AdamW step on φ);
+          * skip step  → ``ttt_record_skip`` (telemetry only);
+          * advance the TeaCache step counter (loop owns the counter, as in
+            the vanilla TeaCache path);
+          * learned-sigma split + scheduler.step.
+
+        The ambient autograd context is ENABLED here (no decorator). Inside
+        ``DiTTransformer2D._forward_ttt`` the 28-block teacher and the tail run
+        under ``torch.no_grad()``; ONLY the plugin forward builds a graph. This
+        keeps peak memory roughly proportional to one block's activation set.
+        """
+        transformer = self.transformer
+        base_bs = (class_labels.shape[0] // 2
+                   if guidance_scale > 1.0 else class_labels.shape[0])
+
+        # Latent init — no graph needed.
+        with torch.no_grad():
+            if isinstance(seed, list):
+                assert len(seed) == base_bs
+                generators = [torch.Generator(device=self.device).manual_seed(s)
+                              for s in seed]
+            else:
+                generators = torch.Generator(device=self.device).manual_seed(seed)
+
+            if isinstance(generators, list):
+                noises = []
+                for g in generators:
+                    shape_one = (1,) + self._latent_shape[1:]
+                    noises.append(torch.randn(shape_one, device=self.device,
+                                              dtype=self._dtype, generator=g))
+                latents = torch.cat(noises, dim=0) * scheduler.init_noise_sigma
+            else:
+                shape = (base_bs,) + self._latent_shape[1:]
+                latents = torch.randn(shape, device=self.device, dtype=self._dtype,
+                                      generator=generators) * scheduler.init_noise_sigma
+
+            if guidance_scale > 1.0:
+                latents = torch.cat([latents, latents], dim=0)
+
+        timesteps = scheduler.timesteps
+        for step_idx, t in enumerate(timesteps):
+            latent_input = scheduler.scale_model_input(latents, t)
+            current_t = t.expand(latents.shape[0]).to(torch.int64)
+
+            # --- TTT forward (decides teacher/student inside) ---
+            noise_pred = transformer.forward_with_cfg_ttt(
+                latent_input, current_t,
+                teacache_state=teacache_state, ttt_state=ttt_state,
+                class_labels=class_labels, cfg_scale=guidance_scale,
+            )
+
+            # --- TTT training dispatch (loop owns this, mirroring
+            #     teacache_step in the vanilla path) ---
+            from accelerators.teacache import teacache_step
+            last_decision = (teacache_state["decisions"][-1]
+                             if teacache_state and teacache_state["decisions"]
+                             else "calc")
+            if last_decision == "calc":
+                ttt_train_step(ttt_state)
+            else:
+                ttt_record_skip(ttt_state)
+            teacache_step(teacache_state)
+
+            # --- learned-sigma split + scheduler step (no graph) ---
+            with torch.no_grad():
+                if transformer.config.out_channels // 2 == transformer.config.in_channels:
+                    noise_pred = noise_pred[:, :transformer.config.in_channels]
+                latents = scheduler.step(
+                    noise_pred.detach(), t, latents, return_dict=False)[0]
+
+        return latents
+
+
+# ===========================================================================
+# TTT plugin setup helper
+# ===========================================================================
+
+def _setup_ttt(generator: "DiTGenerator", args):
+    """Create TTT plugin and state for the full c2i pipeline."""
+    transformer = generator.transformer
+    hidden_dim = (transformer.config.attention_head_dim *
+                  transformer.config.num_attention_heads)
+    plugin = SessionAdaLNModulator(hidden_dim=hidden_dim, mid_dim=192).to(
+        device=generator.device, dtype=torch.float32)
+    plugin.train()
+    return ttt_state_init(num_steps=args.num_steps, plugin=plugin,
+                          lr=args.ttt_lr,
+                          micro_epochs=args.ttt_micro_epochs)
+
 
 # ===========================================================================
 # run_c2i — top-level evaluation entry point for DiT
@@ -487,6 +659,17 @@ def run_c2i(args) -> Dict:
     generator = DiTGenerator(num_steps=args.num_steps, device=device, dtype=dt)
     generator.load()
 
+    # ---- TTT: freeze backbone before anything touches it ----
+    if args.ttt:
+        transformer = generator.transformer
+        vae = generator.vae
+        for p in transformer.parameters():
+            p.requires_grad_(False)
+        for p in vae.parameters():
+            p.requires_grad_(False)
+        transformer.eval()
+        vae.eval()
+
     # ===================================================================
     # 3. Setup metrics
     # ===================================================================
@@ -523,6 +706,7 @@ def run_c2i(args) -> Dict:
     # 4. Setup accelerator state (no monkeypatching!)
     # ===================================================================
     teacache_state = None
+    ttt_state = None
     speca_cache_dic = None
     speca_current = None
     ddim_steps = None
@@ -535,6 +719,10 @@ def run_c2i(args) -> Dict:
             else _load_dit_coefficients(),
         )
         print(f"  TeaCache ready (γ={args.thresh})")
+    if args.ttt:
+        ttt_state = _setup_ttt(generator, args)
+        print(f"  TTT plugin ready (lr={args.ttt_lr}, "
+              f"micro_epochs={args.ttt_micro_epochs})")
     elif args.method == "ddim":
         ddim_steps = args.num_steps
         print(f"  DDIM sampling ({args.num_steps} steps, no caching)")
@@ -593,6 +781,8 @@ def run_c2i(args) -> Dict:
         # Reset accelerator state
         if args.method == "teacache" and teacache_state is not None:
             teacache_reset(teacache_state)
+        if args.ttt and ttt_state is not None:
+            ttt_reset_for_image(ttt_state)
         if args.method == "speca":
             speca_cache_dic, speca_current = speca_init(
                 num_steps=args.num_steps,
@@ -608,15 +798,23 @@ def run_c2i(args) -> Dict:
 
         # Generate
         t0 = time.time()
-        latent, img = generator.generate(
-            batch_inputs, batch_seeds,
-            guidance_scale=args.guidance_scale,
-            method=args.method,
-            teacache_state=teacache_state,
-            cache_dic=speca_cache_dic,
-            current=speca_current,
-            ddim_steps=ddim_steps,
-        )
+        if args.ttt:
+            latent, img = generator.generate_ttt(
+                batch_inputs, batch_seeds,
+                guidance_scale=args.guidance_scale,
+                teacache_state=teacache_state,
+                ttt_state=ttt_state,
+            )
+        else:
+            latent, img = generator.generate(
+                batch_inputs, batch_seeds,
+                guidance_scale=args.guidance_scale,
+                method=args.method,
+                teacache_state=teacache_state,
+                cache_dic=speca_cache_dic,
+                current=speca_current,
+                ddim_steps=ddim_steps,
+            )
         wall_s = time.time() - t0
         wall_times.append(wall_s)
         per_img_s = wall_s / actual_bs
@@ -662,7 +860,22 @@ def run_c2i(args) -> Dict:
             metrics["latency"].add_pairs_batch(
                 [per_img_s] * actual_bs, [per_img_s] * actual_bs)
         if need_flops:
-            if args.method == "teacache" and teacache_state is not None:
+            if args.ttt and teacache_state is not None:
+                # TTT FLOPs: base TeaCache + plugin training overhead.
+                # Plugin fwd~6M + bwd~12M + opt~1M ≈ 19M per micro-epoch.
+                n_calc = sum(1 for d in teacache_state["decisions"] if d == "calc")
+                n_skip = sum(1 for d in teacache_state["decisions"] if d == "skip")
+                total = n_calc + n_skip
+                pfe = 19e6  # plugin forward+backward+opt FLOPs per micro-epoch
+                flops_full = metrics["flops"]._flops_full
+                flops_skip = metrics["flops"]._flops_skip
+                metrics["flops"]._total_vanilla += total * flops_full
+                metrics["flops"]._total_accel += (
+                    n_calc * (flops_full + args.ttt_micro_epochs * pfe)
+                    + n_skip * flops_skip
+                )
+                metrics["flops"]._n += 1
+            elif args.method == "teacache" and teacache_state is not None:
                 metrics["flops"].add_generation(
                     SimpleNamespace(decisions=teacache_state["decisions"]))
             elif args.method == "speca":
@@ -721,12 +934,17 @@ def run_c2i(args) -> Dict:
     if need_fid_is:
         agg.update(fid_is_results)
 
-    # TeaCache stats
+    # TeaCache / TTT stats
     if args.method == "teacache" and teacache_state is not None:
         st = teacache_stats(teacache_state)
         agg["skip_ratio"] = st.get("skip_ratio", 0.0)
         agg["total_calc"] = st.get("total_calc", 0)
         agg["total_skip"] = st.get("total_skip", 0)
+    if args.ttt and ttt_state is not None:
+        ts = ttt_session_stats(ttt_state)
+        agg["ttt_trained_steps"] = ts["trained_steps"]
+        agg["ttt_loss_mean"] = ts["session_loss_mean"]
+        agg["ttt_plugin_params"] = ts["plugin_params"]
     elif args.method == "speca" and speca_cache_dic is not None:
         full_cnt = speca_cache_dic.get('full_count', 0)
         taylor_cnt = args.num_steps - full_cnt
@@ -758,6 +976,9 @@ def run_c2i(args) -> Dict:
             "speca_min_taylor_steps": args.speca_min_taylor_steps if args.method == "speca" else None,
             "speca_max_taylor_steps": args.speca_max_taylor_steps if args.method == "speca" else None,
             "speca_error_metric": args.speca_error_metric if args.method == "speca" else None,
+            "ttt": args.ttt,
+            "ttt_lr": args.ttt_lr if args.ttt else None,
+            "ttt_micro_epochs": args.ttt_micro_epochs if args.ttt else None,
         },
         "aggregate": agg,
     }

@@ -104,23 +104,31 @@ class DiTTransformer2D(nn.Module):
                 cache_dic: Optional[dict] = None,
                 teacache_state: Optional[dict] = None,
                 class_labels: Optional[torch.Tensor] = None,
-                return_dict: bool = True):
-        """Explicit DiT forward with SpecA + TeaCache branching.
+                return_dict: bool = True,
+                ttt_state: Optional[dict] = None):
+        """Explicit DiT forward with SpecA + TeaCache + Session-TTT branching.
 
         Parameters
         ----------
         hidden_states : (B, C, H, W) latent
         timestep : (B,) timestep indices
-        current, cache_dic : SpecA state dicts (None = vanilla / TeaCache).
+        current, cache_dic : SpecA state dicts (None = vanilla / TeaCache / TTT).
         teacache_state : TeaCache state dict (None = vanilla / SpecA).
             Only one of (current+cache_dic) or teacache_state should be set.
             When set, the step counter is NOT advanced here — the caller
             must call ``teacache_step`` after this forward returns.
         class_labels : (B,) ImageNet class indices
+        ttt_state : Session-TTT state dict (from ``ttt_state_init``), optional.
+            When set TOGETHER with ``teacache_state``, activates the dual
+            Teacher/Student path: calc steps distil the backbone into the
+            persistent plugin ($\\phi$) via one AdamW step; skip steps route
+            the stale cache through $\\phi$. Backbone ($\\Theta$) is frozen
+            (gradient flows ONLY through $\\phi$). See ``models/ttt_plugin.py``.
         """
         # Determine mode
         use_speca = current is not None and cache_dic is not None
         use_teacache = teacache_state is not None and not use_speca
+        use_ttt = use_teacache and ttt_state is not None
 
         if use_speca:
             speca_cal_type(cache_dic, current)
@@ -138,6 +146,22 @@ class DiTTransformer2D(nn.Module):
             modulated = compute_modulated_input_dit(
                 self, hidden_states, timestep, class_labels)
             should_calc, _ = teacache_decide(teacache_state, modulated)
+
+            # ===========================================================
+            # Session-TTT: persistent plugin modulation of the cache.
+            #
+            # The plugin (φ) is the ONLY learnable object — the backbone (Θ)
+            # is frozen (requires_grad=False at the runner level). On calc
+            # steps we distil the full 28-block teacher Z_true into φ; on
+            # skip steps we let φ modulate the stale cache. The ambient
+            # autograd context (set by _denoise_loop_ttt, which is NOT under
+            # @torch.no_grad) determines whether the plugin builds a graph.
+            # ===========================================================
+            if use_ttt:
+                return self._forward_ttt(
+                    hidden_states, timestep, class_labels, teacache_state,
+                    ttt_state, should_calc, height, width, return_dict,
+                )
 
             if not should_calc:
                 # Skip all blocks — apply cached residual
@@ -256,6 +280,172 @@ class DiTTransformer2D(nn.Module):
         return Transformer2DModelOutput(sample=output)
 
     # ------------------------------------------------------------------
+    # Session-TTT forward path (Teacher/Student dual mode)
+    # ------------------------------------------------------------------
+
+    def _run_full_blocks(self, hidden_states: torch.Tensor,
+                         timestep: torch.Tensor,
+                         class_labels: torch.Tensor) -> torch.Tensor:
+        """Run the full 28-block stack (vanilla, 'full' step type).
+
+        Factored out so it can be called under ``torch.no_grad`` from the
+        TTT teacher path WITHOUT affecting the SpecA / TeaCache block loop
+        below. Returns the post-block hidden state (B, seq, hidden_dim).
+        """
+        for block in self.transformer_blocks:
+            norm_hidden, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.norm1(
+                hidden_states, timestep=timestep, class_labels=class_labels,
+                hidden_dtype=hidden_states.dtype,
+            )
+            attn_out = block.attn1(norm_hidden)
+            hidden_states = hidden_states + gate_msa.unsqueeze(1) * attn_out
+            norm_ff = block.norm3(hidden_states)
+            modulated_ff = norm_ff * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+            ff_out = block.ff(modulated_ff)
+            hidden_states = hidden_states + gate_mlp.unsqueeze(1) * ff_out
+        return hidden_states
+
+    def _forward_ttt(self, hidden_states, timestep, class_labels,
+                     teacache_state, ttt_state, should_calc,
+                     height, width, return_dict):
+        """Session-TTT dual-mode forward, sitting atop the TeaCache decision.
+
+        **calc step (Teacher Mode):**
+            1. Run the frozen 28-block backbone under ``no_grad`` → Z_true.
+            2. Build the stale cached input = (hidden + prev_residual), detached.
+            3. Run the plugin (φ) on the stale input → Z_pred (graph-enabled).
+            4. Stash (z_pred, z_true) for the loop's ``ttt_train_step``.
+            5. Cache the residual against Z_true and emit Z_true through the
+               shared tail — so the emitted image uses the high-fidelity
+               teacher output (the plugin only *learns* here, it does not yet
+               *drive* the output).
+
+        **skip step (Student/Inference Mode):**
+            1. Build the stale cached input = (hidden + prev_residual).
+            2. Run φ on it → Z_pred under ``no_grad`` (no training signal).
+            3. Emit Z_pred through the shared tail. The 28 blocks are bypassed
+               entirely — this is where session-level adaptation pays off: a
+               well-trained φ sustains high skip ratios without fidelity loss.
+
+        Both branches converge on the shared output tail (norm_out + proj_out +
+        unpatchify), so no tail code is duplicated. The TeaCache step counter
+        is advanced by the caller (consistent with the vanilla TeaCache path).
+        """
+        plugin = ttt_state["plugin"]
+
+        # Shared timestep embedding (same signal the tail projector uses).
+        t_emb = self.transformer_blocks[0].norm1.emb(
+            timestep, class_labels, hidden_dtype=hidden_states.dtype)
+
+        # ---- Plugin runs in fp32 for numerical stability ----
+        # The hidden-state MSE can reach ~1e5 (e.g. 170K), which overflows
+        # fp16 (max 65504) during the squared-difference and produces NaNs
+        # that then corrupt φ. The plugin is tiny (<1M params), so we keep it
+        # in fp32 and cast the backbone's fp16 inputs up at the boundary,
+        # casting the output back down. This is mixed-precision training done
+        # right: backbone stays fp16 (fast inference), plugin trains in fp32.
+        plugin_dtype = next(plugin.parameters()).dtype
+        backbone_dtype = hidden_states.dtype
+
+        if should_calc:
+            # ---------- Teacher Mode ----------
+            ori_hidden = hidden_states.clone()
+
+            # 1. Frozen-teacher ground truth: full 28-block pass, no graph.
+            #    Wrap in autocast(fp32) so the teacher signal is numerically
+            #    clean — fp16 activations in the 28-block stack can spike
+            #    beyond 65504 and produce NaN, which would corrupt φ.
+            with torch.no_grad():
+                with torch.amp.autocast('cuda', dtype=torch.float32):
+                    z_true = self._run_full_blocks(
+                        hidden_states, timestep, class_labels)
+
+            # Safety net: if the fp16 backbone still produces NaN (e.g.
+            # extreme activation values), fall back to the stale cached
+            # residual and skip this training opportunity.
+            if torch.isnan(z_true).any():
+                import warnings
+                warnings.warn(
+                    f"[TTT] NaN detected in teacher z_true at step "
+                    f"{teacache_state.get('cnt', '?')}; "
+                    f"falling back to stale cache, skipping training.")
+                z_true = teacache_apply_residual(
+                    teacache_state, hidden_states).clone()
+
+            # 2. Stale cached input that the plugin must learn to correct.
+            #    teacache_apply_residual returns hidden unchanged when no
+            #    residual is cached yet (first step) — correct identity.
+            cached = teacache_apply_residual(teacache_state, hidden_states).detach()
+
+            # 3. Micro-Epoch distillation on z_true (sample-starvation fix).
+            #    The expensive 28-block teacher signal costs ~675M FLOPs to
+            #    produce; its value is fully extracted by reusing it multiple
+            #    times. Plugin (<1M params) forward+backward is ~100× cheaper
+            #    than the backbone — squeezing z_true dry before discarding it.
+            micro_epochs = ttt_state.get("micro_epochs", 1)
+            z_true_target = z_true.detach().to(plugin_dtype)
+
+            plugin.train()
+            for me in range(micro_epochs):
+                ttt_state["optimizer"].zero_grad(set_to_none=True)
+                with torch.amp.autocast('cuda', dtype=torch.float32):
+                    z_pred = plugin(cached.to(plugin_dtype),
+                                    t_emb.to(plugin_dtype))
+                    loss = F.mse_loss(z_pred, z_true_target)
+                loss.backward()
+                ttt_state["optimizer"].step()
+            plugin.eval()
+
+            # Telemetry: log the final epoch's loss.
+            loss_val = float(loss.detach().item())
+            ttt_state["losses"].append(loss_val)
+            ttt_state["session_losses"].append(loss_val)
+            ttt_state["n_calc"] += 1
+            ttt_state["trained_steps"] += 1
+
+            # Clear stash: training was done in the micro-epoch loop; the
+            # ambient _denoise_loop_ttt must NOT double-train (ttt_train_step
+            # returns 0.0 when z_pred/z_true are None).
+            ttt_state["z_pred"] = None
+            ttt_state["z_true"] = None
+
+            # 5. Update TeaCache residual against the teacher, emit teacher.
+            #    z_true is fp32 from autocast; cast back to backbone dtype
+            #    for the tail (which is fp16) and for caching.
+            z_true_bd = z_true.to(backbone_dtype)
+            teacache_cache_residual(teacache_state, z_true_bd, ori_hidden)
+            hidden_states = z_true_bd
+
+        else:
+            # ---------- Student/Inference Mode ----------
+            # Bypass all 28 blocks; φ modulates the stale cache. No training.
+            cached = teacache_apply_residual(teacache_state, hidden_states)
+            with torch.no_grad():
+                z_pred = plugin(cached.detach().to(plugin_dtype),
+                                t_emb.to(plugin_dtype))
+            hidden_states = z_pred.to(backbone_dtype)
+
+        # Shared output tail (identical to the vanilla / TeaCache path).
+        conditioning = t_emb
+        shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
+        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        hidden_states = self.proj_out_2(hidden_states)
+        hidden_states = hidden_states.reshape(
+            shape=(-1, height, width, self.patch_size,
+                   self.patch_size, self.out_channels)
+        )
+        hidden_states = torch.einsum("nhwpqc->nchpwq", hidden_states)
+        output = hidden_states.reshape(
+            shape=(-1, self.out_channels,
+                   height * self.patch_size, width * self.patch_size)
+        )
+
+        if not return_dict:
+            return (output,)
+        from diffusers.models.modeling_outputs import Transformer2DModelOutput
+        return Transformer2DModelOutput(sample=output)
+
+    # ------------------------------------------------------------------
     # Classifier-free guidance wrapper.
     # ------------------------------------------------------------------
 
@@ -275,6 +465,35 @@ class DiTTransformer2D(nn.Module):
         # CFG only on noise channels; variance (learned sigma) passes through.
         # noise channels = config.in_channels (= 4 for SD VAE latent).
         eps, rest = model_out[:, :self.config.in_channels], model_out[:, self.config.in_channels:]
+        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+        eps = torch.cat([half_eps, half_eps], dim=0)
+        return torch.cat([eps, rest], dim=1)
+
+    def forward_with_cfg_ttt(self,
+                             hidden_states: torch.Tensor,
+                             timestep: torch.Tensor,
+                             teacache_state: Optional[dict],
+                             ttt_state: Optional[dict],
+                             class_labels: torch.Tensor,
+                             cfg_scale: float):
+        """CFG wrapper for the Session-TTT path.
+
+        Mirrors ``forward_with_cfg`` (takes the cond half, duplicates it to
+        [cond, cond], runs ONE forward), threading the TTT state so the
+        plugin's teacher/student logic fires inside ``forward``. CFG is
+        applied to the noise channels exactly as in the vanilla path; it is
+        orthogonal to the plugin, which operates in the pre-tail hidden space.
+        """
+        half = hidden_states[: len(hidden_states) // 2]
+        combined = torch.cat([half, half], dim=0)
+        model_out = self.forward(combined, timestep,
+                                 current=None, cache_dic=None,
+                                 teacache_state=teacache_state,
+                                 class_labels=class_labels, return_dict=False,
+                                 ttt_state=ttt_state)[0]
+        eps, rest = (model_out[:, :self.config.in_channels],
+                     model_out[:, self.config.in_channels:])
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
