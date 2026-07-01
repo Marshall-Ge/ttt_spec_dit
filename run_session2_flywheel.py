@@ -50,7 +50,7 @@ print(f"  Model loaded (null_class={null_class})")
 # =====================================================================
 print(f"\n[2] Setting up VFL calibrator (exploit mode)...")
 buf = StratifiedReplayBuffer(capacity_per_stratum=200)
-cal = OnlineCalibrator(ema_window=100, forget_factor=0.99)
+cal = OnlineCalibrator(ema_window=100)
 cal.set_exploit_mode(True)  # allows thresholds below static default
 set_vfl_buffer(buf, 'dit-v1')
 set_vfl_calibrator(cal)

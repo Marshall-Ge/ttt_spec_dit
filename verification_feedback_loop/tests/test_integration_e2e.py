@@ -39,7 +39,7 @@ def test_synthetic_event_flow():
 
     # Setup
     buf = StratifiedReplayBuffer(capacity_per_stratum=100)
-    cal = OnlineCalibrator(ema_window=50, forget_factor=0.95)
+    cal = OnlineCalibrator(ema_window=50)
     num_steps = 50
 
     # ---- TeaCache path ----
@@ -194,7 +194,7 @@ def test_real_dit_generation():
 
         # Setup VFL
         buf = StratifiedReplayBuffer(capacity_per_stratum=100)
-        cal = OnlineCalibrator(ema_window=50, forget_factor=0.95)
+        cal = OnlineCalibrator(ema_window=50)
         set_vfl_buffer(buf, model_version="dit-v1.0")
         set_vfl_calibrator(cal)
         assert get_vfl_buffer() is buf

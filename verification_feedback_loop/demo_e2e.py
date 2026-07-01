@@ -48,7 +48,7 @@ def demo_synthetic(n_images: int = 20, num_steps: int = 20):
 
     # ---- Setup ----
     buf = StratifiedReplayBuffer(capacity_per_stratum=cfg.buffer_capacity_per_stratum)
-    cal = OnlineCalibrator(ema_window=50, forget_factor=0.95)
+    cal = OnlineCalibrator(ema_window=50)
     registry = VersionRegistry(state_dir="./output/vfl_demo")
     registry.set_current_version("dit-synthetic-v1")
 
@@ -244,7 +244,7 @@ def demo_real_dit(n_images: int = 10, num_steps: int = 20):
 
     # ---- VFL setup ----
     buf = StratifiedReplayBuffer(capacity_per_stratum=cfg.buffer_capacity_per_stratum)
-    cal = OnlineCalibrator(ema_window=100, forget_factor=0.99)
+    cal = OnlineCalibrator(ema_window=100)
     registry = VersionRegistry(state_dir="./output/vfl_demo")
     registry.set_current_version("dit-real-v1")
     gate = EvalGate(output_dir="./output/vfl_demo",

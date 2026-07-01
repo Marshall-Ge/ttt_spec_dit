@@ -35,8 +35,6 @@ class VFLConfig:
         Curvature loss 权重下限。
     lambda_curvature_max : float
         Curvature loss 权重上限。
-    rls_forget_factor : float
-        RLS 遗忘因子 (0 < λ ≤ 1, 越小遗忘越快)。
     ema_window_short : int
         版本切换后的短 EMA 窗口步数。
     ema_window_long : int
@@ -58,8 +56,6 @@ class VFLConfig:
     # ---- M2: 在线校准 ----
     ema_window_long: int = 500     # 正常运行 EMA 窗口
     ema_window_short: int = 50     # 版本切换后短窗口
-    rls_forget_factor: float = 0.995  # RLS 遗忘因子
-
     # ---- M3: 回放缓冲区 ----
     buffer_capacity_per_stratum: int = 1000
     batch_ratio: Dict[str, float] = field(default_factory=lambda: {

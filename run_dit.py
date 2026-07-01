@@ -704,7 +704,7 @@ def run_c2i(args) -> Dict:
         vfl_buf = StratifiedReplayBuffer(
             capacity_per_stratum=vfl_cfg.buffer_capacity_per_stratum)
         vfl_cal = OnlineCalibrator(
-            ema_window=100, forget_factor=0.99)
+            ema_window=100)
         set_vfl_buffer(vfl_buf, model_version="dit-v1")
         set_vfl_calibrator(vfl_cal)
 
