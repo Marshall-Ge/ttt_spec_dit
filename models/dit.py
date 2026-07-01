@@ -53,6 +53,8 @@ from verification_feedback_loop.vfl_state import (
     get_vfl_buffer,
     get_vfl_calibrator,
     set_vfl_step_info,
+    get_vfl_step_idx,
+    get_vfl_num_steps,
     set_vfl_sample_id,
     record_speca_event,
     record_teacache_event,
@@ -312,9 +314,9 @@ class DiTTransformer2D(nn.Module):
                     # ---- VFL: record SpecA verification event ----
                     _vfl_record_speca_event(
                         layer_id=layer_idx,
-                        timestep_val=_vfl_step_idx,
-                        step_idx=_vfl_step_idx,
-                        num_steps=_vfl_num_steps,
+                        timestep_val=get_vfl_step_idx(),
+                        step_idx=get_vfl_step_idx(),
+                        num_steps=get_vfl_num_steps(),
                         predicted_hidden=hidden_states,
                         full_hidden=full_hidden,
                         error_value=gate_value,
@@ -334,9 +336,9 @@ class DiTTransformer2D(nn.Module):
             # decisions — using the full-stack residual as the "prediction".
             _vfl_record_teacache_event(
                 layer_id=_VFL_PROBE_LAYER,
-                timestep_val=_vfl_step_idx,
-                step_idx=_vfl_step_idx,
-                num_steps=_vfl_num_steps,
+                timestep_val=get_vfl_step_idx(),
+                step_idx=get_vfl_step_idx(),
+                num_steps=get_vfl_num_steps(),
                 predicted_hidden=teacache_apply_residual(
                     teacache_state, ori_hidden),
                 true_hidden=hidden_states,

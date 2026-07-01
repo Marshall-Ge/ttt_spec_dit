@@ -77,6 +77,16 @@ def set_vfl_step_info(step_idx: int,
         _vfl_timestep_actual = int(timestep_actual)
 
 
+def get_vfl_step_idx() -> int:
+    """Return the current denoising step index (set by set_vfl_step_info)."""
+    return _vfl_step_idx
+
+
+def get_vfl_num_steps() -> int:
+    """Return the total number of denoising steps (set by set_vfl_step_info)."""
+    return _vfl_num_steps
+
+
 def set_vfl_sample_id(sample_id: int):
     """Set the current denoising trajectory id (called before each image).
 

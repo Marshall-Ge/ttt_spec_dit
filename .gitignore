@@ -6,3 +6,5 @@
 *.pdf
 **/__trash__
 output/
+analysis_output/
+scripts/experienment
