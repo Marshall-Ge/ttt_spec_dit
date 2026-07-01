@@ -51,6 +51,7 @@ from verification_feedback_loop.vfl_state import (
     set_vfl_buffer,
     set_vfl_calibrator,
     get_vfl_buffer,
+    get_vfl_calibrator,
     set_vfl_step_info,
     set_vfl_sample_id,
     record_speca_event,
@@ -180,7 +181,7 @@ class DiTTransformer2D(nn.Module):
         use_ttt = use_teacache and ttt_state is not None
 
         if use_speca:
-            speca_cal_type(cache_dic, current, calibrator=_vfl_calibrator)
+            speca_cal_type(cache_dic, current, calibrator=get_vfl_calibrator())
         vanilla = not use_speca and not use_teacache
 
         # VFL: snapshot the transformer's raw latent input (B, C, H, W) before
@@ -199,7 +200,7 @@ class DiTTransformer2D(nn.Module):
             modulated = compute_modulated_input_dit(
                 self, hidden_states, timestep, class_labels)
             should_calc, _ = teacache_decide(teacache_state, modulated,
-                                              calibrator=_vfl_calibrator,
+                                              calibrator=get_vfl_calibrator(),
                                               probe_layer=_VFL_PROBE_LAYER)
 
             # ===========================================================

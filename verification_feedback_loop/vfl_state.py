@@ -42,6 +42,11 @@ def set_vfl_calibrator(calibrator):
     _vfl_calibrator = calibrator
 
 
+def get_vfl_calibrator():
+    """Return the current VFL calibrator (None if VFL / M2 is disabled)."""
+    return _vfl_calibrator
+
+
 def get_vfl_buffer():
     """Return the current VFL buffer (None if VFL is disabled)."""
     return _vfl_buffer

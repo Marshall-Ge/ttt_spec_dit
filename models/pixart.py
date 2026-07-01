@@ -50,6 +50,7 @@ from verification_feedback_loop.vfl_state import (
     set_vfl_buffer,
     set_vfl_calibrator,
     get_vfl_buffer,
+    get_vfl_calibrator,
     set_vfl_step_info,
     record_speca_event,
     record_teacache_event,
@@ -177,7 +178,7 @@ class PixArtTransformer2D(nn.Module):
         use_teacache = teacache_state is not None and not use_speca
 
         if use_speca:
-            speca_cal_type(cache_dic, current, calibrator=_vfl_calibrator)
+            speca_cal_type(cache_dic, current, calibrator=get_vfl_calibrator())
         vanilla = not use_speca and not use_teacache
 
         # Preprocess attention masks (replicate diffusers convention).
@@ -224,7 +225,7 @@ class PixArtTransformer2D(nn.Module):
             modulated = compute_modulated_input(
                 self, hidden_states, timestep_emb)
             should_calc, _ = teacache_decide(teacache_state, modulated,
-                                            calibrator=_vfl_calibrator,
+                                            calibrator=get_vfl_calibrator(),
                                             probe_layer=_VFL_PROBE_LAYER)
 
             if not should_calc:
