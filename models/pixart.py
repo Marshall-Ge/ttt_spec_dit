@@ -65,31 +65,51 @@ def _vfl_record_speca_event(layer_id, timestep_val, step_idx, num_steps,
                               predicted_hidden, full_hidden, error_value,
                               module_name="",
                               latent_input=None, encoder_hidden_states=None):
-    """Record a SpecA verification event for PixArt."""
-    record_speca_event(
-        layer_id=layer_id, timestep_val=timestep_val,
-        step_idx=step_idx, num_steps=num_steps,
-        predicted_hidden=predicted_hidden, full_hidden=full_hidden,
-        error_value=error_value,
-        model="pixart", module_name=module_name,
-        latent_input=latent_input,
-        encoder_hidden_states=encoder_hidden_states,
-    )
+    """Record per-sample SpecA verification events for PixArt.
+
+    Splits batch tensors into per-sample events — see the DiT counterpart
+    for the memory rationale.
+    """
+    B = predicted_hidden.shape[0]
+    pred = predicted_hidden[:B]
+    full = full_hidden[:B]
+    lat = latent_input[:B] if latent_input is not None else None
+    enc = encoder_hidden_states[:B] if encoder_hidden_states is not None else None
+
+    for i in range(B):
+        record_speca_event(
+            layer_id=layer_id, timestep_val=timestep_val,
+            step_idx=step_idx, num_steps=num_steps,
+            predicted_hidden=pred[i:i + 1],
+            full_hidden=full[i:i + 1],
+            error_value=error_value,
+            model="pixart", module_name=module_name,
+            latent_input=lat[i:i + 1] if lat is not None else None,
+            encoder_hidden_states=enc[i:i + 1] if enc is not None else None,
+        )
 
 
 def _vfl_record_teacache_event(layer_id, timestep_val, step_idx, num_steps,
                                  predicted_hidden, true_hidden,
                                  raw_diff: float = 0.0,
                                  latent_input=None, encoder_hidden_states=None):
-    """Record a TeaCache probe event for PixArt."""
-    record_teacache_event(
-        layer_id=layer_id, timestep_val=timestep_val,
-        step_idx=step_idx, num_steps=num_steps,
-        predicted_hidden=predicted_hidden, true_hidden=true_hidden,
-        model="pixart", raw_diff=raw_diff,
-        latent_input=latent_input,
-        encoder_hidden_states=encoder_hidden_states,
-    )
+    """Record per-sample TeaCache probe events for PixArt."""
+    B = predicted_hidden.shape[0]
+    pred = predicted_hidden[:B]
+    true = true_hidden[:B]
+    lat = latent_input[:B] if latent_input is not None else None
+    enc = encoder_hidden_states[:B] if encoder_hidden_states is not None else None
+
+    for i in range(B):
+        record_teacache_event(
+            layer_id=layer_id, timestep_val=timestep_val,
+            step_idx=step_idx, num_steps=num_steps,
+            predicted_hidden=pred[i:i + 1],
+            true_hidden=true[i:i + 1],
+            model="pixart", raw_diff=raw_diff,
+            latent_input=lat[i:i + 1] if lat is not None else None,
+            encoder_hidden_states=enc[i:i + 1] if enc is not None else None,
+        )
 
 
 class PixArtTransformer2D(nn.Module):

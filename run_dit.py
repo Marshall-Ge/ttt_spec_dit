@@ -1085,7 +1085,8 @@ def run_c2i(args) -> Dict:
         agg["vfl_crash_count"] = ws["crash_count"]
         # Phase 2 全层挂 LoRA, attached_layers 不再有意义, 但保留
         # vfl_layers 字段向后兼容 (输出全 28 层)
-        agg["vfl_layers"] = sorted(vfl_worker._layer_wrappers.keys())
+        agg["vfl_layers"] = (sorted(vfl_worker._layer_wrappers.keys())
+                            if vfl_worker._layer_wrappers else [])
         if ws.get("latest_checkpoint"):
             agg["vfl_latest_checkpoint"] = ws["latest_checkpoint"]
 

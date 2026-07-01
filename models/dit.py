@@ -67,31 +67,67 @@ def _vfl_record_speca_event(layer_id, timestep_val, step_idx, num_steps,
                               predicted_hidden, full_hidden, error_value,
                               module_name="",
                               latent_input=None, class_labels=None):
-    """Record a SpecA verification event for DiT."""
-    record_speca_event(
-        layer_id=layer_id, timestep_val=timestep_val,
-        step_idx=step_idx, num_steps=num_steps,
-        predicted_hidden=predicted_hidden, full_hidden=full_hidden,
-        error_value=error_value,
-        model="dit", module_name=module_name,
-        latent_input=latent_input,
-        class_labels=class_labels,
-    )
+    """Record per-sample SpecA verification events for DiT.
+
+    Splits batch tensors into per-sample events.  Without this a single
+    event at batch_size=32 with CFG doubling stores (64, 256, 1152) × fp32
+    ≈ 151 MB — just 20 events would blow past 3 GB of CPU RAM.  Per-sample
+    events store (1, 256, 1152) × fp16 ≈ 0.6 MB each, keeping the buffer
+    bounded at ~2 GB even when full (3 strata × 1 000).
+    """
+    # ---- CFG dedup: keep only the cond half ----
+    if class_labels is not None:
+        B = class_labels.shape[0]  # real batch size (before CFG doubling)
+    else:
+        B = predicted_hidden.shape[0]
+
+    pred = predicted_hidden[:B]
+    full = full_hidden[:B]
+    lat = latent_input[:B] if latent_input is not None else None
+    cl = class_labels[:B] if class_labels is not None else None
+
+    for i in range(B):
+        record_speca_event(
+            layer_id=layer_id, timestep_val=timestep_val,
+            step_idx=step_idx, num_steps=num_steps,
+            predicted_hidden=pred[i:i + 1],
+            full_hidden=full[i:i + 1],
+            error_value=error_value,
+            model="dit", module_name=module_name,
+            latent_input=lat[i:i + 1] if lat is not None else None,
+            class_labels=cl[i:i + 1] if cl is not None else None,
+        )
 
 
 def _vfl_record_teacache_event(layer_id, timestep_val, step_idx, num_steps,
                                  predicted_hidden, true_hidden,
                                  raw_diff: float = 0.0,
                                  latent_input=None, class_labels=None):
-    """Record a TeaCache probe event for DiT."""
-    record_teacache_event(
-        layer_id=layer_id, timestep_val=timestep_val,
-        step_idx=step_idx, num_steps=num_steps,
-        predicted_hidden=predicted_hidden, true_hidden=true_hidden,
-        model="dit", raw_diff=raw_diff,
-        latent_input=latent_input,
-        class_labels=class_labels,
-    )
+    """Record per-sample TeaCache probe events for DiT.
+
+    Same per-sample splitting as ``_vfl_record_speca_event`` — see that
+    function's docstring for the memory rationale.
+    """
+    if class_labels is not None:
+        B = class_labels.shape[0]
+    else:
+        B = predicted_hidden.shape[0]
+
+    pred = predicted_hidden[:B]
+    true = true_hidden[:B]
+    lat = latent_input[:B] if latent_input is not None else None
+    cl = class_labels[:B] if class_labels is not None else None
+
+    for i in range(B):
+        record_teacache_event(
+            layer_id=layer_id, timestep_val=timestep_val,
+            step_idx=step_idx, num_steps=num_steps,
+            predicted_hidden=pred[i:i + 1],
+            true_hidden=true[i:i + 1],
+            model="dit", raw_diff=raw_diff,
+            latent_input=lat[i:i + 1] if lat is not None else None,
+            class_labels=cl[i:i + 1] if cl is not None else None,
+        )
 
 
 class DiTTransformer2D(nn.Module):

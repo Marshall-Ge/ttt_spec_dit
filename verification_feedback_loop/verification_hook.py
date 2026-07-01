@@ -188,15 +188,15 @@ def make_speca_event(
         layer_id=layer_id,
         timestep=timestep_val,
         timestep_bucket=bucket,
-        predicted_feature=predicted_hidden.detach().float().cpu(),
-        true_feature=full_hidden.detach().float().cpu(),
+        predicted_feature=predicted_hidden.detach().half().cpu(),
+        true_feature=full_hidden.detach().half().cpu(),
         error_value=error_value,
         decision="reject",  # check_layer 触发 = 潜在 rejection
         model=model,
         base_model_version=base_model_version,
         step_idx=step_idx,
         module=module,
-        latent_input=(latent_input.detach().cpu()
+        latent_input=(latent_input.detach().half().cpu()
                       if latent_input is not None else None),
         class_labels=(class_labels.detach().cpu()
                       if class_labels is not None else None),
@@ -240,15 +240,15 @@ def make_teacache_probe_event(
         layer_id=layer_id,
         timestep=timestep_val,
         timestep_bucket=bucket,
-        predicted_feature=predicted_hidden.detach().float().cpu(),
-        true_feature=true_hidden.detach().float().cpu(),
+        predicted_feature=predicted_hidden.detach().half().cpu(),
+        true_feature=true_hidden.detach().half().cpu(),
         error_value=error_val,
         decision="reject",  # calc 步骤本身说明 TeaCache 认为不能 skip
         model=model,
         base_model_version=base_model_version,
         step_idx=step_idx,
         module="residual",   # TeaCache 是全 block 级别的 residual
-        latent_input=(latent_input.detach().cpu()
+        latent_input=(latent_input.detach().half().cpu()
                       if latent_input is not None else None),
         class_labels=(class_labels.detach().cpu()
                       if class_labels is not None else None),

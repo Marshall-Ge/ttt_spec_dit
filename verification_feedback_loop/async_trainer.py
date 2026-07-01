@@ -112,35 +112,24 @@ class AsyncTrainingWorker:
         self.train_batch_size = train_batch_size
         os.makedirs(output_dir, exist_ok=True)
 
-        # ---- 1. 深拷贝 transformer 作为训练副本 (fp32) ----
-        # 在 fp16 状态下拷贝内存占用更小 (Phase 2 约束), 之后再转 fp32。
-        # 推理副本与训练副本完全独立: dtype / autograd / LoRA 都互不影响。
+        # ---- 1. Keep a reference to the inference model; deepcopy is LAZY ----
+        # We defer ``copy.deepcopy(transformer)`` + ``.float()`` + LoRA attach
+        # to the first ``_train_once()`` call.  In many benchmark runs the
+        # buffer never reaches the readiness threshold, so the ~2.7 GB fp32
+        # copy would be pure waste.  When training DOES fire the copy happens
+        # inside the background thread — inference continues unaffected on the
+        # original fp16 model.
         if not getattr(transformer, "transformer_blocks", None):
             raise ValueError(
                 "AsyncTrainingWorker expects a transformer with "
                 "`.transformer_blocks` (DiT/PixArt). Got: "
                 f"{type(transformer).__name__}")
-        orig_dtype = next(transformer.parameters()).dtype
-        # 推理副本原本在 fp16 → 拷贝时占 fp16 内存, 然后转 fp32
-        self._train_model = copy.deepcopy(transformer)
-        self._train_model.float()
-        self._train_model.train()
+        self._inference_model = transformer
+        self._train_model: Optional[torch.nn.Module] = None
+        self._layer_wrappers: Optional[Dict[int, Any]] = None
+        self._model_ready: bool = False
 
-        # ---- 2. 给全部 28 层挂 LoRA ----
-        # Phase 2 取消 select_top_k_layers: 异步触发时 buffer 稀疏, 选层
-        # 不可靠; 训练后 error 分布会漂移, 固定选层无法自适应。全层挂
-        # rank=4 的 LoRA 总参数 ~5.2M, 远小于 675M backbone, 训练代价可接受。
-        self._layer_wrappers = attach_lora_all_layers(
-            self._train_model, rank=config.loRA_rank, alpha=config.loRA_alpha)
-        freeze_backbone(self._train_model)
-
-        n_params = count_lora_params(self._layer_wrappers)
-        n_layers = len(self._layer_wrappers)
-        print(f"[VFL:AsyncTrainingWorker] Initialised: "
-              f"train_model=fp32 deepcopy, LoRA on {n_layers} layers "
-              f"({n_params:,} params, rank={config.loRA_rank})")
-
-        # ---- 3. 训练状态 ----
+        # ---- 2. 训练状态 ----
         self._optimizer: Optional[torch.optim.Optimizer] = None
         self._candidate_version: int = 0
         self._total_updates: int = 0
@@ -261,6 +250,37 @@ class AsyncTrainingWorker:
         print("[VFL:AsyncTrainingWorker] loop exiting (stop requested)")
 
     # ------------------------------------------------------------------
+    # Lazy model init — deepcopy only on first training trigger
+    # ------------------------------------------------------------------
+
+    def _ensure_train_model(self):
+        """Deep-copy the inference model and attach LoRA (once).
+
+        Called lazily from ``_train_once`` so that benchmark runs where the
+        buffer never crosses the readiness threshold pay zero GPU-memory cost
+        for the training copy (~2.7 GB fp32 for DiT-2-256).
+        """
+        if self._model_ready:
+            return
+        self._train_model = copy.deepcopy(self._inference_model)
+        self._train_model.float()
+        self._train_model.train()
+
+        self._layer_wrappers = attach_lora_all_layers(
+            self._train_model,
+            rank=self.config.loRA_rank,
+            alpha=self.config.loRA_alpha,
+        )
+        freeze_backbone(self._train_model)
+
+        n_params = count_lora_params(self._layer_wrappers)
+        n_layers = len(self._layer_wrappers)
+        print(f"[VFL:AsyncTrainingWorker] lazy init: "
+              f"train_model=fp32 deepcopy, LoRA on {n_layers} layers "
+              f"({n_params:,} params, rank={self.config.loRA_rank})")
+        self._model_ready = True
+
+    # ------------------------------------------------------------------
     # Buffer readiness — 信号质量而非 raw count
     # ------------------------------------------------------------------
 
@@ -301,6 +321,9 @@ class AsyncTrainingWorker:
         返回 checkpoint 路径 (成功) 或 None (跳过 / 无可用样本)。
         异常由调用方 ``_train_loop`` 的 try/except 兜底。
         """
+        # ---- 0. Lazy init: deepcopy + LoRA attach on first trigger ----
+        self._ensure_train_model()
+
         t0 = time.time()
         cfg = self.config
 
