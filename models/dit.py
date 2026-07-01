@@ -43,88 +43,45 @@ from accelerators.teacache import (
     compute_modulated_input_dit,
 )
 
-# VFL (Verification Feedback Loop) — module-level buffer singleton.
-# Set via ``set_vfl_buffer()`` before generation; None → all VFL code is no-op.
-_vfl_buffer = None
-_vfl_calibrator = None  # M2 online calibrator (separate from buffer)
-_vfl_model_version = "unknown"
-_VFL_PROBE_LAYER = 20  # layer for TeaCache per-layer probe (matches SpecA check_layer)
-_vfl_step_idx = 0       # set by denoising loop before each forward call
-_vfl_num_steps = 50     # set by denoising loop before each forward call
+# VFL (Verification Feedback Loop) — delegates to shared module.
+# All globals and hooks live in ``verification_feedback_loop.vfl_state``.
+# We re-export the public setters/getters for backward compatibility and keep
+# only DiT-specific constants + thin recording wrappers that pass ``model="dit"``.
+from verification_feedback_loop.vfl_state import (
+    set_vfl_buffer,
+    set_vfl_calibrator,
+    get_vfl_buffer,
+    set_vfl_step_info,
+    record_speca_event,
+    record_teacache_event,
+)
 
-
-def set_vfl_step_info(step_idx: int, num_steps: int):
-    """Set per-step tracking info for VFL hooks (called by denoising loop)."""
-    global _vfl_step_idx, _vfl_num_steps
-    _vfl_step_idx = step_idx
-    _vfl_num_steps = num_steps
-
-
-def set_vfl_buffer(buffer, model_version: str = "unknown"):
-    """Register the global VFL buffer for this process."""
-    global _vfl_buffer, _vfl_model_version
-    _vfl_buffer = buffer
-    _vfl_model_version = model_version
-
-
-def set_vfl_calibrator(calibrator):
-    """Register the global VFL calibrator for this process (M2)."""
-    global _vfl_calibrator
-    _vfl_calibrator = calibrator
-
-
-def get_vfl_buffer():
-    """Return the current VFL buffer (None if VFL is disabled)."""
-    return _vfl_buffer
+_VFL_PROBE_LAYER = 20  # TeaCache + SpecA check layer for DiT
 
 
 def _vfl_record_speca_event(layer_id, timestep_val, step_idx, num_steps,
                               predicted_hidden, full_hidden, error_value,
                               module_name=""):
-    """Record a SpecA verification event to the global VFL buffer + calibrator."""
-    import verification_feedback_loop.verification_hook as vh
-    buf = _vfl_buffer
-    cal = _vfl_calibrator
-    if buf is None and cal is None:
-        return
-    event = vh.make_speca_event(
+    """Record a SpecA verification event for DiT."""
+    record_speca_event(
         layer_id=layer_id, timestep_val=timestep_val,
         step_idx=step_idx, num_steps=num_steps,
         predicted_hidden=predicted_hidden, full_hidden=full_hidden,
-        error_value=error_value, error_metric="cosine_similarity",
-        model="dit", base_model_version=_vfl_model_version,
-        module=module_name,
+        error_value=error_value,
+        model="dit", module_name=module_name,
     )
-    if buf is not None:
-        vh.record_event(event, buffer=buf)
-    if cal is not None:
-        cal.update(event)  # EMA threshold adaptation
 
 
 def _vfl_record_teacache_event(layer_id, timestep_val, step_idx, num_steps,
                                  predicted_hidden, true_hidden,
                                  raw_diff: float = 0.0):
-    """Record a TeaCache probe event to the global VFL buffer + calibrator.
-
-    If ``raw_diff > 0``, also updates the calibrator's RLS model with the
-    proxy→error pair (raw_diff is the TeaCache modulation change, error_value
-    is the hidden-state prediction error from the probe).
-    """
-    import verification_feedback_loop.verification_hook as vh
-    buf = _vfl_buffer
-    cal = _vfl_calibrator
-    if buf is None and cal is None:
-        return
-    event = vh.make_teacache_probe_event(
+    """Record a TeaCache probe event for DiT."""
+    record_teacache_event(
         layer_id=layer_id, timestep_val=timestep_val,
         step_idx=step_idx, num_steps=num_steps,
         predicted_hidden=predicted_hidden, true_hidden=true_hidden,
-        model="dit", base_model_version=_vfl_model_version,
+        model="dit", raw_diff=raw_diff,
     )
-    if buf is not None:
-        vh.record_event(event, buffer=buf)
-    if cal is not None:
-        cal.update(event)
 
 
 class DiTTransformer2D(nn.Module):

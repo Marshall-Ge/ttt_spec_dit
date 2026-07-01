@@ -53,6 +53,14 @@ from verification_feedback_loop.version_registry import (
     AdapterRecord,
 )
 from verification_feedback_loop.config import VFLConfig
+from verification_feedback_loop.vfl_state import (
+    set_vfl_buffer,
+    set_vfl_calibrator,
+    get_vfl_buffer,
+    set_vfl_step_info,
+    record_speca_event,
+    record_teacache_event,
+)
 
 __all__ = [
     # M1
@@ -90,4 +98,11 @@ __all__ = [
     "AdapterRecord",
     # Config
     "VFLConfig",
+    # VFL shared state hooks
+    "set_vfl_buffer",
+    "set_vfl_calibrator",
+    "get_vfl_buffer",
+    "set_vfl_step_info",
+    "record_speca_event",
+    "record_teacache_event",
 ]
