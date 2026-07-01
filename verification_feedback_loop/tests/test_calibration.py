@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Tests for M2: OnlineCalibrator — RLS convergence, EMA threshold, version swap."""
+"""Tests for M2: OnlineCalibrator — EMA threshold, version swap."""
 
 import math
 import torch
 
 from verification_feedback_loop.online_calibration import (
     OnlineCalibrator,
-    _RLSEstimator,
     _EMAThreshold,
 )
 from verification_feedback_loop.verification_hook import (
@@ -35,87 +34,6 @@ def _make_event(layer_id=5, timestep_bucket=1, error_value=0.05,
         base_model_version="v1.0",
         step_idx=10,
     )
-
-
-# ===========================================================================
-# RLS estimator tests
-# ===========================================================================
-
-
-class TestRLSEstimator:
-    def test_initial_state(self):
-        rls = _RLSEstimator(degree=2, forget_factor=0.995)
-        assert not rls.is_ready()
-        assert rls.n_updates == 0
-        # Before any updates, predict should be near 0
-        assert abs(rls.predict(0.5)) < 0.1
-
-    def test_convergence_linear(self):
-        """RLS should converge to the true linear relationship y = 2x + 1."""
-        rls = _RLSEstimator(degree=1, forget_factor=0.99)  # linear: [x, 1]
-        true_slope, true_intercept = 2.0, 1.0
-
-        for i in range(200):
-            x = i * 0.01  # 0 .. 2
-            y = true_slope * x + true_intercept + 0.1 * (0.5 - (i % 100) / 100)
-            rls.update(x, y)
-
-        assert rls.is_ready()
-        slope, intercept = rls.get_linear_coeffs()
-        # Should be close to true values (within reasonable tolerance)
-        assert abs(slope - true_slope) < 0.5, f"slope={slope:.3f}, expected ~{true_slope}"
-        assert abs(intercept - true_intercept) < 0.5, f"intercept={intercept:.3f}, expected ~{true_intercept}"
-
-    def test_convergence_quadratic(self):
-        """RLS should converge for y = 3x² + 2x + 1."""
-        rls = _RLSEstimator(degree=2, forget_factor=0.99)
-        for i in range(300):
-            x = i * 0.005  # 0 .. 1.5
-            y = 3 * x**2 + 2 * x + 1 + 0.05 * (0.5 - (i % 50) / 50)
-            rls.update(x, y)
-
-        assert rls.is_ready()
-        # Predict should be close at sampled points
-        for x_test in [0.0, 0.5, 1.0]:
-            y_pred = rls.predict(x_test)
-            y_true = 3 * x_test**2 + 2 * x_test + 1
-            assert abs(y_pred - y_true) < 1.0, \
-                f"At x={x_test}: pred={y_pred:.3f}, true={y_true:.3f}"
-
-    def test_forgetting(self):
-        """After a distribution shift, RLS should adapt with forgetting."""
-        rls = _RLSEstimator(degree=1, forget_factor=0.95)  # fast forgetting
-
-        # Phase 1: y = 1x + 0
-        for _ in range(50):
-            rls.update(0.5, 0.5)
-        slope1, _ = rls.get_linear_coeffs()
-        assert abs(slope1 - 1.0) < 0.5
-
-        # Phase 2: y = 5x + 0 (distribution shift)
-        for _ in range(100):
-            rls.update(0.5, 2.5)
-        slope2, _ = rls.get_linear_coeffs()
-        # Should have moved toward slope=5
-        assert slope2 > slope1, f"RLS didn't adapt: slope1={slope1:.3f}, slope2={slope2:.3f}"
-
-    def test_reset(self):
-        rls = _RLSEstimator(degree=1, forget_factor=0.99)
-        for _ in range(50):
-            rls.update(0.5, 1.0)
-        assert rls.is_ready()
-        rls.reset()
-        assert not rls.is_ready()
-        assert rls.n_updates == 0
-
-    def test_min_updates(self):
-        rls = _RLSEstimator(degree=1)
-        assert not rls.is_ready(min_updates=10)
-        for _ in range(9):
-            rls.update(0.5, 1.0)
-        assert not rls.is_ready(min_updates=10)
-        rls.update(0.5, 1.0)
-        assert rls.is_ready(min_updates=10)
 
 
 # ===========================================================================
@@ -181,29 +99,6 @@ class TestOnlineCalibrator:
         cal.update(event)
         assert cal.total_updates == 1
         assert cal.num_strata == 1
-
-    def test_update_with_proxy(self):
-        cal = OnlineCalibrator(forget_factor=0.95, ema_window=50)
-
-        # Feed correlated proxy→error pairs
-        for i in range(100):
-            proxy = 0.01 * (i % 50)
-            true_error = 2.0 * proxy + 0.01  # linear relationship
-            event = _make_event(
-                layer_id=5, timestep_bucket=1,
-                error_value=true_error,
-            )
-            cal.update_with_proxy(event, proxy_value=proxy)
-
-        assert cal.total_updates == 100
-
-        # The rescale function should approximate the linear relationship
-        rescale = cal.get_rescale_fn(layer_id=5, timestep_bucket=1)
-        for x_test in [0.05, 0.10, 0.20]:
-            pred = rescale(x_test)
-            expected = 2.0 * x_test + 0.01
-            # Allow loose tolerance since RLS takes time to converge
-            assert pred >= 0, f"rescale({x_test}) = {pred} < 0"
 
     def test_get_threshold_default(self):
         cal = OnlineCalibrator()
@@ -278,5 +173,3 @@ class TestOnlineCalibrator:
         # Never-seen stratum should return default
         thresh = cal.get_threshold(99, 2, default=0.30)
         assert thresh == 0.30
-        rescale = cal.get_rescale_fn(99, 2)
-        assert rescale(0.5) == 0.5  # identity fallback

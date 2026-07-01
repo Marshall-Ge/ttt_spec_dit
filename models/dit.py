@@ -14,7 +14,7 @@ so the existing ``diffusion_pytorch_model.bin`` checkpoint loads directly and
 ``transformer.transformer_blocks[0].norm1.emb`` / ``proj_out_1`` / ``proj_out_2``)
 keeps working unchanged.
 
-Block module-name convention (keys into ``cache_dic['cache'][-1][layer]``):
+Block module-name convention (keys into ``cache.cache[-1][layer]``):
   - 'attn' : self-attention output (modulated)
   - 'mlp'  : feed-forward output (modulated)
 """
@@ -28,6 +28,8 @@ import torch.nn.functional as F
 from diffusers.models.transformers.transformer_2d import Transformer2DModel
 
 from accelerators.speca import (
+    SpecACache,
+    SpecAState,
     speca_cal_type,
     taylor_cache_init,
     derivative_approximation,
@@ -122,10 +124,7 @@ def _vfl_record_teacache_event(layer_id, timestep_val, step_idx, num_steps,
     if buf is not None:
         vh.record_event(event, buffer=buf)
     if cal is not None:
-        if raw_diff > 0:
-            cal.update_with_proxy(event, proxy_value=raw_diff)
-        else:
-            cal.update(event)
+        cal.update(event)
 
 
 class DiTTransformer2D(nn.Module):
@@ -186,8 +185,8 @@ class DiTTransformer2D(nn.Module):
     def forward(self,
                 hidden_states: torch.Tensor,
                 timestep: torch.Tensor,
-                current: Optional[dict] = None,
-                cache_dic: Optional[dict] = None,
+                current: Optional[SpecAState] = None,
+                cache_dic: Optional[SpecACache] = None,
                 teacache_state: Optional[dict] = None,
                 class_labels: Optional[torch.Tensor] = None,
                 return_dict: bool = True,
@@ -281,8 +280,8 @@ class DiTTransformer2D(nn.Module):
         # 3. Block loop (visible, no monkeypatch).
         for layer_idx, block in enumerate(self.transformer_blocks):
             if use_speca:
-                current['layer'] = layer_idx
-            step_type = 'full' if (vanilla or use_teacache) else current['type']
+                current.layer = layer_idx
+            step_type = 'full' if (vanilla or use_teacache) else current.type
 
             # adaLN-Zero: returns (norm_hidden, gate_msa, shift_mlp, scale_mlp, gate_mlp)
             norm_hidden, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.norm1(
@@ -292,7 +291,7 @@ class DiTTransformer2D(nn.Module):
 
             if step_type == 'full':
                 if use_speca:
-                    current['module'] = 'attn'
+                    current.module = 'attn'
                     taylor_cache_init(cache_dic, current)
                 attn_out = block.attn1(norm_hidden)
                 if use_speca:
@@ -300,7 +299,7 @@ class DiTTransformer2D(nn.Module):
                 hidden_states = hidden_states + gate_msa.unsqueeze(1) * attn_out
 
                 if use_speca:
-                    current['module'] = 'mlp'
+                    current.module = 'mlp'
                     taylor_cache_init(cache_dic, current)
                 norm_ff = block.norm3(hidden_states)
                 modulated_ff = norm_ff * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
@@ -310,16 +309,16 @@ class DiTTransformer2D(nn.Module):
                 hidden_states = hidden_states + gate_mlp.unsqueeze(1) * ff_out
 
             elif step_type == 'Taylor':
-                distance = current['step'] - current['activated_steps'][-1]
-                check_layer = cache_dic['check_layer']
-                do_check = (layer_idx == check_layer and cache_dic['check'])
+                distance = current.step - current.activated_steps[-1]
+                check_layer = cache_dic.check_layer
+                do_check = (layer_idx == check_layer and cache_dic.check)
                 if do_check:
                     full_hidden = hidden_states.clone()
 
                 hidden_states = cache_step_dit(
                     hidden_states,
-                    cache_dic['cache'][-1][layer_idx]['attn'],
-                    cache_dic['cache'][-1][layer_idx]['mlp'],
+                    cache_dic.cache[-1][layer_idx]['attn'],
+                    cache_dic.cache[-1][layer_idx]['mlp'],
                     gate_msa, gate_mlp, distance,
                 )
 
@@ -337,9 +336,9 @@ class DiTTransformer2D(nn.Module):
 
                     gate_value, _ = compute_error_gate(
                         hidden_states, full_hidden,
-                        metric=cache_dic['error_metric'],
+                        metric=cache_dic.error_metric,
                     )
-                    current['last_layer_error'] = gate_value
+                    current.last_layer_error = gate_value
 
                     # ---- VFL: record SpecA verification event ----
                     _vfl_record_speca_event(
@@ -568,8 +567,8 @@ class DiTTransformer2D(nn.Module):
     def forward_with_cfg(self,
                          hidden_states: torch.Tensor,
                          timestep: torch.Tensor,
-                         current: Optional[dict],
-                         cache_dic: Optional[dict],
+                         current: Optional[SpecAState],
+                         cache_dic: Optional[SpecACache],
                          teacache_state: Optional[dict] = None,
                          class_labels: torch.Tensor = None,
                          cfg_scale: float = 4.0):

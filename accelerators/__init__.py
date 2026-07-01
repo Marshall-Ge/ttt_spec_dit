@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """Accelerators for diffusion model inference — pure functions, no classes.
 
-  - speca:   per-block per-submodule Taylor cache; ``cache_dic``/``current``
-             dicts are owned by the caller and threaded through the model.
+  - speca:   per-block per-submodule Taylor cache; ``SpecACache``/``SpecAState``
+             objects are owned by the caller and threaded through the model.
   - teacache: whole-step residual cache; integrated at the top-level sampling
              loop (the model itself is agnostic to it).
 """
 
 from .speca import (
+    SpecACache,
+    SpecAState,
     speca_init,
     speca_cal_type,
     derivative_approximation,

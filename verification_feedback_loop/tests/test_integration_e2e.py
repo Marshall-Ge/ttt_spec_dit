@@ -78,7 +78,7 @@ def test_synthetic_event_flow():
             )
             record_event(event, buffer=buf)
             if raw2 > 0:
-                cal.update_with_proxy(event, proxy_value=raw2)
+                cal.update(event)
             else:
                 cal.update(event)
 
@@ -114,15 +114,15 @@ def test_synthetic_event_flow():
     types_with_cal = []
 
     for step in [49, 48, 47, 46, 45]:  # reverse denoising order
-        current["step"] = step
+        current.step = step
 
         # Without calibrator
         speca_cal_type(cache_dic, current, calibrator=None)
-        types_no_cal.append(current["type"])
+        types_no_cal.append(current.type)
 
         # Simulate error if full step happened
-        if current["type"] == "full":
-            current["last_layer_error"] = 0.005
+        if current.type == "full":
+            current.last_layer_error = 0.005
             # Simulate a VFL event
             event = VerificationEvent(
                 layer_id=20, timestep=step,
@@ -142,11 +142,11 @@ def test_synthetic_event_flow():
         num_layers=28, error_metric="cosine_similarity", check_layer=20,
     )
     for step in [49, 48, 47, 46, 45]:
-        current2["step"] = step
+        current2.step = step
         speca_cal_type(cache_dic2, current2, calibrator=cal)
-        types_with_cal.append(current2["type"])
-        if current2["type"] == "full":
-            current2["last_layer_error"] = 0.005
+        types_with_cal.append(current2.type)
+        if current2.type == "full":
+            current2.last_layer_error = 0.005
 
     # SpecA decisions may differ with warm calibrator (expected behavior)
     print(f"  SpecA: types_no_cal={types_no_cal}, types_with_cal={types_with_cal}")
@@ -222,11 +222,11 @@ def test_real_dit_generation():
                 min_taylor_steps=1, max_taylor_steps=4, max_order=4,
                 num_layers=28, error_metric="cosine_similarity", check_layer=20,
             )
-            current["step"] = num_steps - 1  # first step
+            current.step = num_steps - 1  # first step
             set_vfl_step_info(0, num_steps)
             out2 = transformer(x, t, current=current, cache_dic=cache_dic,
                               class_labels=class_labels, return_dict=False)[0]
-            print(f"  SpecA forward: output shape={out2.shape}, step_type={current.get('type','?')}")
+            print(f"  SpecA forward: output shape={out2.shape}, step_type={current.type}")
 
             # --- 3. TeaCache forward with VFL ---
             from accelerators.teacache import teacache_init

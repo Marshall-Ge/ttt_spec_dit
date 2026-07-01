@@ -40,7 +40,7 @@ from accelerators.teacache import (
     teacache_apply_residual, teacache_step, teacache_reset,
     teacache_stats, compute_modulated_input_dit,
 )
-from accelerators.speca import speca_init
+from accelerators.speca import SpecACache, SpecAState, speca_init
 from models.ttt_plugin import (
     SessionAdaLNModulator, ttt_state_init, ttt_reset_for_image,
     ttt_train_step, ttt_record_skip, ttt_session_stats,
@@ -231,8 +231,8 @@ class DiTGenerator:
                  guidance_scale: float = 4.0,
                  method: str = "baseline",
                  teacache_state: Optional[dict] = None,
-                 cache_dic: Optional[dict] = None,
-                 current: Optional[dict] = None,
+                 cache_dic: Optional[SpecACache] = None,
+                 current: Optional[SpecAState] = None,
                  ddim_steps: Optional[int] = None,
                  ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Generate image(s).
@@ -305,8 +305,8 @@ class DiTGenerator:
                        scheduler,
                        method: str,
                        teacache_state: Optional[dict],
-                       cache_dic: Optional[dict],
-                       current: Optional[dict],
+                       cache_dic: Optional[SpecACache],
+                       current: Optional[SpecAState],
                        ) -> torch.Tensor:
         """Single denoising loop with method dispatch.
 
@@ -367,7 +367,7 @@ class DiTGenerator:
             elif method == "speca":
                 # SpecA: state threaded through model
                 if current is not None:
-                    current['step'] = len(timesteps) - 1 - step_idx
+                    current.step = len(timesteps) - 1 - step_idx
                 if guidance_scale > 1.0:
                     noise_pred = transformer.forward_with_cfg(
                         latent_input, current_t,
@@ -926,7 +926,7 @@ def run_c2i(args) -> Dict:
                 metrics["flops"].add_generation(
                     SimpleNamespace(decisions=teacache_state["decisions"]))
             elif args.method == "speca":
-                full_cnt = speca_cache_dic.get('full_count', 0)
+                full_cnt = speca_cache_dic.full_count
                 taylor_cnt = args.num_steps - full_cnt
                 metrics["flops"].add_generation(
                     SimpleNamespace(
@@ -1001,7 +1001,7 @@ def run_c2i(args) -> Dict:
         agg["ttt_loss_mean"] = ts["session_loss_mean"]
         agg["ttt_plugin_params"] = ts["plugin_params"]
     elif args.method == "speca" and speca_cache_dic is not None:
-        full_cnt = speca_cache_dic.get('full_count', 0)
+        full_cnt = speca_cache_dic.full_count
         taylor_cnt = args.num_steps - full_cnt
         total = full_cnt + taylor_cnt
         agg["skip_ratio"] = taylor_cnt / total if total > 0 else 0.0

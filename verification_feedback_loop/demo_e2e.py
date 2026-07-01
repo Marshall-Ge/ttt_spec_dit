@@ -112,7 +112,7 @@ def demo_synthetic(n_images: int = 20, num_steps: int = 20):
                 )
                 record_event(event, buffer=buf,
                             accept_sample_rate=cfg.accept_sample_rate)
-                cal.update_with_proxy(event, proxy_value=raw_diff)
+                cal.update(event)
 
     elapsed = time.time() - t0
     buf_stats = buf.stats()
@@ -127,11 +127,7 @@ def demo_synthetic(n_images: int = 20, num_steps: int = 20):
     print("\n[3] L1 online calibration...")
     # Show calibrator adapting
     print(f"    Threshold (stratum 20/1): {cal_stats['threshold']:.4f}")
-    print(f"    RLS ready: {cal_stats['rls_ready']}, slope={cal_stats.get('rls_slope', '?'):.4f}")
-    if cal_stats['rls_ready']:
-        for x_test in [0.05, 0.10, 0.20]:
-            pred = cal.get_rescale_fn(20, 1)(x_test)
-            print(f"      rescale({x_test:.2f}) = {pred:.4f}")
+    print(f"    EMA ready: {cal_stats['ema_ready']}")
 
     # ---- Phase 3: L3 async training ----
     print("\n[4] L3 async training...")
@@ -274,7 +270,7 @@ def demo_real_dit(n_images: int = 10, num_steps: int = 20):
 
         for step_idx in range(num_steps):
             # SpecA counts DOWN
-            current["step"] = num_steps - 1 - step_idx
+            current.step = num_steps - 1 - step_idx
             set_vfl_step_info(step_idx, num_steps)
             t_step = torch.tensor([500 - step_idx * 25], device=device, dtype=torch.long)
 

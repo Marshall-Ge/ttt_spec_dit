@@ -141,8 +141,7 @@ def teacache_decide(state: Dict, modulated_input: torch.Tensor,
         Output of ``compute_modulated_input()`` or ``compute_modulated_input_dit()``.
     calibrator : OnlineCalibrator, optional
         VFL M2 online calibrator. When provided and ready for the current bucket,
-        its ``get_rescale_fn()`` and ``get_threshold()`` override the state's
-        static ``rescale_func`` and ``rel_l1_thresh`` respectively.
+        its ``get_threshold()`` overrides the static ``rel_l1_thresh``.
     probe_layer : int
         Layer ID for ``(layer, bucket)`` key. Default -1 = TeaCache's global
         step-level sentinel. Set to the VFL probe layer (e.g. 20 for DiT) if
@@ -159,17 +158,15 @@ def teacache_decide(state: Dict, modulated_input: torch.Tensor,
     timestep_bucket = int(cnt * 3 / num_steps) if num_steps > 0 else 0
     timestep_bucket = min(timestep_bucket, 2)
 
-    # ---- Resolve rescale function and threshold ----
-    # TeaCache uses the offline-calibrated poly4 rescale function (state["rescale_func"])
-    # because the RLS-based online rescale predicts true errors which are too small
-    # for the accumulate-vs-threshold mechanism.  The calibrator only adjusts the
-    # threshold (dynamic EMA), making it more or less conservative over time.
+    # Rescale: always use offline poly4 (RLS-based online rescale was removed —
+    # it predicted values too small for the accumulate-vs-threshold mechanism).
+    rescale_fn = state["rescale_func"]
+
+    # Threshold: online EMA if calibrator is available, else static
     if calibrator is not None:
-        rescale_fn = state["rescale_func"]
         threshold = calibrator.get_threshold(probe_layer, timestep_bucket,
                                               default=state["rel_l1_thresh"])
     else:
-        rescale_fn = state["rescale_func"]
         threshold = state["rel_l1_thresh"]
 
     if state["cnt"] == 0 or state["cnt"] == state["num_steps"] - 1:
@@ -196,7 +193,6 @@ def teacache_decide(state: Dict, modulated_input: torch.Tensor,
     )
     state["decisions"].append("calc" if should_calc else "skip")
     state["previous_modulated_input"] = modulated_input.detach()
-    # Stash for VFL calibrator: allows update_with_proxy(raw_diff, error_value)
     state["last_raw_diff"] = raw_diff
     return should_calc, raw_diff
 

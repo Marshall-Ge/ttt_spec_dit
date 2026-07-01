@@ -118,7 +118,7 @@ for idx in range(n_images):
 
     # ---- Denoising loop ----
     for si, t_step in enumerate(scheduler.timesteps):
-        current['step'] = num_steps - 1 - si
+        current.step = num_steps - 1 - si
         set_vfl_step_info(si, num_steps)
 
         latent_input = scheduler.scale_model_input(latent, t_step)
@@ -139,7 +139,7 @@ for idx in range(n_images):
     wall_s = time.time() - t0
     wall_times.append(wall_s)
 
-    full_cnt = cache_dic.get('full_count', 0)
+    full_cnt = cache_dic.full_count
     total_full += full_cnt
     total_taylor += num_steps - full_cnt
 

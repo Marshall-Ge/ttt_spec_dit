@@ -12,7 +12,7 @@ is no monkeypatching. Submodules reuse the diffusers
 ``PixArtTransformer2DModel`` building blocks (``BasicTransformerBlock``-style
 attn1/attn2/ff), so the existing state_dict keys line up exactly.
 
-Block module-name convention (keys into ``cache_dic['cache'][-1][layer]``):
+Block module-name convention (keys into ``cache.cache[-1][layer]``):
   - 'attn1' : self-attention output (modulated via norm1)
   - 'attn2' : cross-attention output (raw hidden_states, no gate)
   - 'ff'    : feed-forward output (modulated via norm2)
@@ -27,6 +27,8 @@ from diffusers.models.transformers.pixart_transformer_2d import PixArtTransforme
 from diffusers import PixArtAlphaPipeline
 
 from accelerators.speca import (
+    SpecACache,
+    SpecAState,
     speca_cal_type,
     taylor_cache_init,
     derivative_approximation,
@@ -116,10 +118,7 @@ def _vfl_record_teacache_event(layer_id, timestep_val, step_idx, num_steps,
     if buf is not None:
         vh.record_event(event, buffer=buf)
     if cal is not None:
-        if raw_diff > 0:
-            cal.update_with_proxy(event, proxy_value=raw_diff)
-        else:
-            cal.update(event)
+        cal.update(event)
 
 
 class PixArtTransformer2D(nn.Module):
@@ -183,8 +182,8 @@ class PixArtTransformer2D(nn.Module):
                 hidden_states: torch.Tensor,
                 encoder_hidden_states: torch.Tensor,
                 timestep: torch.Tensor,
-                current: Optional[dict] = None,
-                cache_dic: Optional[dict] = None,
+                current: Optional[SpecAState] = None,
+                cache_dic: Optional[SpecACache] = None,
                 teacache_state: Optional[dict] = None,
                 added_cond_kwargs: Optional[Dict[str, Any]] = None,
                 attention_mask: Optional[torch.Tensor] = None,
@@ -282,8 +281,8 @@ class PixArtTransformer2D(nn.Module):
         # 3. Block loop (visible, no monkeypatch).
         for layer_idx, block in enumerate(self.transformer_blocks):
             if use_speca:
-                current['layer'] = layer_idx
-            step_type = 'full' if (vanilla or use_teacache) else current['type']
+                current.layer = layer_idx
+            step_type = 'full' if (vanilla or use_teacache) else current.type
 
             # ------------------- ada_norm_single projection ------------------
             proj = (block.scale_shift_table[None]
@@ -294,7 +293,7 @@ class PixArtTransformer2D(nn.Module):
             if step_type == 'full':
                 # --- submodule 1: self-attention (norm1-modulated) ---
                 if use_speca:
-                    current['module'] = 'attn1'
+                    current.module = 'attn1'
                     taylor_cache_init(cache_dic, current)
                 norm_hidden = block.norm1(hidden_states)
                 modulated = norm_hidden * (1 + scale_msa) + shift_msa
@@ -305,7 +304,7 @@ class PixArtTransformer2D(nn.Module):
 
                 # --- submodule 2: cross-attention (raw hidden, no gate) ---
                 if use_speca:
-                    current['module'] = 'attn2'
+                    current.module = 'attn2'
                     taylor_cache_init(cache_dic, current)
                 # attn2 takes raw hidden_states as query (PixArt convention)
                 attn2_out = block.attn2(
@@ -319,7 +318,7 @@ class PixArtTransformer2D(nn.Module):
 
                 # --- submodule 3: feed-forward (norm2-modulated) ---
                 if use_speca:
-                    current['module'] = 'ff'
+                    current.module = 'ff'
                     taylor_cache_init(cache_dic, current)
                 norm_ff = block.norm2(hidden_states)
                 modulated_ff = norm_ff * (1 + scale_mlp) + shift_mlp
@@ -329,17 +328,17 @@ class PixArtTransformer2D(nn.Module):
                 hidden_states = hidden_states + gate_mlp * ff_out
 
             elif step_type == 'Taylor':
-                distance = current['step'] - current['activated_steps'][-1]
-                check_layer = cache_dic['check_layer']
-                do_check = (layer_idx == check_layer and cache_dic['check'])
+                distance = current.step - current.activated_steps[-1]
+                check_layer = cache_dic.check_layer
+                do_check = (layer_idx == check_layer and cache_dic.check)
                 if do_check:
                     full_hidden = hidden_states.clone()
 
                 hidden_states = cache_step_pixart(
                     hidden_states,
-                    cache_dic['cache'][-1][layer_idx]['attn1'],
-                    cache_dic['cache'][-1][layer_idx]['attn2'],
-                    cache_dic['cache'][-1][layer_idx]['ff'],
+                    cache_dic.cache[-1][layer_idx]['attn1'],
+                    cache_dic.cache[-1][layer_idx]['attn2'],
+                    cache_dic.cache[-1][layer_idx]['ff'],
                     gate_msa, gate_mlp, distance,
                 )
 
@@ -370,9 +369,9 @@ class PixArtTransformer2D(nn.Module):
 
                     gate_value, _ = compute_error_gate(
                         hidden_states, full_hidden,
-                        metric=cache_dic['error_metric'],
+                        metric=cache_dic.error_metric,
                     )
-                    current['last_layer_error'] = gate_value
+                    current.last_layer_error = gate_value
 
                     # ---- VFL: record SpecA verification event ----
                     _vfl_record_speca_event(

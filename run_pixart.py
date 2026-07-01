@@ -41,7 +41,7 @@ from accelerators.teacache import (
     teacache_apply_residual, teacache_step, teacache_reset,
     teacache_stats, compute_modulated_input,
 )
-from accelerators.speca import speca_init
+from accelerators.speca import SpecACache, SpecAState, speca_init
 
 from eval.latency import LatencyMetric, FLOPsMetric
 
@@ -218,8 +218,8 @@ class PixArtGenerator:
                  guidance_scale: float = 4.5,
                  method: str = "baseline",
                  teacache_state: Optional[dict] = None,
-                 cache_dic: Optional[dict] = None,
-                 current: Optional[dict] = None,
+                 cache_dic: Optional[SpecACache] = None,
+                 current: Optional[SpecAState] = None,
                  ddim_steps: Optional[int] = None,
                  ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Generate image(s).
@@ -295,8 +295,8 @@ class PixArtGenerator:
                        guidance_scale: float = 4.5,
                        method: str = "baseline",
                        teacache_state: Optional[dict] = None,
-                       cache_dic: Optional[dict] = None,
-                       current: Optional[dict] = None,
+                       cache_dic: Optional[SpecACache] = None,
+                       current: Optional[SpecAState] = None,
                        ddim_steps: Optional[int] = None,
                        ) -> Tuple[torch.Tensor, float]:
         """Generate with CUDA-event timing. Returns (latent, time_s)."""
@@ -358,7 +358,7 @@ class PixArtGenerator:
             current_t = t.expand(latents.shape[0]).to(torch.int64)
 
             if current is not None:
-                current['step'] = len(timesteps) - 1 - step_idx
+                current.step = len(timesteps) - 1 - step_idx
 
             with timer:
                 noise_pred = transformer(
@@ -395,8 +395,8 @@ class PixArtGenerator:
                        scheduler,
                        method: str,
                        teacache_state: Optional[dict],
-                       cache_dic: Optional[dict],
-                       current: Optional[dict],
+                       cache_dic: Optional[SpecACache],
+                       current: Optional[SpecAState],
                        ) -> torch.Tensor:
         """Single denoising loop with method dispatch."""
         transformer = self.transformer
@@ -423,7 +423,7 @@ class PixArtGenerator:
             current_t = t.expand(latents.shape[0]).to(torch.int64)
 
             if current is not None:
-                current['step'] = len(timesteps) - 1 - step_idx
+                current.step = len(timesteps) - 1 - step_idx
 
             # --------------- method dispatch ---------------
             if method == "teacache" and teacache_state is not None:
@@ -681,7 +681,7 @@ def run_t2i(args) -> Dict:
                 metrics["flops"].add_generation(
                     SimpleNamespace(decisions=teacache_state["decisions"]))
             elif args.method == "speca" and speca_cache_dic is not None:
-                full_cnt = speca_cache_dic.get('full_count', 0)
+                full_cnt = speca_cache_dic.full_count
                 taylor_cnt = args.num_steps - full_cnt
                 metrics["flops"].add_generation(
                     SimpleNamespace(
@@ -715,7 +715,7 @@ def run_t2i(args) -> Dict:
         agg["total_calc"] = st.get("total_calc", 0)
         agg["total_skip"] = st.get("total_skip", 0)
     elif args.method == "speca" and speca_cache_dic is not None:
-        full_cnt = speca_cache_dic.get('full_count', 0)
+        full_cnt = speca_cache_dic.full_count
         taylor_cnt = args.num_steps - full_cnt
         total = full_cnt + taylor_cnt
         agg["skip_ratio"] = taylor_cnt / total if total > 0 else 0.0
@@ -1014,7 +1014,7 @@ def run_c2i(args) -> Dict:
                 metrics["flops"].add_generation(
                     SimpleNamespace(decisions=teacache_state["decisions"]))
             elif args.method == "speca" and speca_cache_dic is not None:
-                full_cnt = speca_cache_dic.get('full_count', 0)
+                full_cnt = speca_cache_dic.full_count
                 taylor_cnt = args.num_steps - full_cnt
                 metrics["flops"].add_generation(
                     SimpleNamespace(
@@ -1069,7 +1069,7 @@ def run_c2i(args) -> Dict:
         agg["total_calc"] = st.get("total_calc", 0)
         agg["total_skip"] = st.get("total_skip", 0)
     elif args.method == "speca" and speca_cache_dic is not None:
-        full_cnt = speca_cache_dic.get('full_count', 0)
+        full_cnt = speca_cache_dic.full_count
         taylor_cnt = args.num_steps - full_cnt
         total = full_cnt + taylor_cnt
         agg["skip_ratio"] = taylor_cnt / total if total > 0 else 0.0
