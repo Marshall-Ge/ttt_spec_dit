@@ -52,6 +52,7 @@ from verification_feedback_loop.vfl_state import (
     set_vfl_calibrator,
     get_vfl_buffer,
     set_vfl_step_info,
+    set_vfl_sample_id,
     record_speca_event,
     record_teacache_event,
 )

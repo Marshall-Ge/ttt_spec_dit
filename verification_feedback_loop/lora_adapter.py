@@ -200,6 +200,42 @@ def attach_lora(transformer, layer_ids: List[int],
     return all_wrappers
 
 
+def attach_lora_all_layers(transformer, rank: int = 4, alpha: int = 1.0
+                           ) -> Dict[int, Dict[str, LoRALinear]]:
+    """Attach LoRA to **every** transformer block (Phase 2 async trainer).
+
+    Replaces the old ``select_top_k_layers`` + ``attach_lora`` two-step. In the
+    async regime the buffer is sparse when the first training cycle triggers,
+    so per-layer reject frequency is an unreliable selection signal; training
+    also shifts the error distribution over time, so a fixed top-K cannot
+    adapt. Hanging LoRA on all 28 blocks removes the selection problem entirely
+    at the cost of a larger adapter (~5.2M params for DiT at rank=4 vs ~220K
+    at rank=8 top-3, both tiny compared to the 675M backbone).
+
+    Parameters
+    ----------
+    transformer : DiTTransformer2D / PixArtTransformer2D
+        Must expose ``transformer_blocks`` (ModuleList).
+    rank : int
+        LoRA rank (default 4 — smaller than the sync path's 8 because we're
+        spreading across 28 layers instead of concentrating on 3).
+    alpha : int
+        LoRA scaling factor.
+
+    Returns
+    -------
+    layer_wrappers : dict
+        ``{layer_id: {path: LoRALinear}}`` for every block. Layers whose
+        block is missing any of ``_LORA_TARGET_PATHS`` simply have fewer
+        entries in their inner dict.
+    """
+    all_wrappers: Dict[int, Dict[str, LoRALinear]] = {}
+    for layer_idx, block in enumerate(transformer.transformer_blocks):
+        wrappers = attach_lora_to_block(block, rank=rank, alpha=alpha)
+        all_wrappers[layer_idx] = wrappers
+    return all_wrappers
+
+
 def detach_lora(transformer, layer_wrappers: Dict[int, Dict[str, LoRALinear]]):
     """Remove LoRA wrappers, restoring original Linear layers."""
     for layer_id, wrappers in layer_wrappers.items():
@@ -356,3 +392,35 @@ def count_lora_params(layer_wrappers: Dict[int, Dict[str, LoRALinear]]) -> int:
         for lora in wrappers.values():
             total += lora.lora_A.numel() + lora.lora_B.numel()
     return total
+
+
+# ===========================================================================
+# Checkpoint discovery (Phase 2 async worker)
+# ===========================================================================
+
+
+def find_latest_checkpoint(output_dir: str) -> Optional[str]:
+    """Return the path of the most recently saved LoRA checkpoint in ``output_dir``.
+
+    Recognises both the canonical ``lora_candidate_vNNN.pt`` naming scheme
+    produced by ``save_lora_checkpoint`` and any other ``*.pt`` file, picking
+    the one with the largest mtime. Returns ``None`` when the directory is
+    absent, empty, or contains no ``.pt`` files.
+    """
+    if not output_dir or not os.path.isdir(output_dir):
+        return None
+    candidates: List[Tuple[float, str]] = []
+    for name in os.listdir(output_dir):
+        if not name.endswith(".pt"):
+            continue
+        path = os.path.join(output_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            candidates.append((os.path.getmtime(path), path))
+        except OSError:
+            continue
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]

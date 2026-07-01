@@ -27,12 +27,14 @@ from verification_feedback_loop.online_calibration import (
 from verification_feedback_loop.lora_adapter import (
     LoRALinear,
     attach_lora,
+    attach_lora_all_layers,
     detach_lora,
     get_lora_params,
     freeze_backbone,
     select_top_k_layers,
     save_lora_checkpoint,
     load_lora_checkpoint,
+    find_latest_checkpoint,
 )
 from verification_feedback_loop.curvature_loss import (
     trajectory_curvature_loss,
@@ -41,6 +43,7 @@ from verification_feedback_loop.curvature_loss import (
 )
 from verification_feedback_loop.async_trainer import (
     AsyncTrainer,
+    AsyncTrainingWorker,
 )
 from verification_feedback_loop.eval_gate import (
     EvalGate,
@@ -77,18 +80,21 @@ __all__ = [
     # M4
     "LoRALinear",
     "attach_lora",
+    "attach_lora_all_layers",
     "detach_lora",
     "get_lora_params",
     "freeze_backbone",
     "select_top_k_layers",
     "save_lora_checkpoint",
     "load_lora_checkpoint",
+    "find_latest_checkpoint",
     # M5
     "trajectory_curvature_loss",
     "trajectory_curvature_loss_from_buffer",
     "compute_training_loss",
     # M6
     "AsyncTrainer",
+    "AsyncTrainingWorker",
     # M7
     "EvalGate",
     "GateStatus",

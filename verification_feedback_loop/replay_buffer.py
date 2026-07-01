@@ -18,6 +18,7 @@ reservoir sampling ring buffer。
 """
 
 import random
+import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -195,6 +196,12 @@ class StratifiedReplayBuffer:
         self._ehs_count = 0
         self._ehs_dropped = 0  # 因超限被丢弃的次数
 
+        # Phase 2: 推理线程写, 训练线程读 — 单把粗粒度锁保护全部操作。
+        # 简单优先: buffer 操作本身是 O(1)~O(strata) 级别, 锁竞争极轻;
+        # 真正耗时的训练 forward / backward 都在锁外执行 (sample_training_batch
+        # 拷贝出 events/anchors 后就释放锁, 训练线程在锁外跑梯度)。
+        self._lock = threading.RLock()
+
     # ------------------------------------------------------------------
     # Stratum key
     # ------------------------------------------------------------------
@@ -227,24 +234,29 @@ class StratifiedReplayBuffer:
         # ~600KB/event fp16)。latent_input / class_labels 仍保留, 所以
         # DiT 路径完全不受影响, PixArt 也能继续训练 (只是 attn2 的
         # cross-attention 重跑会缺文本输入, supervised loss 跳过该 event)。
-        if event.encoder_hidden_states is not None:
-            if self._ehs_count >= self.max_ehs_events:
-                event.encoder_hidden_states = None
-                self._ehs_dropped += 1
-            else:
-                self._ehs_count += 1
+        #
+        # Phase 2: 推理线程 (调用 record_event → add) 与训练线程
+        # (调用 sample_training_batch) 并发访问 — 用 _lock 保护。
+        with self._lock:
+            if event.encoder_hidden_states is not None:
+                if self._ehs_count >= self.max_ehs_events:
+                    event.encoder_hidden_states = None
+                    self._ehs_dropped += 1
+                else:
+                    self._ehs_count += 1
 
-        stratum = self._get_or_create_stratum(
-            event.layer_id, event.timestep_bucket)
-        stratum.add(event, kind)
-        self._total_added[kind] += 1
+            stratum = self._get_or_create_stratum(
+                event.layer_id, event.timestep_bucket)
+            stratum.add(event, kind)
+            self._total_added[kind] += 1
 
     def add_anchor(self, sample: AnchorSample) -> None:
         """存入一个 anchor 样本 (独立存储, 不限容量)。"""
-        self._anchor_samples.append(sample.detach())
-        # 容量保护: 保留最近 500 个
-        if len(self._anchor_samples) > 500:
-            self._anchor_samples = self._anchor_samples[-500:]
+        with self._lock:
+            self._anchor_samples.append(sample.detach())
+            # 容量保护: 保留最近 500 个
+            if len(self._anchor_samples) > 500:
+                self._anchor_samples = self._anchor_samples[-500:]
 
     def add_anchor_from_tensors(self, prompt, latent, timestep, target,
                                  model="dit", base_model_version="unknown"):
@@ -289,46 +301,53 @@ class StratifiedReplayBuffer:
         (events, anchors) : (list of VerificationEvent, list of AnchorSample)
             events 包含 hard_negative 和 normal 两类。
             anchors 是独立的 anchor 样本列表。
+
+        Phase 2 (thread safety):
+            推理线程可能在采样期间调用 ``add`` / ``add_anchor``。我们在
+            锁内只做"快照 + 拷贝出"动作 (O(num_strata)~O(num_layers*3) 微秒级),
+            释放锁后才返回给训练线程; 真正的 forward / backward 在锁外执行,
+            不会阻塞推理写。
         """
         ratio = ratio or self.batch_ratio
 
-        # 计算各类配额
-        n_hard = max(1, int(batch_size * ratio.get("hard_negative", 0.5)))
-        n_normal = max(1, int(batch_size * ratio.get("normal", 0.3)))
-        n_anchor = max(1, int(batch_size * ratio.get("anchor", 0.2)))
-        # 调整使总和 = batch_size
-        total_alloc = n_hard + n_normal + n_anchor
-        if total_alloc != batch_size:
-            n_hard += batch_size - total_alloc
+        with self._lock:
+            # 计算各类配额
+            n_hard = max(1, int(batch_size * ratio.get("hard_negative", 0.5)))
+            n_normal = max(1, int(batch_size * ratio.get("normal", 0.3)))
+            n_anchor = max(1, int(batch_size * ratio.get("anchor", 0.2)))
+            # 调整使总和 = batch_size
+            total_alloc = n_hard + n_normal + n_anchor
+            if total_alloc != batch_size:
+                n_hard += batch_size - total_alloc
 
-        # 从有数据的 strata 中均匀采样
-        events = []
-        hard_pools = [(k, s) for k, s in self._strata.items()
-                       if any(kind == "hard_negative" for _, kind in s._buffer)]
-        normal_pools = [(k, s) for k, s in self._strata.items()
-                         if any(kind == "normal" for _, kind in s._buffer)]
+            # 从有数据的 strata 中均匀采样
+            events = []
+            hard_pools = [(k, s) for k, s in self._strata.items()
+                           if any(kind == "hard_negative" for _, kind in s._buffer)]
+            normal_pools = [(k, s) for k, s in self._strata.items()
+                             if any(kind == "normal" for _, kind in s._buffer)]
 
-        # hard_negative
-        if hard_pools:
-            per_stratum = max(1, n_hard // len(hard_pools))
-            for _, s in hard_pools:
-                events.extend(s.sample(per_stratum,
-                                       {"hard_negative": 1.0, "normal": 0.0, "anchor": 0.0}))
+            # hard_negative
+            if hard_pools:
+                per_stratum = max(1, n_hard // len(hard_pools))
+                for _, s in hard_pools:
+                    events.extend(s.sample(per_stratum,
+                                           {"hard_negative": 1.0, "normal": 0.0, "anchor": 0.0}))
 
-        # normal
-        if normal_pools:
-            per_stratum = max(1, n_normal // len(normal_pools))
-            for _, s in normal_pools:
-                events.extend(s.sample(per_stratum,
-                                       {"hard_negative": 0.0, "normal": 1.0, "anchor": 0.0}))
+            # normal
+            if normal_pools:
+                per_stratum = max(1, n_normal // len(normal_pools))
+                for _, s in normal_pools:
+                    events.extend(s.sample(per_stratum,
+                                           {"hard_negative": 0.0, "normal": 1.0, "anchor": 0.0}))
 
-        # anchor — 独立采样
-        anchors = []
-        if self._anchor_samples:
-            anchors = random.choices(
-                self._anchor_samples,
-                k=min(n_anchor, len(self._anchor_samples)),
-            )
+            # anchor — 独立采样 (拷贝引用, 训练线程会用 .to(device) 拉到 GPU)
+            anchors: List[AnchorSample] = []
+            if self._anchor_samples:
+                anchors = random.choices(
+                    self._anchor_samples,
+                    k=min(n_anchor, len(self._anchor_samples)),
+                )
 
         return events, anchors
 
@@ -338,34 +357,36 @@ class StratifiedReplayBuffer:
 
     def stats(self) -> Dict:
         """全缓冲区统计快照。"""
-        strata_stats = {}
-        for (layer_id, bucket), s in self._strata.items():
-            strata_stats[f"L{layer_id}_B{bucket}"] = s.stats()
+        with self._lock:
+            strata_stats = {}
+            for (layer_id, bucket), s in self._strata.items():
+                strata_stats[f"L{layer_id}_B{bucket}"] = s.stats()
 
-        # 按 layer 聚合
-        per_layer_hard: Dict[int, int] = defaultdict(int)
-        per_layer_normal: Dict[int, int] = defaultdict(int)
-        for (layer_id, bucket), s in self._strata.items():
-            for kind, cnt in s.stats()["by_kind"].items():
-                if kind == "hard_negative":
-                    per_layer_hard[layer_id] += cnt
-                elif kind == "normal":
-                    per_layer_normal[layer_id] += cnt
+            # 按 layer 聚合
+            per_layer_hard: Dict[int, int] = defaultdict(int)
+            per_layer_normal: Dict[int, int] = defaultdict(int)
+            for (layer_id, bucket), s in self._strata.items():
+                for kind, cnt in s.stats()["by_kind"].items():
+                    if kind == "hard_negative":
+                        per_layer_hard[layer_id] += cnt
+                    elif kind == "normal":
+                        per_layer_normal[layer_id] += cnt
 
-        return {
-            "num_strata": len(self._strata),
-            "num_strata_nonempty": sum(1 for s in self._strata.values() if not s.is_empty),
-            "total_samples": sum(s.size for s in self._strata.values()),
-            "total_anchors": len(self._anchor_samples),
-            "total_added": dict(self._total_added),
-            "ehs_count": self._ehs_count,
-            "ehs_dropped": self._ehs_dropped,
-            "ehs_cap": self.max_ehs_events,
-            "per_layer_hard_negative": dict(sorted(per_layer_hard.items())),
-            "per_layer_normal": dict(sorted(per_layer_normal.items())),
-            "strata": strata_stats,
-        }
+            return {
+                "num_strata": len(self._strata),
+                "num_strata_nonempty": sum(1 for s in self._strata.values() if not s.is_empty),
+                "total_samples": sum(s.size for s in self._strata.values()),
+                "total_anchors": len(self._anchor_samples),
+                "total_added": dict(self._total_added),
+                "ehs_count": self._ehs_count,
+                "ehs_dropped": self._ehs_dropped,
+                "ehs_cap": self.max_ehs_events,
+                "per_layer_hard_negative": dict(sorted(per_layer_hard.items())),
+                "per_layer_normal": dict(sorted(per_layer_normal.items())),
+                "strata": strata_stats,
+            }
 
     @property
     def total_samples(self) -> int:
-        return sum(s.size for s in self._strata.values())
+        with self._lock:
+            return sum(s.size for s in self._strata.values())

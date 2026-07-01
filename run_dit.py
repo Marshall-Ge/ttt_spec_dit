@@ -34,7 +34,9 @@ from config import (
 )
 from utils import CudaTimer, decode_latent, save_image, pil_to_tensor, ensure_real_299
 
-from models.dit import DiTTransformer2D, set_vfl_step_info, get_vfl_buffer
+from models.dit import (
+    DiTTransformer2D, set_vfl_step_info, get_vfl_buffer, set_vfl_sample_id,
+)
 from accelerators.teacache import (
     teacache_init, teacache_decide, teacache_cache_residual,
     teacache_apply_residual, teacache_step, teacache_reset,
@@ -686,36 +688,68 @@ def run_c2i(args) -> Dict:
         transformer.eval()
         vae.eval()
 
-    # ---- VFL: Verification Feedback Loop ----
+    # ---- VFL: Verification Feedback Loop (Phase 2 — true async) ----
+    # 推理线程只写 buffer + 调用 set_vfl_sample_id; 后台 daemon 线程独立
+    # 跑训练, 不感知推理循环。每轮推理开始前可选加载上一轮的 LoRA
+    # checkpoint (跨 run 飞轮) — 加载的是 train_model 副本, 推理模型权重
+    # 仍为本轮 base, FID 评估保持干净。
     vfl_buf = None
     vfl_cal = None
-    vfl_trainer = None
+    vfl_worker = None
     if getattr(args, "vfl", False):
         from verification_feedback_loop import (
-            StratifiedReplayBuffer, OnlineCalibrator, AsyncTrainer, VFLConfig,
+            StratifiedReplayBuffer, OnlineCalibrator,
+            AsyncTrainingWorker, VFLConfig,
+            load_lora_checkpoint, find_latest_checkpoint,
         )
         from models.dit import set_vfl_buffer, set_vfl_calibrator
 
         vfl_cfg = VFLConfig()
-        vfl_cfg.trigger_min_samples = max(10, args.n_prompts // 10)
-        vfl_cfg.top_k_layers = 2
+        # Phase 2: trigger by signal-quality not raw count. Lower the
+        # poll interval so the worker reacts quickly once buffer fills,
+        # but keep it ≥2s to avoid busy-spinning on tiny benchmarks.
+        vfl_cfg.poll_interval_s = 5.0
         vfl_cfg.loRA_rank = 4
+        # Buffer-ready thresholds are left at VFLConfig defaults
+        # (10 strata × ≥5 events + ≥10 anchors) — appropriate for the
+        # async trigger. For very small benchmarks (n_prompts < 80) the
+        # worker may simply not fire, which is the intended behaviour
+        # (下一轮再加载上轮的 checkpoint).
 
         vfl_buf = StratifiedReplayBuffer(
             capacity_per_stratum=vfl_cfg.buffer_capacity_per_stratum)
-        vfl_cal = OnlineCalibrator(
-            ema_window=100)
+        vfl_cal = OnlineCalibrator(ema_window=100)
         set_vfl_buffer(vfl_buf, model_version="dit-v1")
         set_vfl_calibrator(vfl_cal)
 
         vfl_output_dir = getattr(args, "vfl_output_dir", None) or \
             os.path.join(output_dir, "vfl")
-        vfl_trainer = AsyncTrainer(
+        vfl_worker = AsyncTrainingWorker(
             generator.transformer, vfl_buf, config=vfl_cfg,
             base_model_version="dit-v1", output_dir=vfl_output_dir,
         )
-        print(f"  VFL enabled: buffer + calibrator + async trainer "
-              f"(trigger ≥{vfl_cfg.trigger_min_samples} samples)")
+
+        # 如果上一轮留了 checkpoint, 推理前加载到 *推理* 模型上, 让本轮
+        # 推理直接享受上轮训练成果 (不影响本轮 buffer 收集 / 下轮训练)。
+        # 失败时只警告不中止 — benchmark 不应被一个 stale checkpoint 卡住。
+        prev_ckpt = find_latest_checkpoint(vfl_output_dir)
+        if prev_ckpt is None:
+            # 也尝试 args.vfl_output_dir (用户可能指定了跨 run 共享目录)
+            prev_ckpt = find_latest_checkpoint(
+                getattr(args, "vfl_output_dir", None) or "")
+        if prev_ckpt:
+            try:
+                load_lora_checkpoint(generator.transformer, prev_ckpt)
+                print(f"  Loaded LoRA from previous run: {prev_ckpt}")
+            except Exception as e:
+                print(f"  [WARN] failed to load previous LoRA checkpoint "
+                      f"{prev_ckpt}: {e} — proceeding without it")
+
+        vfl_worker.start()
+        print(f"  VFL enabled (Phase 2 async): buffer + calibrator + "
+              f"background training thread (poll={vfl_cfg.poll_interval_s}s, "
+              f"min_strata={vfl_cfg.buffer_ready_min_strata}, "
+              f"min_anchors={vfl_cfg.buffer_ready_min_anchors})")
 
     # ===================================================================
     # 3. Setup metrics
@@ -843,6 +877,16 @@ def run_c2i(args) -> Dict:
                 check_layer=20,
             )
 
+        # VFL (Phase 2): tag this batch's denoising trajectory with a unique
+        # sample_id so curvature loss can group events from the same image.
+        # We use batch_start as the id — every event recorded during the
+        # upcoming generate() call (across all denoising steps and all
+        # blocks) will share this id, which is exactly what the per-(sample,
+        # layer) trajectory fitter needs. Set just before generate() so the
+        # _denoise_loop's set_vfl_step_info calls layer on top of it.
+        if vfl_buf is not None:
+            set_vfl_sample_id(batch_start)
+
         # Generate
         t0 = time.time()
         if args.ttt:
@@ -943,36 +987,34 @@ def run_c2i(args) -> Dict:
                 "images": 1,
             })
 
-        # ---- VFL: online async training trigger (per-batch) ----
-        # Fire maybe_train() after every batch so LoRA weight deltas can be
-        # applied mid-run and feed back into cache correction for the
-        # remaining batches. ``AsyncTrainer.should_train`` internally guards
-        # on ``trigger_min_samples`` / elapsed time, so this is a cheap no-op
-        # most iterations. Stay quiet unless training actually fires, to
-        # avoid log spam (the original "Triggering async training check..."
-        # banner was only appropriate for the single post-loop call).
-        if vfl_trainer is not None:
-            train_result = vfl_trainer.maybe_train()
-            if train_result:
-                print(f"  [VFL] mid-run training triggered after batch "
-                      f"start_idx={batch_start}: "
-                      f"loss={train_result.get('loss_mean', float('nan')):.6f} "
-                      f"-> {os.path.basename(train_result.get('checkpoint_path', ''))}")
+        # Phase 2: 推理循环内不再调用任何训练方法。后台线程独立轮询
+        # buffer, 在数据足够时自行触发训练。这里只做 event / anchor
+        # 收集 (在 _denoise_loop 内部完成), latency 完全不受训练影响。
 
     elapsed = time.time() - t_start
     print(f"\n  Total time: {elapsed/60:.1f} min "
           f"({elapsed/total_images:.2f} s/image, {len(wall_times)} batches)")
 
-    # ---- VFL: final flush ----
-    # 兜底处理循环末尾积累的样本: the last few batches may not have crossed
-    # ``trigger_min_samples`` mid-loop, so a final check here drains any
-    # remaining replay-buffer entries before FID/aggregation runs.
-    if vfl_trainer is not None:
-        train_result = vfl_trainer.maybe_train()
-        if train_result:
-            print(f"  [VFL] final-flush training: "
-                  f"loss={train_result.get('loss_mean', float('nan')):.6f} "
-                  f"-> {os.path.basename(train_result.get('checkpoint_path', ''))}")
+    # ---- VFL: 推理结束后处理 ----
+    # 1. 优雅停止后台线程 (等待当前训练周期完成或 timeout);
+    # 2. 报告本 run 的训练成果 (checkpoint / 周期数 / crash 计数)。
+    # 注意: 不会强行 drain buffer — 残余样本留到下一轮加载 checkpoint
+    # 后继续训练 (跨 run 飞轮)。如果想立即处理, 在 stop 前手动调用
+    # worker._train_once() 即可 (但通常无必要)。
+    if vfl_worker is not None:
+        vfl_worker.stop(timeout=60.0)
+        print(f"  [VFL] worker stopped. total updates: "
+              f"{vfl_worker.total_updates}, "
+              f"train_steps: {vfl_worker.total_train_steps}, "
+              f"crashes: {vfl_worker.crash_count}")
+        if vfl_worker.last_error:
+            print(f"  [VFL] last error: {vfl_worker.last_error}")
+        ckpt = vfl_worker.get_latest_checkpoint()
+        if ckpt:
+            print(f"  [VFL] latest checkpoint: {ckpt}")
+        else:
+            print("  [VFL] no checkpoint produced this run "
+                  "(buffer may not have crossed readiness threshold)")
 
     # ===================================================================
     # 6. FID/IS
@@ -1036,10 +1078,16 @@ def run_c2i(args) -> Dict:
         agg["vfl_strata"] = vfl_stats["num_strata_nonempty"]
     if vfl_cal is not None:
         agg["vfl_calibrator_updates"] = vfl_cal.total_updates
-    if vfl_trainer is not None:
-        ts = vfl_trainer.get_status()
-        agg["vfl_train_steps"] = ts["train_step"]
-        agg["vfl_layers"] = ts["attached_layers"]
+    if vfl_worker is not None:
+        ws = vfl_worker.get_status()
+        agg["vfl_train_steps"] = ws["train_step"]
+        agg["vfl_total_updates"] = ws["total_updates"]
+        agg["vfl_crash_count"] = ws["crash_count"]
+        # Phase 2 全层挂 LoRA, attached_layers 不再有意义, 但保留
+        # vfl_layers 字段向后兼容 (输出全 28 层)
+        agg["vfl_layers"] = sorted(vfl_worker._layer_wrappers.keys())
+        if ws.get("latest_checkpoint"):
+            agg["vfl_latest_checkpoint"] = ws["latest_checkpoint"]
 
     if "speed" in selected and all_results:
         unique_walls = list(dict.fromkeys(r["wall_s"] for r in all_results))

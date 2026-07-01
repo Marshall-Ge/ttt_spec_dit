@@ -80,6 +80,24 @@ class VFLConfig:
     trigger_min_interval_s: float = 300.0
     trainer_steps_per_trigger: int = 50
 
+    # ---- M6 (Phase 2): real async worker ----
+    # Polling interval between buffer-readiness checks in the background
+    # training thread. Small enough to feel responsive, large enough to avoid
+    # busy-spinning while the inference thread fills the buffer.
+    poll_interval_s: float = 5.0
+    # Buffer-readiness thresholds for ``AsyncTrainingWorker._buffer_ready``:
+    #   * ``buffer_ready_min_strata`` — how many (layer, bucket) strata must
+    #     each hold at least ``buffer_ready_min_per_stratum`` events before
+    #     we attempt a training cycle. Replaces the old raw-count trigger
+    #     (``trigger_min_samples``) so that sparse first-batch data doesn't
+    #     drive a bad gradient update.
+    #   * ``buffer_ready_min_anchors`` — minimum anchor samples for the
+    #     diffusion anchor loss to have signal (otherwise L_anchor is 0
+    #     and we waste a cycle).
+    buffer_ready_min_strata: int = 10
+    buffer_ready_min_per_stratum: int = 5
+    buffer_ready_min_anchors: int = 10
+
     # ---- M7: Eval Gate ----
     quality_epsilon: float = 5.0   # FID 退化容忍上限
     reject_delta: float = 0.05     # Reject 率下降最低要求 (5pp)
