@@ -12,16 +12,20 @@
     这鼓励 backbone 的去噪轨迹变得更"可被低阶外推捕捉" —
     而不是让 backbone 去逼近某次具体的 draft 预测值。
 
-**训练目标**::
+**训练目标 (M5 v2 — buffer-driven closed loop)**::
 
-    L_total = L_diffusion(anchor_batch) + λ_t * L_curvature(batch)
+    L_total = L_supervised + λ_curv * L_curvature + λ_anchor * L_anchor
 
-其中 ``L_diffusion`` 是标准 diffusion loss (v-prediction / noise prediction),
-只在真实 anchor 数据上计算, 是防止 "拉懒" 的关键锚点。
-
-``λ_t`` 由 M7 eval_gate 反馈调节: 质量退化就调小, reject 率改善且质量不变就调大。
+其中:
+  * ``L_supervised`` — 对每个 verification event, 重跑 forward (带 LoRA),
+    用 hook 捕获目标层输出, MSE 逼近 ``event.true_feature`` (真实计算结果)。
+  * ``L_curvature``  — 对同 (sample, layer) 的时序 hidden 序列拟合多项式,
+    惩罚残差, 鼓励轨迹光滑可外推。
+  * ``L_anchor``     — 标准 diffusion loss, 在真实 anchor 样本上计算,
+    防止 LoRA 坍缩 (只监督 noise 通道, 与 DiT learned-sigma CFG 一致)。
 """
 
+from collections import defaultdict
 from typing import List, Optional
 
 import torch
@@ -151,7 +155,52 @@ def trajectory_curvature_loss_from_buffer(
 
 
 # ===========================================================================
-# Composite training loss
+# Internal helpers for the buffer-driven training loss
+# ===========================================================================
+
+
+def _run_transformer_forward(transformer,
+                             latent: torch.Tensor,
+                             timestep: torch.Tensor,
+                             class_labels: Optional[torch.Tensor] = None,
+                             encoder_hidden_states: Optional[torch.Tensor] = None):
+    """Dispatch a vanilla forward call to DiT or PixArt based on inputs.
+
+    Both forwards run with current=None, cache_dic=None, teacache_state=None
+    so they take the vanilla path (full 28-block stack). LoRA-modified
+    submodules still apply because LoRA is attached to the block params.
+    """
+    if encoder_hidden_states is not None:
+        # PixArt signature: forward(hidden_states, encoder_hidden_states, timestep, ...)
+        return transformer(
+            latent,
+            encoder_hidden_states=encoder_hidden_states,
+            timestep=timestep,
+            return_dict=False,
+        )
+    # DiT signature: forward(hidden_states, timestep, class_labels=None, ...)
+    return transformer(
+        latent,
+        timestep=timestep,
+        class_labels=class_labels,
+        return_dict=False,
+    )
+
+
+def _resolve_hook_layer(event, num_layers: int) -> int:
+    """Map an event to the layer index whose output the hook should capture.
+
+    SpecA events record a single block's output → hook that block directly.
+    TeaCache events record the full block-stack output (event.layer_id is just
+    a probe label, typically _VFL_PROBE_LAYER) → hook the last block.
+    """
+    if getattr(event, "module", "") == "residual":
+        return num_layers - 1
+    return event.layer_id
+
+
+# ===========================================================================
+# Composite training loss (buffer-driven, gradient-connected)
 # ===========================================================================
 
 
@@ -161,13 +210,19 @@ def compute_training_loss(
     anchor_samples: Optional[List] = None,
     lambda_curvature: float = 1e-4,
     curvature_order: int = 2,
-) -> torch.Tensor:
+    lambda_anchor: float = 1.0,
+    in_channels: int = 4,
+):
     """Compute the full L3 training loss with proper gradient connectivity.
 
-    Runs a forward pass through the transformer (which has LoRA attached)
-    to get gradient-connected hidden states, then computes curvature loss.
+    Replaces the previous random-noise version: now drives LoRA training
+    from real buffer events with three loss terms — supervised MSE on
+    event.true_feature, curvature on per-(sample, layer) trajectories, and
+    a standard diffusion anchor on real anchor samples.
 
-    L_total = λ_curv * L_curvature(from forward pass) [+ λ_diff * L_diffusion if anchors]
+    L_total = L_supervised
+            + λ_curv * L_curvature
+            + λ_anchor * L_anchor
 
     Parameters
     ----------
@@ -175,12 +230,19 @@ def compute_training_loss(
         The transformer with LoRA adapters attached. Must be in train mode
         for the LoRA layers, but can have backbone frozen.
     curvature_events : list of VerificationEvent
-        Events providing metadata (layer_id, timestep) for curvature computation.
-        Their true_features are NOT used directly — instead we re-run forward
-        to get gradient-connected features.
+        Events with ``latent_input`` / ``class_labels`` / ``encoder_hidden_states``
+        populated. Their ``true_feature`` is the supervised target.
     anchor_samples : list of AnchorSample, optional
+        Real data anchors for the standard diffusion loss term.
     lambda_curvature : float
+        Weight for the curvature term.
     curvature_order : int
+        Polynomial order for the curvature fit.
+    lambda_anchor : float
+        Weight for the anchor diffusion loss term.
+    in_channels : int
+        Number of noise channels (DiT learned-sigma: 4 noise + 4 variance).
+        Anchor loss only supervises the first ``in_channels`` channels.
 
     Returns
     -------
@@ -189,19 +251,155 @@ def compute_training_loss(
     device = next(transformer.parameters()).device
     dtype = next(transformer.parameters()).dtype
 
-    num_steps_in_seq = curvature_order + 4  # enough for polynomial fit (6)
-    batch_size = 2
+    # ----------------------------------------------------------------------
+    # 0. Short-circuit: nothing to learn from.
+    # ----------------------------------------------------------------------
+    has_events = bool(curvature_events) and any(
+        getattr(e, "latent_input", None) is not None for e in curvature_events
+    )
+    has_anchors = bool(anchor_samples)
+    if not has_events and not has_anchors:
+        return torch.tensor(0.0, device=device, dtype=dtype,
+                            requires_grad=True)
 
-    hidden_states_seq = []
-    for i in range(num_steps_in_seq):
-        latent = torch.randn(batch_size, 4, 32, 32, device=device, dtype=dtype)
-        t = torch.full((batch_size,), 500 - i * 30, device=device, dtype=torch.long)
-        class_labels = torch.randint(0, 1000, (batch_size,), device=device)
+    # ----------------------------------------------------------------------
+    # 1. Register forward hooks on the layers we need to capture.
+    # ----------------------------------------------------------------------
+    num_layers = len(transformer.transformer_blocks)
+    target_layers = set()
+    for e in curvature_events:
+        if getattr(e, "latent_input", None) is None:
+            continue
+        target_layers.add(_resolve_hook_layer(e, num_layers))
 
-        out = transformer(latent, t, class_labels=class_labels, return_dict=False)[0]
-        hidden_states_seq.append(out)
+    captured: dict = {}
+    hooks: list = []
 
-    loss_curv = trajectory_curvature_loss(hidden_states_seq, order=curvature_order)
-    loss = lambda_curvature * loss_curv
+    def _make_hook(lid):
+        def _hook(_module, _inp, out):
+            captured[lid] = out
+        return _hook
 
+    for lid in target_layers:
+        block = transformer.transformer_blocks[lid]
+        hooks.append(block.register_forward_hook(_make_hook(lid)))
+
+    # ----------------------------------------------------------------------
+    # 2. For each event, re-run forward (with LoRA) and capture target output.
+    # ----------------------------------------------------------------------
+    supervised_losses: List[torch.Tensor] = []
+    # (sample_id, hook_layer) → list of (step_idx, lora_hidden)
+    curvature_by_layer: dict = defaultdict(list)
+
+    try:
+        for event in curvature_events:
+            if getattr(event, "latent_input", None) is None:
+                continue
+
+            latent = event.latent_input.to(device=device, dtype=dtype)
+            # Prefer the real diffusion timestep (e.g. 981) over the legacy
+            # `timestep` field which historically held step_idx. adaLN
+            # modulation depends on the actual t — using step_idx would
+            # force LoRA to compensate for a wrong modulation signal.
+            t_val = getattr(event, "timestep_actual", 0) or event.timestep
+            timestep = torch.tensor(
+                [t_val], device=device, dtype=torch.long,
+            ).expand(latent.shape[0])
+
+            cl = (event.class_labels.to(device=device, dtype=dtype)
+                  if event.class_labels is not None else None)
+            enc = (event.encoder_hidden_states.to(device=device, dtype=dtype)
+                   if event.encoder_hidden_states is not None else None)
+
+            captured.clear()
+            _run_transformer_forward(
+                transformer, latent, timestep,
+                class_labels=cl, encoder_hidden_states=enc,
+            )
+
+            hook_layer = _resolve_hook_layer(event, num_layers)
+            if hook_layer not in captured:
+                continue  # hook didn't fire (shouldn't happen, but be safe)
+
+            lora_hidden = captured[hook_layer]
+            target = event.true_feature.to(device=device, dtype=dtype)
+            if target.shape != lora_hidden.shape:
+                # Shape mismatch (e.g. CFG-doubled vs single) — skip safely.
+                continue
+
+            supervised_losses.append(F.mse_loss(lora_hidden, target))
+
+            curvature_by_layer[(event.sample_id, hook_layer)].append(
+                (event.step_idx, lora_hidden))
+
+        # ----------------------------------------------------------------------
+        # 3. Curvature loss: fit polynomial per (sample, layer) trajectory.
+        # ----------------------------------------------------------------------
+        curv_losses: List[torch.Tensor] = []
+        for seq in curvature_by_layer.values():
+            if len(seq) < curvature_order + 2:
+                continue
+            seq.sort(key=lambda x: x[0])
+            hiddens = [h for _, h in seq]
+            curv_losses.append(trajectory_curvature_loss(
+                hiddens, order=curvature_order))
+
+        # ----------------------------------------------------------------------
+        # 4. Anchor diffusion loss on real samples (prevents collapse).
+        # ----------------------------------------------------------------------
+        anchor_losses: List[torch.Tensor] = []
+        for anchor in (anchor_samples or []):
+            if getattr(anchor, "latent", None) is None:
+                continue
+            a_latent = anchor.latent.to(device=device, dtype=dtype)
+            a_t = anchor.timestep.to(device=device, dtype=torch.long)
+            if a_t.numel() == 1:
+                a_t = a_t.expand(a_latent.shape[0])
+            a_target = anchor.target.to(device=device, dtype=dtype)
+
+            # AnchorSample.prompt is class_labels (DiT) or encoder_hidden_states (PixArt)
+            prompt = anchor.prompt
+            a_cl = None
+            a_enc = None
+            if isinstance(prompt, torch.Tensor):
+                if prompt.ndim == 1:
+                    a_cl = prompt.to(device=device, dtype=dtype)
+                elif prompt.ndim == 3:
+                    a_enc = prompt.to(device=device, dtype=dtype)
+
+            out = _run_transformer_forward(
+                transformer, a_latent, a_t,
+                class_labels=a_cl, encoder_hidden_states=a_enc,
+            )
+            model_out = out[0] if isinstance(out, tuple) else out.sample
+            # Only supervise the noise channels (learned-sigma safe).
+            ch = min(in_channels, model_out.shape[1],
+                     a_target.shape[1])
+            anchor_losses.append(F.mse_loss(model_out[:, :ch], a_target[:, :ch]))
+    finally:
+        # ----------------------------------------------------------------------
+        # 5. Always remove hooks, even on exception.
+        # ----------------------------------------------------------------------
+        for h in hooks:
+            h.remove()
+
+    # ----------------------------------------------------------------------
+    # 6. Weighted sum. Empty terms contribute zero.
+    # ----------------------------------------------------------------------
+    zero = torch.tensor(0.0, device=device, dtype=dtype)
+    loss_sup = (sum(supervised_losses) / len(supervised_losses)
+                if supervised_losses else zero)
+    loss_curv = (sum(curv_losses) / len(curv_losses)
+                 if curv_losses else zero)
+    loss_anchor = (sum(anchor_losses) / len(anchor_losses)
+                   if anchor_losses else zero)
+
+    loss = loss_sup + lambda_curvature * loss_curv + lambda_anchor * loss_anchor
+
+    # If everything was empty (e.g. all events lacked latent_input), still
+    # return a grad-connected zero so .backward() doesn't blow up.
+    if not loss.requires_grad:
+        loss = loss + 0.0 * sum(
+            p.sum() for p in transformer.parameters() if p.requires_grad
+        )
     return loss

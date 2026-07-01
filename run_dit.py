@@ -341,8 +341,8 @@ class DiTGenerator:
 
         timesteps = scheduler.timesteps
         for step_idx, t in enumerate(timesteps):
-            # VFL: track current step for event recording hooks inside forward()
-            set_vfl_step_info(step_idx, len(timesteps))
+            # VFL: track current step + real timestep for event recording hooks
+            set_vfl_step_info(step_idx, len(timesteps), timestep_actual=int(t))
             latent_input = scheduler.scale_model_input(latents, t)
             current_t = t.expand(latents.shape[0]).to(torch.int64)
 
@@ -535,8 +535,8 @@ class DiTGenerator:
 
         timesteps = scheduler.timesteps
         for step_idx, t in enumerate(timesteps):
-            # VFL: track current step for event recording hooks inside forward()
-            set_vfl_step_info(step_idx, len(timesteps))
+            # VFL: track current step + real timestep for event recording hooks
+            set_vfl_step_info(step_idx, len(timesteps), timestep_actual=int(t))
             latent_input = scheduler.scale_model_input(latents, t)
             current_t = t.expand(latents.shape[0]).to(torch.int64)
 
@@ -943,17 +943,36 @@ def run_c2i(args) -> Dict:
                 "images": 1,
             })
 
+        # ---- VFL: online async training trigger (per-batch) ----
+        # Fire maybe_train() after every batch so LoRA weight deltas can be
+        # applied mid-run and feed back into cache correction for the
+        # remaining batches. ``AsyncTrainer.should_train`` internally guards
+        # on ``trigger_min_samples`` / elapsed time, so this is a cheap no-op
+        # most iterations. Stay quiet unless training actually fires, to
+        # avoid log spam (the original "Triggering async training check..."
+        # banner was only appropriate for the single post-loop call).
+        if vfl_trainer is not None:
+            train_result = vfl_trainer.maybe_train()
+            if train_result:
+                print(f"  [VFL] mid-run training triggered after batch "
+                      f"start_idx={batch_start}: "
+                      f"loss={train_result.get('loss_mean', float('nan')):.6f} "
+                      f"-> {os.path.basename(train_result.get('checkpoint_path', ''))}")
+
     elapsed = time.time() - t_start
     print(f"\n  Total time: {elapsed/60:.1f} min "
           f"({elapsed/total_images:.2f} s/image, {len(wall_times)} batches)")
 
-    # ---- VFL: trigger async training ----
+    # ---- VFL: final flush ----
+    # 兜底处理循环末尾积累的样本: the last few batches may not have crossed
+    # ``trigger_min_samples`` mid-loop, so a final check here drains any
+    # remaining replay-buffer entries before FID/aggregation runs.
     if vfl_trainer is not None:
-        print("\n[VFL] Triggering async training check...")
         train_result = vfl_trainer.maybe_train()
         if train_result:
-            print(f"  [VFL] Training done: {train_result.get('loss_mean', '?'):.6f} "
-                  f"→ {os.path.basename(train_result.get('checkpoint_path', ''))}")
+            print(f"  [VFL] final-flush training: "
+                  f"loss={train_result.get('loss_mean', float('nan')):.6f} "
+                  f"-> {os.path.basename(train_result.get('checkpoint_path', ''))}")
 
     # ===================================================================
     # 6. FID/IS

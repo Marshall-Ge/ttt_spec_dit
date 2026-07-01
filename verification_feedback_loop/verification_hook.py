@@ -30,6 +30,9 @@ class VerificationEvent:
     所有 tensor 字段都必须是 detached 的 CPU tensor, 确保:
       1. 不保留 autograd 图 (O(1) 内存)
       2. 不受推理线程的 GPU 内存管理影响
+
+    Replay 上下文 (latent_input / class_labels / encoder_hidden_states) 用于
+    L3 训练时重新 forward 该层以获得 gradient-connected hidden states。
     """
 
     layer_id: int                      # 0-27
@@ -44,6 +47,23 @@ class VerificationEvent:
     step_idx: int                      # 去噪步序号 (0 = first, N-1 = last)
     module: str = ""                   # 子模块名 ("attn"/"mlp" for DiT, "attn1"/"attn2"/"ff" for PixArt)
 
+    # ---- Replay context (L3 training) ----
+    # transformer 的输入 latent (B, C, H, W) — 重新 forward 该层时使用。
+    # 注意: 这是 transformer.forward() 的 hidden_states 入参, NOT 单个 block
+    # 的入口 hidden; 但重新 forward 整个 transformer 后, hooks 会捕获目标
+    # block 的输出, 等价于"重跑该层"。
+    latent_input: Optional[torch.Tensor] = None
+    # DiT: (B,) ImageNet class id; PixArt: None
+    class_labels: Optional[torch.Tensor] = None
+    # PixArt: (B, seq, dim) T5 text embeddings; DiT: None
+    # Stored as fp16 to halve memory (~1.2MB → ~600KB per event for PixArt).
+    encoder_hidden_states: Optional[torch.Tensor] = None
+    # 标识产生该 event 的去噪轨迹 (用于 curvature loss 按 (sample, layer) 分组)
+    sample_id: int = 0
+    # 真实扩散 timestep (如 981), NOT step_idx。L3 训练重跑 forward 时必须
+    # 用真实 t 才能让 adaLN modulation 与录制时一致。0 表示未设置 (legacy)。
+    timestep_actual: int = 0
+
     def to_dict(self) -> dict:
         """序列化为纯 Python 对象 (用于日志/存储)。不保留 tensor。"""
         return {
@@ -56,9 +76,17 @@ class VerificationEvent:
             "base_model_version": self.base_model_version,
             "step_idx": self.step_idx,
             "module": self.module,
+            "sample_id": self.sample_id,
+            "timestep_actual": self.timestep_actual,
             # tensor shapes for reference
             "predicted_shape": tuple(self.predicted_feature.shape),
             "true_shape": tuple(self.true_feature.shape),
+            "latent_input_shape": (tuple(self.latent_input.shape)
+                                   if self.latent_input is not None else None),
+            "class_labels_shape": (tuple(self.class_labels.shape)
+                                   if self.class_labels is not None else None),
+            "encoder_hidden_states_shape": (tuple(self.encoder_hidden_states.shape)
+                                            if self.encoder_hidden_states is not None else None),
         }
 
 
@@ -135,6 +163,11 @@ def make_speca_event(
     model: str,
     base_model_version: str,
     module: str = "",
+    latent_input: Optional[torch.Tensor] = None,
+    class_labels: Optional[torch.Tensor] = None,
+    encoder_hidden_states: Optional[torch.Tensor] = None,
+    sample_id: int = 0,
+    timestep_actual: int = 0,
 ) -> VerificationEvent:
     """从 SpecA check_layer 的比较结果构造 VerificationEvent。
 
@@ -142,6 +175,13 @@ def make_speca_event(
     但这里不判断 threshold — 由调用方传入 decision (已在 speca_cal_type 中决定)。
     简化: 只要触发了 do_check (即达到了 min_taylor_steps), 就是 "reject" 候选。
     实际 decision 由 record_event 调用方根据 cache_dic['check'] 和 step_type 判断。
+
+    Replay 上下文 (latent_input / class_labels / encoder_hidden_states) 用于
+    L3 训练时重新 forward 该层。所有 tensor 会 detach + cpu 化以避免持有 GPU 内存。
+    encoder_hidden_states 存为 fp16 以减半内存 (PixArt: ~1.2MB → ~600KB/event)。
+
+    timestep_actual 是真实扩散 timestep (如 981), NOT step_idx。L3 训练重跑
+    forward 时必须用它才能让 adaLN modulation 与录制时一致。
     """
     bucket = make_timestep_bucket(step_idx, num_steps)
     return VerificationEvent(
@@ -156,6 +196,14 @@ def make_speca_event(
         base_model_version=base_model_version,
         step_idx=step_idx,
         module=module,
+        latent_input=(latent_input.detach().cpu()
+                      if latent_input is not None else None),
+        class_labels=(class_labels.detach().cpu()
+                      if class_labels is not None else None),
+        encoder_hidden_states=(encoder_hidden_states.detach().half().cpu()
+                               if encoder_hidden_states is not None else None),
+        sample_id=sample_id,
+        timestep_actual=int(timestep_actual) if timestep_actual else 0,
     )
 
 
@@ -168,6 +216,11 @@ def make_teacache_probe_event(
     true_hidden: torch.Tensor,
     model: str,
     base_model_version: str,
+    latent_input: Optional[torch.Tensor] = None,
+    class_labels: Optional[torch.Tensor] = None,
+    encoder_hidden_states: Optional[torch.Tensor] = None,
+    sample_id: int = 0,
+    timestep_actual: int = 0,
 ) -> VerificationEvent:
     """从 TeaCache calc 步的 per-layer probe 构造 VerificationEvent。
 
@@ -195,4 +248,12 @@ def make_teacache_probe_event(
         base_model_version=base_model_version,
         step_idx=step_idx,
         module="residual",   # TeaCache 是全 block 级别的 residual
+        latent_input=(latent_input.detach().cpu()
+                      if latent_input is not None else None),
+        class_labels=(class_labels.detach().cpu()
+                      if class_labels is not None else None),
+        encoder_hidden_states=(encoder_hidden_states.detach().half().cpu()
+                               if encoder_hidden_states is not None else None),
+        sample_id=sample_id,
+        timestep_actual=int(timestep_actual) if timestep_actual else 0,
     )

@@ -139,9 +139,20 @@ class AsyncTrainer:
         events, anchors = self.buffer.sample_training_batch(
             batch_size, ratio=cfg.batch_ratio)
 
-        if len(events) < 4:
-            print("  [VFL:AsyncTrainer] Insufficient events, skipping")
-            return {"status": "skipped", "reason": "insufficient_events"}
+        # Only events carrying replay context (latent_input) can drive the
+        # new buffer-driven loss. Older events recorded before the replay
+        # context fields existed are skipped by compute_training_loss, but
+        # if NONE have it we bail out early to avoid a no-op training cycle.
+        usable_events = [e for e in events
+                         if getattr(e, "latent_input", None) is not None]
+
+        if len(usable_events) < 4:
+            print(f"  [VFL:AsyncTrainer] Insufficient usable events "
+                  f"({len(usable_events)}/{len(events)} have latent_input), skipping")
+            return {"status": "skipped",
+                    "reason": "insufficient_usable_events",
+                    "total_events": len(events),
+                    "usable_events": len(usable_events)}
 
         # ---- Step 3: Training loop ----
         if self._optimizer is None:
@@ -152,11 +163,13 @@ class AsyncTrainer:
         for step in range(cfg.trainer_steps_per_trigger):
             self._optimizer.zero_grad(set_to_none=True)
 
-            # Compute loss with proper gradient connectivity
-            # (runs forward pass through LoRA-attached transformer)
+            # Buffer-driven loss: supervised MSE on event.true_feature +
+            # curvature on per-(sample, layer) trajectories + anchor
+            # diffusion loss on real samples. Forward re-runs per event
+            # with hooks capturing the LoRA-modified target-layer output.
             loss_scaled = compute_training_loss(
                 self.transformer,
-                curvature_events=events,
+                curvature_events=usable_events,
                 anchor_samples=anchors if anchors else None,
                 lambda_curvature=cfg.lambda_curvature,
                 curvature_order=cfg.curvature_order,

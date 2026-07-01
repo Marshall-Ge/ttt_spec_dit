@@ -61,7 +61,8 @@ _VFL_PROBE_LAYER = 20  # TeaCache + SpecA check layer for DiT
 
 def _vfl_record_speca_event(layer_id, timestep_val, step_idx, num_steps,
                               predicted_hidden, full_hidden, error_value,
-                              module_name=""):
+                              module_name="",
+                              latent_input=None, class_labels=None):
     """Record a SpecA verification event for DiT."""
     record_speca_event(
         layer_id=layer_id, timestep_val=timestep_val,
@@ -69,18 +70,23 @@ def _vfl_record_speca_event(layer_id, timestep_val, step_idx, num_steps,
         predicted_hidden=predicted_hidden, full_hidden=full_hidden,
         error_value=error_value,
         model="dit", module_name=module_name,
+        latent_input=latent_input,
+        class_labels=class_labels,
     )
 
 
 def _vfl_record_teacache_event(layer_id, timestep_val, step_idx, num_steps,
                                  predicted_hidden, true_hidden,
-                                 raw_diff: float = 0.0):
+                                 raw_diff: float = 0.0,
+                                 latent_input=None, class_labels=None):
     """Record a TeaCache probe event for DiT."""
     record_teacache_event(
         layer_id=layer_id, timestep_val=timestep_val,
         step_idx=step_idx, num_steps=num_steps,
         predicted_hidden=predicted_hidden, true_hidden=true_hidden,
         model="dit", raw_diff=raw_diff,
+        latent_input=latent_input,
+        class_labels=class_labels,
     )
 
 
@@ -175,6 +181,10 @@ class DiTTransformer2D(nn.Module):
         if use_speca:
             speca_cal_type(cache_dic, current, calibrator=_vfl_calibrator)
         vanilla = not use_speca and not use_teacache
+
+        # VFL: snapshot the transformer's raw latent input (B, C, H, W) before
+        # pos_embed transforms it. Used as replay context for L3 training.
+        _vfl_latent_input = hidden_states
 
         # 2. Patch embed + positional embed.
         height, width = (
@@ -307,6 +317,8 @@ class DiTTransformer2D(nn.Module):
                         full_hidden=full_hidden,
                         error_value=gate_value,
                         module_name="block",
+                        latent_input=_vfl_latent_input,
+                        class_labels=class_labels,
                     )
 
         # ---- TeaCache: save residual after blocks complete ----
@@ -327,6 +339,8 @@ class DiTTransformer2D(nn.Module):
                     teacache_state, ori_hidden),
                 true_hidden=hidden_states,
                 raw_diff=teacache_state.get("last_raw_diff", 0.0),
+                latent_input=_vfl_latent_input,
+                class_labels=class_labels,
             )
 
         # 4. Output (norm_out + proj_out_1/2 + unpatchify) — always runs.

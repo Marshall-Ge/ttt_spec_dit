@@ -105,13 +105,19 @@ class _Stratum:
             pool = by_kind.get(kind, [])
             n_i = max(0, int(n * r))
             if pool and n_i > 0:
-                result.extend(random.choices(pool, k=min(n_i, len(pool))))
+                if n_i >= len(pool):
+                    result.extend(pool)  # return all, no need to sample
+                else:
+                    result.extend(random.sample(pool, k=n_i))
 
         # 如果某种类样本不足, 用其他类补齐到 n
         if len(result) < n and by_kind:
             all_pool = [s for s, _ in self._buffer]
             remaining = n - len(result)
-            result.extend(random.choices(all_pool, k=min(remaining, len(all_pool))))
+            if remaining >= len(all_pool):
+                result.extend(all_pool)
+            else:
+                result.extend(random.sample(all_pool, k=remaining))
 
         random.shuffle(result)
         return result[:n]
@@ -152,7 +158,8 @@ class StratifiedReplayBuffer:
                  capacity_per_stratum: int = 1000,
                  num_layers: int = 28,
                  num_timestep_buckets: int = 3,
-                 batch_ratio: Optional[Dict[str, float]] = None):
+                 batch_ratio: Optional[Dict[str, float]] = None,
+                 max_encoder_hidden_states_events: int = 200):
         """
         Parameters
         ----------
@@ -164,6 +171,11 @@ class StratifiedReplayBuffer:
             时间桶数量 (默认 3: early/mid/late)。
         batch_ratio : dict
             训练采样比例 {"hard_negative": 0.5, "normal": 0.3, "anchor": 0.2}。
+        max_encoder_hidden_states_events : int
+            全缓冲区允许携带 encoder_hidden_states 的 event 数量上限
+            (内存安全阀; PixArt 每个 ~600KB fp16)。超出后新 event 的
+            encoder_hidden_states 会被丢弃, latent_input / class_labels 仍保留。
+            设为 0 可完全禁用 encoder_hidden_states 存储。
         """
         self.capacity_per_stratum = capacity_per_stratum
         self.num_layers = num_layers
@@ -171,6 +183,7 @@ class StratifiedReplayBuffer:
         self.batch_ratio = batch_ratio or {
             "hard_negative": 0.5, "normal": 0.3, "anchor": 0.2,
         }
+        self.max_ehs_events = max_encoder_hidden_states_events
 
         # (layer_id, timestep_bucket) → _Stratum
         self._strata: Dict[Tuple[int, int], _Stratum] = {}
@@ -178,6 +191,9 @@ class StratifiedReplayBuffer:
 
         # 累计统计
         self._total_added: Dict[str, int] = defaultdict(int)
+        # 上限估计值 (reservoir 替换时不去减, 是 conservative upper bound)
+        self._ehs_count = 0
+        self._ehs_dropped = 0  # 因超限被丢弃的次数
 
     # ------------------------------------------------------------------
     # Stratum key
@@ -206,6 +222,18 @@ class StratifiedReplayBuffer:
         kind : str
             "hard_negative" (reject 事件) 或 "normal" (accept 低采样)。
         """
+        # 内存安全阀: 当缓冲区携带 encoder_hidden_states 的 event 数量
+        # 达到上限时, 丢弃新 event 的 encoder_hidden_states (PixArt
+        # ~600KB/event fp16)。latent_input / class_labels 仍保留, 所以
+        # DiT 路径完全不受影响, PixArt 也能继续训练 (只是 attn2 的
+        # cross-attention 重跑会缺文本输入, supervised loss 跳过该 event)。
+        if event.encoder_hidden_states is not None:
+            if self._ehs_count >= self.max_ehs_events:
+                event.encoder_hidden_states = None
+                self._ehs_dropped += 1
+            else:
+                self._ehs_count += 1
+
         stratum = self._get_or_create_stratum(
             event.layer_id, event.timestep_bucket)
         stratum.add(event, kind)
@@ -330,6 +358,9 @@ class StratifiedReplayBuffer:
             "total_samples": sum(s.size for s in self._strata.values()),
             "total_anchors": len(self._anchor_samples),
             "total_added": dict(self._total_added),
+            "ehs_count": self._ehs_count,
+            "ehs_dropped": self._ehs_dropped,
+            "ehs_cap": self.max_ehs_events,
             "per_layer_hard_negative": dict(sorted(per_layer_hard.items())),
             "per_layer_normal": dict(sorted(per_layer_normal.items())),
             "strata": strata_stats,

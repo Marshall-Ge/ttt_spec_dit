@@ -352,8 +352,8 @@ class PixArtGenerator:
         timer = CudaTimer(self.device)
 
         for step_idx, t in enumerate(sched.timesteps):
-            # VFL: track current step for event recording hooks inside forward()
-            set_vfl_step_info(step_idx, len(sched.timesteps))
+            # VFL: track current step + real timestep for event recording hooks
+            set_vfl_step_info(step_idx, len(sched.timesteps), timestep_actual=int(t))
             latent_input = sched.scale_model_input(latents, t)
             current_t = t.expand(latents.shape[0]).to(torch.int64)
 
@@ -417,8 +417,8 @@ class PixArtGenerator:
         timesteps = scheduler.timesteps
 
         for step_idx, t in enumerate(timesteps):
-            # VFL: track current step for event recording hooks inside forward()
-            set_vfl_step_info(step_idx, len(timesteps))
+            # VFL: track current step + real timestep for event recording hooks
+            set_vfl_step_info(step_idx, len(timesteps), timestep_actual=int(t))
             latent_input = scheduler.scale_model_input(latents, t)
             current_t = t.expand(latents.shape[0]).to(torch.int64)
 

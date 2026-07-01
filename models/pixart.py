@@ -60,7 +60,8 @@ _VFL_PROBE_LAYER = 24  # TeaCache + SpecA check layer for PixArt
 
 def _vfl_record_speca_event(layer_id, timestep_val, step_idx, num_steps,
                               predicted_hidden, full_hidden, error_value,
-                              module_name=""):
+                              module_name="",
+                              latent_input=None, encoder_hidden_states=None):
     """Record a SpecA verification event for PixArt."""
     record_speca_event(
         layer_id=layer_id, timestep_val=timestep_val,
@@ -68,18 +69,23 @@ def _vfl_record_speca_event(layer_id, timestep_val, step_idx, num_steps,
         predicted_hidden=predicted_hidden, full_hidden=full_hidden,
         error_value=error_value,
         model="pixart", module_name=module_name,
+        latent_input=latent_input,
+        encoder_hidden_states=encoder_hidden_states,
     )
 
 
 def _vfl_record_teacache_event(layer_id, timestep_val, step_idx, num_steps,
                                  predicted_hidden, true_hidden,
-                                 raw_diff: float = 0.0):
+                                 raw_diff: float = 0.0,
+                                 latent_input=None, encoder_hidden_states=None):
     """Record a TeaCache probe event for PixArt."""
     record_teacache_event(
         layer_id=layer_id, timestep_val=timestep_val,
         step_idx=step_idx, num_steps=num_steps,
         predicted_hidden=predicted_hidden, true_hidden=true_hidden,
         model="pixart", raw_diff=raw_diff,
+        latent_input=latent_input,
+        encoder_hidden_states=encoder_hidden_states,
     )
 
 
@@ -190,6 +196,11 @@ class PixArtTransformer2D(nn.Module):
             hidden_states.shape[-2] // self.config.patch_size,
             hidden_states.shape[-1] // self.config.patch_size,
         )
+
+        # VFL: snapshot the transformer's raw latent input (B, C, H, W) before
+        # pos_embed transforms it. Used as replay context for L3 training.
+        _vfl_latent_input = hidden_states
+
         hidden_states = self.pos_embed(hidden_states)
 
         # adaln_single returns (timestep_emb, embedded_timestep)
@@ -197,6 +208,11 @@ class PixArtTransformer2D(nn.Module):
             timestep, added_cond_kwargs, batch_size=batch_size,
             hidden_dtype=hidden_states.dtype,
         )
+
+        # VFL: snapshot the raw T5 embeddings BEFORE caption_projection —
+        # re-running forward will call caption_projection again, so we must
+        # pass the un-projected tensor to avoid double projection.
+        _vfl_encoder_hidden_states = encoder_hidden_states
 
         if self.caption_projection is not None:
             encoder_hidden_states = self.caption_projection(encoder_hidden_states)
@@ -345,6 +361,8 @@ class PixArtTransformer2D(nn.Module):
                         full_hidden=full_hidden,
                         error_value=gate_value,
                         module_name="block",
+                        latent_input=_vfl_latent_input,
+                        encoder_hidden_states=_vfl_encoder_hidden_states,
                     )
 
         # ---- TeaCache: save residual after blocks complete ----
@@ -361,6 +379,8 @@ class PixArtTransformer2D(nn.Module):
                     teacache_state, ori_hidden),
                 true_hidden=hidden_states,
                 raw_diff=teacache_state.get("last_raw_diff", 0.0),
+                latent_input=_vfl_latent_input,
+                encoder_hidden_states=_vfl_encoder_hidden_states,
             )
 
         # 4. Output (norm_out + proj_out + unpatchify) — always runs.
