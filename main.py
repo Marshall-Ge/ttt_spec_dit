@@ -131,9 +131,12 @@ Examples:
     parser.add_argument("--vfl_output_dir", type=str, default=None,
                         help="VFL output directory (default: <output_dir>/vfl)")
     parser.add_argument("--vfl-no-train", action="store_true", default=False,
-                        help="Calibration-only mode: collect events + tune "
-                             "thresholds, but skip all training (no deepcopy, "
-                             "no LoRA, no background worker).")
+                        help="Threshold-only mode: collect scalar errors for "
+                             "the OnlineCalibrator (no GPU→CPU tensor "
+                             "transfer, no buffer writes) and skip all "
+                             "training (no deepcopy, no LoRA, no background "
+                             "worker). Combine with --vfl for the lightweight "
+                             "threshold-only baseline.")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
     parser.add_argument("--guidance_scale", type=float, default=DEFAULT_GUIDANCE_SCALE,

@@ -177,30 +177,36 @@ def make_speca_event(
     实际 decision 由 record_event 调用方根据 cache_dic['check'] 和 step_type 判断。
 
     Replay 上下文 (latent_input / class_labels / encoder_hidden_states) 用于
-    L3 训练时重新 forward 该层。所有 tensor 会 detach + cpu 化以避免持有 GPU 内存。
+    L3 训练时重新 forward 该层。所有 tensor 会 cpu 化以避免持有 GPU 内存。
     encoder_hidden_states 存为 fp16 以减半内存 (PixArt: ~1.2MB → ~600KB/event)。
 
     timestep_actual 是真实扩散 timestep (如 981), NOT step_idx。L3 训练重跑
     forward 时必须用它才能让 adaLN modulation 与录制时一致。
+
+    Note: the caller passes tensors produced by the SpecA do_check path
+    (full_hidden = hidden_states.clone() → recomputed through attn/mlp),
+    which are non-leaf intermediates with no grad_fn (forward runs under
+    inference mode).  We therefore skip the redundant ``.detach()`` here
+    — it would be a no-op that allocates a wrapper tensor on every call.
     """
     bucket = make_timestep_bucket(step_idx, num_steps)
     return VerificationEvent(
         layer_id=layer_id,
         timestep=timestep_val,
         timestep_bucket=bucket,
-        predicted_feature=predicted_hidden.detach().half().cpu(),
-        true_feature=full_hidden.detach().half().cpu(),
+        predicted_feature=predicted_hidden.half().cpu(),
+        true_feature=full_hidden.half().cpu(),
         error_value=error_value,
         decision="reject",  # check_layer 触发 = 潜在 rejection
         model=model,
         base_model_version=base_model_version,
         step_idx=step_idx,
         module=module,
-        latent_input=(latent_input.detach().half().cpu()
+        latent_input=(latent_input.half().cpu()
                       if latent_input is not None else None),
-        class_labels=(class_labels.detach().cpu()
+        class_labels=(class_labels.cpu()
                       if class_labels is not None else None),
-        encoder_hidden_states=(encoder_hidden_states.detach().half().cpu()
+        encoder_hidden_states=(encoder_hidden_states.half().cpu()
                                if encoder_hidden_states is not None else None),
         sample_id=sample_id,
         timestep_actual=int(timestep_actual) if timestep_actual else 0,
@@ -228,6 +234,9 @@ def make_teacache_probe_event(
     (用 cached residual) 得到 predicted。这等价于一个 reject 事件:
       预测 = 如果用缓存会得到什么
       真实 = 完整计算的结果
+
+    Same detach-removal rationale as ``make_speca_event``: the inputs are
+    inference-mode intermediates with no autograd graph attached.
     """
     bucket = make_timestep_bucket(step_idx, num_steps)
     # 用 relative L1 作为 error metric (与 TeaCache 保持一致)
@@ -240,19 +249,19 @@ def make_teacache_probe_event(
         layer_id=layer_id,
         timestep=timestep_val,
         timestep_bucket=bucket,
-        predicted_feature=predicted_hidden.detach().half().cpu(),
-        true_feature=true_hidden.detach().half().cpu(),
+        predicted_feature=predicted_hidden.half().cpu(),
+        true_feature=true_hidden.half().cpu(),
         error_value=error_val,
         decision="reject",  # calc 步骤本身说明 TeaCache 认为不能 skip
         model=model,
         base_model_version=base_model_version,
         step_idx=step_idx,
         module="residual",   # TeaCache 是全 block 级别的 residual
-        latent_input=(latent_input.detach().half().cpu()
+        latent_input=(latent_input.half().cpu()
                       if latent_input is not None else None),
-        class_labels=(class_labels.detach().cpu()
+        class_labels=(class_labels.cpu()
                       if class_labels is not None else None),
-        encoder_hidden_states=(encoder_hidden_states.detach().half().cpu()
+        encoder_hidden_states=(encoder_hidden_states.half().cpu()
                                if encoder_hidden_states is not None else None),
         sample_id=sample_id,
         timestep_actual=int(timestep_actual) if timestep_actual else 0,

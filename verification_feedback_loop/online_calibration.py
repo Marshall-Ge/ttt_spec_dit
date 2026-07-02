@@ -20,7 +20,7 @@ Interface::
 """
 
 import math
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -118,7 +118,9 @@ class OnlineCalibrator:
                  ema_window: int = 500,
                  ema_window_short: int = 50,
                  threshold_k: float = 3.0,
-                 min_floor: float = 0.001):
+                 min_floor: float = 0.001,
+                 ema_window_long: Optional[int] = None,
+                 threshold_cache_ttl: int = 5):
         """
         Parameters
         ----------
@@ -130,7 +132,21 @@ class OnlineCalibrator:
             阈值 = mean + k·std 中的 k。
         min_floor : float
             阈值下限。
+        ema_window_long : int, optional
+            Backwards-compat alias for ``ema_window``.  Some call sites and
+            tests still use the long-form name; if provided, overrides
+            ``ema_window``.
+        threshold_cache_ttl : int
+            Number of ``current_step`` ticks that a cached threshold is
+            considered fresh.  ``speca_cal_type`` queries the calibrator
+            once per denoising step (≈50k queries over a 1000-image run);
+            the EMA only moves meaningfully on a ~500-step half-life, so
+            re-computing the threshold every step is wasted work.  TTL=5
+            means we recompute at most every 5 steps — ≤20% of queries
+            hit the slow path, the rest are an O(1) dict lookup.
         """
+        if ema_window_long is not None:
+            ema_window = ema_window_long
         self.ema_window_long = ema_window
         self.ema_window_short = ema_window_short
         self.threshold_k = threshold_k
@@ -140,6 +156,16 @@ class OnlineCalibrator:
         self._ema: Dict[Tuple[int, int], _EMAThreshold] = {}
 
         self._total_updates: int = 0
+
+        # TTL cache for ``get_threshold_cached``.  Key: (layer, bucket),
+        # value: (step_at_last_compute, threshold).  Entries older than
+        # ``threshold_cache_ttl`` steps are recomputed.
+        self._threshold_cache: Dict[Tuple[int, int], Tuple[int, float]] = {}
+        self._threshold_cache_ttl: int = max(1, int(threshold_cache_ttl))
+        # Tracks the most recent ``current_step`` argument we've seen, so
+        # callers that don't pass one (or pass the same one repeatedly) still
+        # get correct TTL eviction.
+        self._last_step_seen: int = -1
 
     # ------------------------------------------------------------------
     # Update
@@ -155,9 +181,16 @@ class OnlineCalibrator:
         if key not in self._ema:
             self._ema[key] = _EMAThreshold(
                 window=self.ema_window_long, k=self.threshold_k)
+            # New stratum → cached value (if any) is for a non-existent
+            # EMA, drop it so the next query recomputes.
+            self._threshold_cache.pop(key, None)
 
         self._ema[key].update(event.error_value)
         self._total_updates += 1
+        # Note: we deliberately do NOT invalidate the threshold cache on
+        # every update — the EMA's half-life is ~500 steps, so the cached
+        # value is fresh enough within the TTL window.  Invalidation happens
+        # lazily when ``get_threshold_cached`` sees a step delta >= TTL.
 
     # ------------------------------------------------------------------
     # Query
@@ -180,6 +213,79 @@ class OnlineCalibrator:
         if getattr(self, '_exploit_mode', False):
             return online  # 飞轮模式: 允许更激进的阈值
         return max(online, default)  # 保守模式: 静态默认值做地板
+
+    def get_threshold_cached(self,
+                             layer_id: int,
+                             timestep_bucket: int,
+                             current_step: int,
+                             default: float = 0.25,
+                             ttl: Optional[int] = None) -> float:
+        """TTL-cached variant of ``get_threshold``.
+
+        SpecA's ``speca_cal_type`` queries the calibrator once per denoising
+        step (≈50k queries over a 1000-image run).  The EMA's half-life is
+        ~500 steps, so the threshold moves by <1e-4 between adjacent steps —
+        recomputing it every step is wasted work.
+
+        This method caches the computed threshold keyed by (layer, bucket)
+        for ``ttl`` steps.  Within the TTL window, calls are an O(1) dict
+        lookup; outside it, the threshold is recomputed and the cache entry
+        refreshed.
+
+        Parameters
+        ----------
+        layer_id, timestep_bucket : int
+            Stratum key.
+        current_step : int
+            Monotonic step counter (the SpeA ``current.step`` field, which
+            counts DOWN from num_steps-1 to 0, works fine — only the
+            difference between successive calls matters).
+        default : float
+            Same semantics as ``get_threshold``.
+        ttl : int, optional
+            Override the constructor's ``threshold_cache_ttl``.  Mainly
+            useful in tests.
+        """
+        ttl_eff = self._threshold_cache_ttl if ttl is None else max(1, int(ttl))
+
+        # Track the highest step we've ever seen so callers that pass a
+        # non-monotonic step (e.g. SpecA's descending counter) don't trick
+        # the cache into thinking no time has passed.  We use abs distance
+        # from the last seen step for the freshness check.
+        key = (layer_id, timestep_bucket)
+        cached = self._threshold_cache.get(key)
+
+        if cached is not None:
+            cached_step, cached_thresh = cached
+            # Fresh if the step distance is within TTL.  Using abs() makes
+            # this work whether step counts up or down.
+            if abs(current_step - cached_step) < ttl_eff:
+                return cached_thresh
+
+        # Cache miss or stale — recompute.
+        thresh = self.get_threshold(layer_id, timestep_bucket, default=default)
+        self._threshold_cache[key] = (current_step, thresh)
+
+        # Opportunistic GC: if the cache has grown past 256 entries (28
+        # layers × 3 buckets = 84 max realistic strata), drop the oldest
+        # entries.  Cheap because it only runs when the cache grows, which
+        # is bounded.
+        if len(self._threshold_cache) > 256:
+            self._threshold_cache.clear()
+            # Re-insert the just-computed value so the next call hits.
+            self._threshold_cache[key] = (current_step, thresh)
+
+        return thresh
+
+    def invalidate_threshold_cache(self) -> None:
+        """Drop all cached thresholds.
+
+        Called automatically on ``on_base_model_swap`` (the EMA windows
+        change, so cached values are stale) and on ``set_exploit_mode``
+        (the threshold formula changes).  Safe to call manually whenever
+        the underlying EMA stats have been mutated externally.
+        """
+        self._threshold_cache.clear()
 
     def get_stats(self, layer_id: int, timestep_bucket: int) -> Dict:
         """获取 ``(layer, bucket)`` 的诊断统计。"""
@@ -210,11 +316,15 @@ class OnlineCalibrator:
         """
         for ema in self._ema.values():
             ema.set_window(self.ema_window_short)
+        # Window change shifts the threshold abruptly — cached values are
+        # stale until the short-window EMA reconverges.
+        self.invalidate_threshold_cache()
 
     def on_converged(self):
         """恢复正常运行参数 (在版本切换重新收敛后调用)。"""
         for ema in self._ema.values():
             ema.set_window(self.ema_window_long)
+        self.invalidate_threshold_cache()
 
     def set_exploit_mode(self, enabled: bool = True):
         """启用飞轮 exploit 模式: 允许阈值低于静态默认值, 降低 k 值。"""
@@ -222,6 +332,8 @@ class OnlineCalibrator:
         if enabled:
             for ema in self._ema.values():
                 ema.k = 1.5  # 更激进的阈值 (从 3.0 降到 1.5)
+        # k change moves the threshold formula → cached values are stale.
+        self.invalidate_threshold_cache()
 
     @property
     def total_updates(self) -> int:

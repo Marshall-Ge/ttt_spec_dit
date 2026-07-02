@@ -711,10 +711,7 @@ def run_c2i(args) -> Dict:
         vfl_cfg.poll_interval_s = 5.0
         vfl_cfg.loRA_rank = 4
 
-        vfl_buf = StratifiedReplayBuffer(
-            capacity_per_stratum=vfl_cfg.buffer_capacity_per_stratum)
         vfl_cal = OnlineCalibrator(ema_window=100)
-        set_vfl_buffer(vfl_buf, model_version="dit-v1")
         set_vfl_calibrator(vfl_cal)
 
         vfl_output_dir = getattr(args, "vfl_output_dir", None) or \
@@ -722,10 +719,14 @@ def run_c2i(args) -> Dict:
         vfl_no_train = getattr(args, "vfl_no_train", False)
 
         if vfl_no_train:
-            # ---- Calibration-only mode ----
-            # Still load previous LoRA checkpoint so inference benefits
-            # from past training, but skip all training overhead
-            # (no deepcopy, no LoRA attachment, no background worker).
+            # ---- Threshold-only mode (--vfl --vfl-no-train) ----
+            # Only the calibrator is registered; the buffer is left None.
+            # record_speca_event / record_teacache_event see buf=None and
+            # take the scalar fast path — no GPU→CPU tensor transfer, no
+            # VerificationEvent construction, no buffer writes.  We still
+            # load any previous LoRA checkpoint so inference benefits from
+            # past training, but skip all training overhead (no deepcopy,
+            # no LoRA attachment, no background worker).
             prev_ckpt = find_latest_checkpoint(vfl_output_dir)
             if prev_ckpt is None:
                 prev_ckpt = find_latest_checkpoint(
@@ -737,10 +738,19 @@ def run_c2i(args) -> Dict:
                 except Exception as e:
                     print(f"  [WARN] failed to load LoRA checkpoint "
                           f"{prev_ckpt}: {e} — proceeding without it")
-            print(f"  VFL enabled (calibration-only, no training): "
-                  f"buffer + calibrator, poll={vfl_cfg.poll_interval_s}s")
+            print(f"  VFL enabled (threshold-only, no training): "
+                  f"calibrator-only hot path, no LoRA worker")
         else:
-            # ---- Full training mode ----
+            # ---- Threshold+LoRA mode (--vfl) ----
+            # Both calibrator and buffer are registered.  record_* builds
+            # full VerificationEvents with detached CPU tensors and writes
+            # them to the buffer so the AsyncTrainingWorker has replay
+            # context for L3 LoRA training.  Hot path pays the GPU→CPU
+            # tensor transfer cost.
+            vfl_buf = StratifiedReplayBuffer(
+                capacity_per_stratum=vfl_cfg.buffer_capacity_per_stratum)
+            set_vfl_buffer(vfl_buf, model_version="dit-v1")
+
             vfl_worker = AsyncTrainingWorker(
                 generator.transformer, vfl_buf, config=vfl_cfg,
                 base_model_version="dit-v1", output_dir=vfl_output_dir,

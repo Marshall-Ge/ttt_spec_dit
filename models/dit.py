@@ -67,14 +67,37 @@ def _vfl_record_speca_event(layer_id, timestep_val, step_idx, num_steps,
                               predicted_hidden, full_hidden, error_value,
                               module_name="",
                               latent_input=None, class_labels=None):
-    """Record per-sample SpecA verification events for DiT.
+    """Record SpecA verification events for DiT.
 
     Splits batch tensors into per-sample events.  Without this a single
     event at batch_size=32 with CFG doubling stores (64, 256, 1152) × fp32
     ≈ 151 MB — just 20 events would blow past 3 GB of CPU RAM.  Per-sample
     events store (1, 256, 1152) × fp16 ≈ 0.6 MB each, keeping the buffer
     bounded at ~2 GB even when full (3 strata × 1 000).
+
+    Hot-path fast path: when no buffer is registered (``--vfl
+    --vfl-no-train``), skip the per-sample GPU→CPU tensor transfer entirely
+    and feed the calibrator a single scalar (the batch-level ``error_value``
+    already computed by ``compute_error_gate``).  This collapses 56k
+    per-sample events × 3 ``.cpu()`` syncs each into 1 750 batch-level
+    scalar updates over a 1000-image run — the instrumentation overhead
+    becomes invisible.
     """
+    # ---- calibrate-only path: no buffer registered → one scalar update ----
+    if get_vfl_buffer() is None:
+        record_speca_event(
+            layer_id=layer_id, timestep_val=timestep_val,
+            step_idx=step_idx, num_steps=num_steps,
+            predicted_hidden=predicted_hidden, full_hidden=full_hidden,
+            error_value=error_value,
+            model="dit", module_name=module_name,
+            # latent_input / class_labels intentionally NOT passed —
+            # calibrate-only path ignores them and we want to avoid even
+            # the reference bump.
+        )
+        return
+
+    # ---- full path: per-sample splitting for buffer storage ----
     # ---- CFG dedup: keep only the cond half ----
     if class_labels is not None:
         B = class_labels.shape[0]  # real batch size (before CFG doubling)
@@ -103,11 +126,24 @@ def _vfl_record_teacache_event(layer_id, timestep_val, step_idx, num_steps,
                                  predicted_hidden, true_hidden,
                                  raw_diff: float = 0.0,
                                  latent_input=None, class_labels=None):
-    """Record per-sample TeaCache probe events for DiT.
+    """Record TeaCache probe events for DiT.
 
     Same per-sample splitting as ``_vfl_record_speca_event`` — see that
     function's docstring for the memory rationale.
+
+    Hot-path fast path: when no buffer is registered, skip the per-sample
+    loop and feed the calibrator a single scalar (``raw_diff``, the
+    proxy_diff already computed by ``teacache_decide``).
     """
+    if get_vfl_buffer() is None:
+        record_teacache_event(
+            layer_id=layer_id, timestep_val=timestep_val,
+            step_idx=step_idx, num_steps=num_steps,
+            predicted_hidden=predicted_hidden, true_hidden=true_hidden,
+            model="dit", raw_diff=raw_diff,
+        )
+        return
+
     if class_labels is not None:
         B = class_labels.shape[0]
     else:

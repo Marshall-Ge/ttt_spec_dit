@@ -24,6 +24,16 @@ _vfl_num_steps = 50
 _vfl_sample_id = 0          # identifies the current denoising trajectory (per-image)
 _vfl_timestep_actual = 0    # real diffusion timestep (e.g. 981), NOT step_idx
 
+# Behavior mode is derived from which globals the runner registers — no
+# separate mode flag:
+#   * cal=None, buf=None       → baseline (no --vfl): record_* is a no-op.
+#   * cal set, buf=None        → --vfl --vfl-no-train: record_* feeds the
+#                                calibrator a single scalar (no GPU→CPU
+#                                tensor transfer, no VerificationEvent).
+#   * cal set, buf set         → --vfl (with training): record_* builds a
+#                                full VerificationEvent, writes to buffer,
+#                                and updates the calibrator.
+
 
 # ===========================================================================
 # Setters / getters
@@ -98,6 +108,63 @@ def set_vfl_sample_id(sample_id: int):
 
 
 # ===========================================================================
+# Internal helpers — mode-aware fast paths
+# ===========================================================================
+
+def _make_calibrator_speca_update(cal,
+                                  layer_id: int,
+                                  step_idx: int,
+                                  num_steps: int,
+                                  error_value: float):
+    """Fast path: feed a single scalar to the calibrator only.
+
+    Avoids constructing a VerificationEvent (no torch tensors touched, no
+    GPU→CPU sync).  Used by ``record_speca_event`` when no buffer is
+    registered (``--vfl --vfl-no-train`` mode).
+    """
+    if num_steps <= 0:
+        return
+    bucket = int(step_idx * 3 / num_steps)
+    if bucket > 2:
+        bucket = 2
+    # Build a lightweight stand-in object so we don't have to special-case
+    # OnlineCalibrator.update — it only reads (layer_id, timestep_bucket,
+    # error_value).  Avoids the per-event torch tensor allocation entirely.
+    cal.update(_ScalarCalibEvent(layer_id, bucket, error_value))
+
+
+def _make_calibrator_teacache_update(cal,
+                                     layer_id: int,
+                                     step_idx: int,
+                                     num_steps: int,
+                                     error_value: float):
+    """Fast path for TeaCache probe events (mirror of the SpecA version)."""
+    if num_steps <= 0:
+        return
+    bucket = int(step_idx * 3 / num_steps)
+    if bucket > 2:
+        bucket = 2
+    cal.update(_ScalarCalibEvent(layer_id, bucket, error_value))
+
+
+class _ScalarCalibEvent:
+    """Minimal stand-in for VerificationEvent consumed by OnlineCalibrator.
+
+    OnlineCalibrator.update only reads ``layer_id``, ``timestep_bucket`` and
+    ``error_value``.  Feeding this lightweight object instead of a fully
+    built VerificationEvent avoids the per-event ``.detach().half().cpu()``
+    tensor transfer on the hot path.
+    """
+
+    __slots__ = ("layer_id", "timestep_bucket", "error_value")
+
+    def __init__(self, layer_id: int, timestep_bucket: int, error_value: float):
+        self.layer_id = layer_id
+        self.timestep_bucket = timestep_bucket
+        self.error_value = error_value
+
+
+# ===========================================================================
 # Event-recording hooks (called from model forward passes)
 # ===========================================================================
 
@@ -117,15 +184,29 @@ def record_speca_event(layer_id: int,
 
     Called from within the SpecA Taylor-path error probe (check_layer).
 
-    Replay context (latent_input / class_labels / encoder_hidden_states) is
-    stashed on the event so L3 training can re-run the forward and recover
-    gradient-connected hidden states at the target layer.
+    Behavior is derived from which globals the runner registered:
+      * cal=None, buf=None  → no-op (baseline, no --vfl).
+      * cal set, buf=None   → scalar calibrator update only; no
+                              VerificationEvent built, no GPU→CPU tensor
+                              transfer (--vfl --vfl-no-train).
+      * cal set, buf set    → full VerificationEvent + buffer write +
+                              calibrator update (--vfl with training).
     """
-    import verification_feedback_loop.verification_hook as vh
-    buf = _vfl_buffer
     cal = _vfl_calibrator
-    if buf is None and cal is None:
+    buf = _vfl_buffer
+
+    if cal is None and buf is None:
         return
+
+    if buf is None:
+        # No buffer → no point building a VerificationEvent (it would be
+        # discarded).  Feed the calibrator a single scalar instead.
+        _make_calibrator_speca_update(
+            cal, layer_id, step_idx, num_steps, error_value)
+        return
+
+    # Buffer registered → build full VerificationEvent + write to buffer.
+    import verification_feedback_loop.verification_hook as vh
     event = vh.make_speca_event(
         layer_id=layer_id, timestep_val=timestep_val,
         step_idx=step_idx, num_steps=num_steps,
@@ -139,8 +220,7 @@ def record_speca_event(layer_id: int,
         sample_id=_vfl_sample_id,
         timestep_actual=_vfl_timestep_actual,
     )
-    if buf is not None:
-        vh.record_event(event, buffer=buf)
+    vh.record_event(event, buffer=buf)
     if cal is not None:
         cal.update(event)
 
@@ -160,12 +240,23 @@ def record_teacache_event(layer_id: int,
 
     Called from the TeaCache calc-step path after the block stack runs,
     comparing the skip-path prediction against the just-computed ground truth.
+
+    Same mode derivation as ``record_speca_event``: buf=None → scalar
+    calibrator-only update; buf set → full VerificationEvent + buffer write.
     """
-    import verification_feedback_loop.verification_hook as vh
-    buf = _vfl_buffer
     cal = _vfl_calibrator
-    if buf is None and cal is None:
+    buf = _vfl_buffer
+
+    if cal is None and buf is None:
         return
+
+    if buf is None:
+        if cal is not None:
+            _make_calibrator_teacache_update(
+                cal, layer_id, step_idx, num_steps, float(raw_diff))
+        return
+
+    import verification_feedback_loop.verification_hook as vh
     event = vh.make_teacache_probe_event(
         layer_id=layer_id, timestep_val=timestep_val,
         step_idx=step_idx, num_steps=num_steps,
@@ -177,7 +268,6 @@ def record_teacache_event(layer_id: int,
         sample_id=_vfl_sample_id,
         timestep_actual=_vfl_timestep_actual,
     )
-    if buf is not None:
-        vh.record_event(event, buffer=buf)
+    vh.record_event(event, buffer=buf)
     if cal is not None:
         cal.update(event)
