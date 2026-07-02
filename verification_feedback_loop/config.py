@@ -94,7 +94,7 @@ class VFLConfig:
     #   * ``buffer_ready_min_anchors`` — minimum anchor samples for the
     #     diffusion anchor loss to have signal (otherwise L_anchor is 0
     #     and we waste a cycle).
-    buffer_ready_min_strata: int = 10
+    buffer_ready_min_strata: int = 2
     buffer_ready_min_per_stratum: int = 5
     buffer_ready_min_anchors: int = 10
 
