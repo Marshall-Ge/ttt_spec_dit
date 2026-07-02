@@ -407,9 +407,9 @@ class DiTGenerator:
                 if _vfl_buf is not None and len(_vfl_buf._anchor_samples) < 50:
                     _vfl_buf.add_anchor_from_tensors(
                         prompt=int(class_labels[0].item()) if class_labels is not None else 0,
-                        latent=latent_input.detach(),
+                        latent=latent_input[0:1].detach(),
                         timestep=current_t[:1],
-                        target=noise_pred.detach(),
+                        target=noise_pred[0:1].detach(),
                         model="dit",
                     )
 
@@ -710,11 +710,6 @@ def run_c2i(args) -> Dict:
         # but keep it ≥2s to avoid busy-spinning on tiny benchmarks.
         vfl_cfg.poll_interval_s = 5.0
         vfl_cfg.loRA_rank = 4
-        # Buffer-ready thresholds are left at VFLConfig defaults
-        # (10 strata × ≥5 events + ≥10 anchors) — appropriate for the
-        # async trigger. For very small benchmarks (n_prompts < 80) the
-        # worker may simply not fire, which is the intended behaviour
-        # (下一轮再加载上轮的 checkpoint).
 
         vfl_buf = StratifiedReplayBuffer(
             capacity_per_stratum=vfl_cfg.buffer_capacity_per_stratum)
@@ -724,32 +719,50 @@ def run_c2i(args) -> Dict:
 
         vfl_output_dir = getattr(args, "vfl_output_dir", None) or \
             os.path.join(output_dir, "vfl")
-        vfl_worker = AsyncTrainingWorker(
-            generator.transformer, vfl_buf, config=vfl_cfg,
-            base_model_version="dit-v1", output_dir=vfl_output_dir,
-        )
+        vfl_no_train = getattr(args, "vfl_no_train", False)
 
-        # 如果上一轮留了 checkpoint, 推理前加载到 *推理* 模型上, 让本轮
-        # 推理直接享受上轮训练成果 (不影响本轮 buffer 收集 / 下轮训练)。
-        # 失败时只警告不中止 — benchmark 不应被一个 stale checkpoint 卡住。
-        prev_ckpt = find_latest_checkpoint(vfl_output_dir)
-        if prev_ckpt is None:
-            # 也尝试 args.vfl_output_dir (用户可能指定了跨 run 共享目录)
-            prev_ckpt = find_latest_checkpoint(
-                getattr(args, "vfl_output_dir", None) or "")
-        if prev_ckpt:
-            try:
-                load_lora_checkpoint(generator.transformer, prev_ckpt)
-                print(f"  Loaded LoRA from previous run: {prev_ckpt}")
-            except Exception as e:
-                print(f"  [WARN] failed to load previous LoRA checkpoint "
-                      f"{prev_ckpt}: {e} — proceeding without it")
+        if vfl_no_train:
+            # ---- Calibration-only mode ----
+            # Still load previous LoRA checkpoint so inference benefits
+            # from past training, but skip all training overhead
+            # (no deepcopy, no LoRA attachment, no background worker).
+            prev_ckpt = find_latest_checkpoint(vfl_output_dir)
+            if prev_ckpt is None:
+                prev_ckpt = find_latest_checkpoint(
+                    getattr(args, "vfl_output_dir", None) or "")
+            if prev_ckpt:
+                try:
+                    load_lora_checkpoint(generator.transformer, prev_ckpt)
+                    print(f"  Loaded LoRA from previous run: {prev_ckpt}")
+                except Exception as e:
+                    print(f"  [WARN] failed to load LoRA checkpoint "
+                          f"{prev_ckpt}: {e} — proceeding without it")
+            print(f"  VFL enabled (calibration-only, no training): "
+                  f"buffer + calibrator, poll={vfl_cfg.poll_interval_s}s")
+        else:
+            # ---- Full training mode ----
+            vfl_worker = AsyncTrainingWorker(
+                generator.transformer, vfl_buf, config=vfl_cfg,
+                base_model_version="dit-v1", output_dir=vfl_output_dir,
+            )
 
-        vfl_worker.start()
-        print(f"  VFL enabled (Phase 2 async): buffer + calibrator + "
-              f"background training thread (poll={vfl_cfg.poll_interval_s}s, "
-              f"min_strata={vfl_cfg.buffer_ready_min_strata}, "
-              f"min_anchors={vfl_cfg.buffer_ready_min_anchors})")
+            prev_ckpt = find_latest_checkpoint(vfl_output_dir)
+            if prev_ckpt is None:
+                prev_ckpt = find_latest_checkpoint(
+                    getattr(args, "vfl_output_dir", None) or "")
+            if prev_ckpt:
+                try:
+                    load_lora_checkpoint(generator.transformer, prev_ckpt)
+                    print(f"  Loaded LoRA from previous run: {prev_ckpt}")
+                except Exception as e:
+                    print(f"  [WARN] failed to load LoRA checkpoint "
+                          f"{prev_ckpt}: {e} — proceeding without it")
+
+            vfl_worker.start()
+            print(f"  VFL enabled (Phase 2 async): buffer + calibrator + "
+                  f"background training thread (poll={vfl_cfg.poll_interval_s}s, "
+                  f"min_strata={vfl_cfg.buffer_ready_min_strata}, "
+                  f"min_anchors={vfl_cfg.buffer_ready_min_anchors})")
 
     # ===================================================================
     # 3. Setup metrics

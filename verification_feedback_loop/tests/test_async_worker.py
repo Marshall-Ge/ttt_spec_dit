@@ -126,7 +126,7 @@ def test_buffer_ready_empty_vs_full():
     cfg = VFLConfig()
     # Use small thresholds so the test doesn't need to add thousands of events
     cfg.buffer_ready_min_strata = 3
-    cfg.buffer_ready_min_per_stratum = 2
+    cfg.buffer_ready_min_total_samples = 10
     cfg.buffer_ready_min_anchors = 2
 
     buf = StratifiedReplayBuffer(capacity_per_stratum=100)
@@ -302,7 +302,7 @@ def test_train_once_crash_does_not_poison_worker():
 
     cfg = VFLConfig()
     cfg.buffer_ready_min_strata = 1
-    cfg.buffer_ready_min_per_stratum = 1
+    cfg.buffer_ready_min_total_samples = 5
     cfg.buffer_ready_min_anchors = 1
     cfg.poll_interval_s = 0.05  # fast polling so the test runs quickly
     cfg.trainer_steps_per_trigger = 1

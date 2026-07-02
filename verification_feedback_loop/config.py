@@ -87,16 +87,21 @@ class VFLConfig:
     poll_interval_s: float = 5.0
     # Buffer-readiness thresholds for ``AsyncTrainingWorker._buffer_ready``:
     #   * ``buffer_ready_min_strata`` — how many (layer, bucket) strata must
-    #     each hold at least ``buffer_ready_min_per_stratum`` events before
-    #     we attempt a training cycle. Replaces the old raw-count trigger
-    #     (``trigger_min_samples``) so that sparse first-batch data doesn't
-    #     drive a bad gradient update.
+    #     be non-empty (i.e. cover different denoising phases) before training.
+    #   * ``buffer_ready_min_total_samples`` — minimum total events across ALL
+    #     strata combined.  This is the primary volume gate — it prevents the
+    #     small-buffer overfitting that the old per-stratum minimum (≥5 events
+    #     per stratum) allowed when only 2 strata × 5 = 10 events were present.
     #   * ``buffer_ready_min_anchors`` — minimum anchor samples for the
-    #     diffusion anchor loss to have signal (otherwise L_anchor is 0
-    #     and we waste a cycle).
+    #     diffusion anchor loss to have signal (otherwise L_anchor is 0 and
+    #     we waste a cycle).
     buffer_ready_min_strata: int = 2
-    buffer_ready_min_per_stratum: int = 5
     buffer_ready_min_anchors: int = 10
+    buffer_ready_min_total_samples: int = 200
+
+    # Maximum curvature events processed per gradient step (limits GPU memory).
+    # Subsamples randomly each step — all events get used across the M steps.
+    max_events_per_step: int = 2
 
     # ---- M7: Eval Gate ----
     quality_epsilon: float = 5.0   # FID 退化容忍上限

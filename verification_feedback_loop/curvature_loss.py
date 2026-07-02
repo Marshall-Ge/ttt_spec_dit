@@ -306,7 +306,7 @@ def compute_training_loss(
                 [t_val], device=device, dtype=torch.long,
             ).expand(latent.shape[0])
 
-            cl = (event.class_labels.to(device=device, dtype=dtype)
+            cl = (event.class_labels.to(device=device)
                   if event.class_labels is not None else None)
             enc = (event.encoder_hidden_states.to(device=device, dtype=dtype)
                    if event.encoder_hidden_states is not None else None)
@@ -363,9 +363,11 @@ def compute_training_loss(
             a_enc = None
             if isinstance(prompt, torch.Tensor):
                 if prompt.ndim == 1:
-                    a_cl = prompt.to(device=device, dtype=dtype)
+                    a_cl = prompt.to(device=device)
                 elif prompt.ndim == 3:
                     a_enc = prompt.to(device=device, dtype=dtype)
+            elif isinstance(prompt, int):
+                a_cl = torch.tensor([prompt], device=device, dtype=torch.long)
 
             out = _run_transformer_forward(
                 transformer, a_latent, a_t,
