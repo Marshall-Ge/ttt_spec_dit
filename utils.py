@@ -152,3 +152,51 @@ def ensure_real_299(ds, output_dir: str, n: int) -> str:
 
     print(f"  [FID] real_299 ready: {n} symlinks → {cache_dir}")
     return subset_dir
+
+
+# ---------------------------------------------------------------------------
+# VFL checkpoint management
+# ---------------------------------------------------------------------------
+
+def get_vfl_checkpoint_dir(output_dir: str, method: str) -> str:
+    """Return the method-scoped VFL checkpoint directory.
+
+    Layout: ``{output_dir}/checkpoints/{method}/`` — segregating by method
+    avoids teacache / speca / baseline LoRA weights overwriting each other.
+    """
+    import os
+    return os.path.join(output_dir, "checkpoints", method)
+
+
+def prune_checkpoints(checkpoint_dir: str, keep: int = 3) -> int:
+    """Retain only the ``keep`` most recent ``.pt`` checkpoints.
+
+    Sorts by mtime (descending); older files beyond the cutoff are deleted.
+    Returns the number of files removed. Silently no-ops if the directory
+    does not exist or contains ≤ ``keep`` files.
+    """
+    import os
+    if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
+        return 0
+    files = []
+    for name in os.listdir(checkpoint_dir):
+        if not name.endswith(".pt"):
+            continue
+        path = os.path.join(checkpoint_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            files.append((os.path.getmtime(path), path))
+        except OSError:
+            continue
+    if len(files) <= keep:
+        return 0
+    files.sort(key=lambda x: x[0], reverse=True)  # newest first
+    deleted = 0
+    for _, path in files[keep:]:
+        try:
+            os.remove(path)
+            deleted += 1
+        except OSError:
+            continue
+    return deleted

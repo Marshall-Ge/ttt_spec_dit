@@ -32,7 +32,7 @@ from config import (
     DEFAULT_REL_L1_THRESH, DEFAULT_NUM_STEPS,
     DDIM_FLOP_MATCHED_STEPS, load_coefficients,
 )
-from utils import CudaTimer, decode_latent, save_image, pil_to_tensor, ensure_real_299
+from utils import CudaTimer, decode_latent, save_image, pil_to_tensor, ensure_real_299, get_vfl_checkpoint_dir, prune_checkpoints
 
 from models.dit import (
     DiTTransformer2D, set_vfl_step_info, get_vfl_buffer, set_vfl_sample_id,
@@ -715,7 +715,7 @@ def run_c2i(args) -> Dict:
         set_vfl_calibrator(vfl_cal)
 
         vfl_output_dir = getattr(args, "vfl_output_dir", None) or \
-            os.path.join(output_dir, "vfl")
+            get_vfl_checkpoint_dir(output_dir, args.method)
         vfl_no_train = getattr(args, "vfl_no_train", False)
 
         if vfl_no_train:
@@ -1038,6 +1038,11 @@ def run_c2i(args) -> Dict:
         else:
             print("  [VFL] no checkpoint produced this run "
                   "(buffer may not have crossed readiness threshold)")
+        # Retain only the 3 most recent checkpoints to bound disk usage.
+        pruned = prune_checkpoints(vfl_output_dir, keep=3)
+        if pruned:
+            print(f"  [VFL] pruned {pruned} old checkpoint(s) "
+                  f"in {vfl_output_dir}")
 
     # ===================================================================
     # 6. FID/IS
