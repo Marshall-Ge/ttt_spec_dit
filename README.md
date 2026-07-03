@@ -460,30 +460,21 @@ The TeaCache threshold γ is scheduled per image to force exploration before exp
 
 ### Usage
 
+TTT plugin is invoked via `main.py` with `--ttt` flag (DiT-only). See the
+[CLI Reference](#cli-reference) section for the full flag list.
+
 ```bash
-# DiT Session TTT runner
-python continual_inference_runner.py \
-    --num_steps 20 --session_class 207 --n_images 20 \
-    --guidance_scale 4.5 --lr 1e-4 \
-    --output_dir ./output/ttt_session
+python main.py --model dit --task c2i --dataset imagenet \
+    --method teacache --ttt --ttt_lr 1e-4 --ttt_micro_epochs 3 \
+    --num_steps 20 --n_prompts 20 --guidance_scale 4.5 \
+    --metrics fid is latency flops speed
 ```
-
-**CLI flags:**
-
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `--num_steps` | int | `20` | Denoising steps per image |
-| `--session_class` | int | `207` | ImageNet class (207 = golden retriever) |
-| `--n_images` | int | `20` | Session length |
-| `--guidance_scale` | float | `4.5` | CFG scale |
-| `--lr` | float | `1e-4` | Plugin AdamW learning rate |
-| `--seed` | int | `42` | Base seed; per-image = seed + 1000·(i+1) |
 
 ### Output
 
-- `generated/{k:02d}_gamma{γ}.png` — per-image output
-- `ttt_session_telemetry.csv` — per-image skip ratio, plugin loss, latent/pixel MSE vs baseline
-- `ttt_session_summary.json` — aggregated Flywheel statistics
+- `generated/{idx:06d}_{class_name}.png` — per-image output (subject to `--img_save_limit`)
+- `results.json` — aggregated metrics (FID/IS/latency/FLOPs/speed)
+- Telemetry (skip ratio, plugin loss) is emitted via the standard metrics pipeline
 
 ### Design Decisions & Caveats
 

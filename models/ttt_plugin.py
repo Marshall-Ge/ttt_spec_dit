@@ -164,7 +164,7 @@ class SessionAdaLNModulator(nn.Module):
 # Pure-function state API (plain-dict state, mirrors accelerators/ style)
 # ===========================================================================
 #
-# The state dict is owned by the session runner (continual_inference_runner.py)
+# The state dict is owned by the session runner (run_dit.py with --ttt)
 # and threaded through the model forward + denoise loop. The model's forward is
 # agnostic to the TTT training mechanics — it only reads ``plugin`` and writes
 # ``z_pred`` / ``z_true``; the *loop* calls ``ttt_train_step``.
