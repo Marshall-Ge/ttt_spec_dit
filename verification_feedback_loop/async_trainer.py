@@ -271,13 +271,22 @@ class AsyncTrainingWorker:
             self._train_model,
             rank=self.config.loRA_rank,
             alpha=self.config.loRA_alpha,
+            time_conditioned=self.config.time_conditioned_lora,
         )
         freeze_backbone(self._train_model)
 
         n_params = count_lora_params(self._layer_wrappers)
         n_layers = len(self._layer_wrappers)
+        # Reflect actual state (not just config) — stub transformers in tests
+        # have no norm1.emb so attach silently downgrades to vanilla.
+        any_tc = any(
+            lora.time_conditioned
+            for wdict in self._layer_wrappers.values()
+            for lora in wdict.values()
+        )
+        tc_tag = "time-conditioned " if any_tc else ""
         print(f"[VFL:AsyncTrainingWorker] lazy init: "
-              f"train_model=fp32 deepcopy, LoRA on {n_layers} layers "
+              f"train_model=fp32 deepcopy, {tc_tag}LoRA on {n_layers} layers "
               f"({n_params:,} params, rank={self.config.loRA_rank})")
         self._model_ready = True
 

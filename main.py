@@ -137,6 +137,11 @@ Examples:
                              "training (no deepcopy, no LoRA, no background "
                              "worker). Combine with --vfl for the lightweight "
                              "threshold-only baseline.")
+    parser.add_argument("--vfl-no-time-lora", action="store_true", default=False,
+                        help="Disable time-conditioned LoRA modulation "
+                             "(γ(t_emb) gating on the A→B bottleneck). "
+                             "Default: time-conditioning is ON; pass this "
+                             "flag to fall back to vanilla LoRA.")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
     parser.add_argument("--guidance_scale", type=float, default=DEFAULT_GUIDANCE_SCALE,

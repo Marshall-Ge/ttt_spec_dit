@@ -169,22 +169,42 @@ def _run_transformer_forward(transformer,
     Both forwards run with current=None, cache_dic=None, teacache_state=None
     so they take the vanilla path (full 28-block stack). LoRA-modified
     submodules still apply because LoRA is attached to the block params.
+
+    Side effect: sets the global t_emb cache so time-conditioned LoRA layers
+    can read it without recomputing per Linear. Cleared in ``finally`` to
+    avoid leaking across forwards.
     """
-    if encoder_hidden_states is not None:
-        # PixArt signature: forward(hidden_states, encoder_hidden_states, timestep, ...)
+    from verification_feedback_loop.lora_adapter import (
+        set_lora_t_emb, clear_lora_t_emb,
+        compute_timestep_emb_for_transformer,
+    )
+
+    hidden_dtype = latent.dtype
+    t_emb = compute_timestep_emb_for_transformer(
+        transformer, timestep, class_labels=class_labels,
+        hidden_dtype=hidden_dtype,
+    )
+    if t_emb is not None:
+        set_lora_t_emb(t_emb)
+    try:
+        if encoder_hidden_states is not None:
+            # PixArt signature: forward(hidden_states, encoder_hidden_states, timestep, ...)
+            return transformer(
+                latent,
+                encoder_hidden_states=encoder_hidden_states,
+                timestep=timestep,
+                return_dict=False,
+            )
+        # DiT signature: forward(hidden_states, timestep, class_labels=None, ...)
         return transformer(
             latent,
-            encoder_hidden_states=encoder_hidden_states,
             timestep=timestep,
+            class_labels=class_labels,
             return_dict=False,
         )
-    # DiT signature: forward(hidden_states, timestep, class_labels=None, ...)
-    return transformer(
-        latent,
-        timestep=timestep,
-        class_labels=class_labels,
-        return_dict=False,
-    )
+    finally:
+        if t_emb is not None:
+            clear_lora_t_emb()
 
 
 def _resolve_hook_layer(event, num_layers: int) -> int:

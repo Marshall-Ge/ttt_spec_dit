@@ -20,6 +20,15 @@ DiT block 线性层结构::
 
 每 block 6 个 Linear, rank=8 时每 block ~221K 参数。
 Top-K=3 → ~663K 参数。
+
+Time-conditioned LoRA (默认开启)::
+    在 A→B 瓶颈层注入时间步 embedding 调制 (ControlNet 风格)。
+    ΔW(x) = (x @ A^T) @ B^T · γ(t_emb)
+    γ(t_emb) 由 t_proj MLP 输出 (末层零初始化 → 起点 γ=0 → no-op)。
+    这样让 rank=4 的小网络可以随 t 变化, 不再被迫一组参数
+    同时拟合早/中/晚三个去噪阶段。
+    关键不变量: lora_B=0 && t_proj[-1].weight=0 → 第一次 forward
+    与原模型严格相等。
 """
 
 from __future__ import annotations
@@ -35,6 +44,136 @@ import torch.nn.functional as F
 
 
 # ===========================================================================
+# Global t_emb cache (复用 vfl_state.py 单例模式)
+# ===========================================================================
+#
+# 由 denoise loop / training forward 在 transformer forward 之前 set,
+# LoRALinear.forward 只读不写。每次 forward 算 168 次 (28 layers × 6 Linears)
+# 太贵, 所以全局缓存一次。
+#
+# None → time-conditioning 失效, LoRA 走纯 ΔW(x) 路径
+#        (用于 --vfl-no-time-lora 模式或 fallback)
+
+_current_t_emb: "Optional[torch.Tensor]" = None
+
+
+def set_lora_t_emb(t_emb: "Optional[torch.Tensor]"):
+    """Set the global timestep embedding used by LoRALinear.forward.
+
+    Called once per transformer forward (推理循环 / 训练 forward).
+    Passing None effectively disables time-conditioning for this forward.
+    """
+    global _current_t_emb
+    _current_t_emb = t_emb
+
+
+def clear_lora_t_emb():
+    """Reset the global t_emb cache. Idempotent."""
+    global _current_t_emb
+    _current_t_emb = None
+
+
+def get_lora_t_emb() -> "Optional[torch.Tensor]":
+    """Return the cached t_emb (or None if not set)."""
+    return _current_t_emb
+
+
+# ===========================================================================
+# t_emb 派发 helper — DiT vs PixArt
+# ===========================================================================
+
+
+def _infer_t_emb_dim_from_block(block: nn.Module) -> "Optional[int]":
+    """Try to read DiT's t_emb dim from block.norm1.emb.
+
+    DiT block.norm1 is an AdaLNModulation wrapping a TimestepEmbedder whose
+    ``mlp[0].in_features`` equals the conditioning dim (1152 for DiT-2-256).
+    Returns None for PixArt-style blocks (no emb on the block).
+    """
+    norm1 = getattr(block, "norm1", None)
+    if norm1 is None:
+        return None
+    emb = getattr(norm1, "emb", None)
+    if emb is None:
+        return None
+    mlp = getattr(emb, "mlp", None)
+    if mlp is None or len(mlp) == 0:
+        return None
+    first = mlp[0]
+    return getattr(first, "in_features", None)
+
+
+def _infer_t_emb_dim_from_transformer(transformer: nn.Module) -> "Optional[int]":
+    """Infer the timestep embedding dim from DiT or PixArt transformer.
+
+    DiT:  transformer.transformer_blocks[0].norm1.emb.mlp[0].in_features
+    PixArt: transformer.adaln_single.timestep_embedder.mlp[0].in_features
+    """
+    try:
+        first_block = transformer.transformer_blocks[0]
+    except (AttributeError, IndexError):
+        return None
+    dit_dim = _infer_t_emb_dim_from_block(first_block)
+    if dit_dim is not None:
+        return dit_dim
+    # PixArt path
+    adaln = getattr(transformer, "adaln_single", None)
+    if adaln is None:
+        return None
+    ts = getattr(adaln, "timestep_embedder", None)
+    if ts is None:
+        return None
+    mlp = getattr(ts, "mlp", None)
+    if mlp is None or len(mlp) == 0:
+        return None
+    return getattr(mlp[0], "in_features", None)
+
+
+def compute_timestep_emb_for_transformer(transformer,
+                                         timestep: torch.Tensor,
+                                         class_labels: "Optional[torch.Tensor]" = None,
+                                         hidden_dtype=None
+                                         ) -> "Optional[torch.Tensor]":
+    """Run DiT or PixArt's own timestep embedding once, return the result.
+
+    Re-uses the model's existing embedding path so we don't invent a new one
+    (which would diverge from the conditioning the backbone actually sees).
+
+    Returns None if neither DiT's norm1.emb nor PixArt's adaln_single is
+    present (e.g. stub transformers in unit tests).
+    """
+    try:
+        first_block = transformer.transformer_blocks[0]
+    except (AttributeError, IndexError):
+        return None
+
+    emb = getattr(getattr(first_block, "norm1", None), "emb", None)
+    if emb is not None and callable(emb):
+        try:
+            return emb(timestep, class_labels, hidden_dtype=hidden_dtype)
+        except TypeError:
+            # Some TimestepEmbedder variants don't take class_labels
+            return emb(timestep, hidden_dtype=hidden_dtype)
+
+    adaln = getattr(transformer, "adaln_single", None)
+    if adaln is not None and callable(adaln):
+        batch_size = timestep.shape[0] if hasattr(timestep, "shape") else 1
+        # PixArt adaln_single wants added_cond_kwargs; pass the canonical
+        # None-pair (use_additional_conditions defaults to False).
+        added = {"resolution": None, "aspect_ratio": None}
+        try:
+            timestep_emb, _embedded = adaln(
+                timestep, added, batch_size=batch_size,
+                hidden_dtype=hidden_dtype,
+            )
+            return timestep_emb
+        except Exception:
+            return None
+
+    return None
+
+
+# ===========================================================================
 # LoRA Linear wrapper
 # ===========================================================================
 
@@ -42,20 +181,28 @@ import torch.nn.functional as F
 class LoRALinear(nn.Module):
     """Low-rank adapter wrapping a frozen ``nn.Linear``.
 
-    Forward::
+    Forward (vanilla)::
 
         y = W·x + (α/r) · (B @ A) @ x
+
+    Forward (time-conditioned)::
+
+        y = W·x + (α/r) · γ(t_emb) · (B @ A) @ x
+        γ(t_emb) = t_proj(t_emb)   # scalar per batch, init = 0 → 1.0
 
     where A ∈ R^{r×in}, B ∈ R^{out×r}, B 零初始化。
     ``α`` is the scaling factor (default = rank).
     """
 
-    def __init__(self, base: nn.Linear, rank: int = 8, alpha: int = 16):
+    def __init__(self, base: nn.Linear, rank: int = 8, alpha: int = 16,
+                 time_conditioned: bool = False,
+                 t_emb_dim: "Optional[int]" = None):
         super().__init__()
         self.base = base
         self.rank = rank
         self.alpha = alpha
         self.scaling = alpha / rank
+        self.time_conditioned = bool(time_conditioned) and t_emb_dim is not None
 
         out_features, in_features = base.weight.shape
 
@@ -70,6 +217,24 @@ class LoRALinear(nn.Module):
         # B: (out_features, rank) — ZERO init → no-op at start
         self.lora_B = nn.Parameter(torch.zeros(out_features, rank, device=device, dtype=dtype))
 
+        if self.time_conditioned:
+            # ControlNet-style γ modulation MLP.
+            #   γ: (B, 1) scalar gate, broadcast across the whole output.
+            # Two-zero-init invariant: lora_B=0 AND t_proj[-1].weight=0
+            # guarantees that the very first forward (even once B is trained)
+            # with γ=0 → delta * (1+0) = delta, no contribution to base.
+            self.t_proj = nn.Sequential(
+                nn.Linear(t_emb_dim, rank, device=device, dtype=dtype),
+                nn.SiLU(),
+                nn.Linear(rank, 1, device=device, dtype=dtype),
+            )
+            nn.init.zeros_(self.t_proj[-1].weight)
+            nn.init.zeros_(self.t_proj[-1].bias)
+        else:
+            # Keep attribute absent so state_dict doesn't carry phantom keys.
+            # Callers should check .time_conditioned before touching t_proj.
+            pass
+
         # Freeze base
         base.weight.requires_grad_(False)
         if base.bias is not None:
@@ -78,8 +243,24 @@ class LoRALinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base_out = self.base(x)
         # LoRA correction: x @ A^T @ B^T  (x: ... × in, A: r×in, B: out×r)
-        lora_out = (x @ self.lora_A.T) @ self.lora_B.T
-        return base_out + lora_out * self.scaling
+        delta = (x @ self.lora_A.T) @ self.lora_B.T
+
+        if self.time_conditioned:
+            t_emb = get_lora_t_emb()
+            if t_emb is not None:
+                # γ: (B, 1) — ControlNet-style gate. Start = 0 → factor = 1.0.
+                gamma = self.t_proj(t_emb)
+                # Match dtype defensively (t_emb may be fp32 from TimestepEmbedder
+                # while backbone is fp16).
+                if gamma.dtype != delta.dtype:
+                    gamma = gamma.to(delta.dtype)
+                # Broadcast over output feature dim & any trailing spatial dims.
+                # delta is (..., out_features); gamma is (B, 1).
+                # Expand to (B, 1) → (B, 1, 1, ...) for broadcasting.
+                view = gamma.shape + (1,) * (delta.ndim - gamma.ndim)
+                delta = delta * (1.0 + gamma.view(view))
+
+        return base_out + delta * self.scaling
 
     @property
     def weight(self):
@@ -90,6 +271,8 @@ class LoRALinear(nn.Module):
         """Merge LoRA into base weights, returning a plain nn.Linear.
 
         Used when deploying a validated adapter: eliminates the LoRA overhead.
+        Time-conditioned LoRA cannot be cleanly merged (gamma depends on
+        runtime t_emb); fall back to the mean ΔW with gamma=0 (no-op).
         """
         merged_weight = self.base.weight.data + (
             self.lora_B.data @ self.lora_A.data
@@ -104,9 +287,12 @@ class LoRALinear(nn.Module):
         return merged
 
     def reset_lora(self):
-        """Re-zero the B matrix, resetting adapter to no-op."""
+        """Re-zero the B matrix (and t_proj), resetting adapter to no-op."""
         nn.init.zeros_(self.lora_B)
         nn.init.kaiming_uniform_(self.lora_A, a=math_sqrt(5))
+        if self.time_conditioned:
+            nn.init.zeros_(self.t_proj[-1].weight)
+            nn.init.zeros_(self.t_proj[-1].bias)
 
 
 def math_sqrt(x: float) -> float:
@@ -146,17 +332,44 @@ def _resolve_path(block: nn.Module, path: str) -> nn.Linear:
 # ===========================================================================
 
 
-def attach_lora_to_block(block: nn.Module, rank: int = 8, alpha: int = 16
+def attach_lora_to_block(block: nn.Module, rank: int = 8, alpha: int = 16,
+                         time_conditioned: bool = False,
+                         t_emb_dim: "Optional[int]" = None,
                          ) -> Dict[str, LoRALinear]:
     """Attach LoRA to a single transformer block.
 
+    Parameters
+    ----------
+    block
+        A DiT or PixArt transformer block.
+    rank, alpha
+        Standard LoRA hyperparams.
+    time_conditioned
+        If True, each LoRA gets a t_proj MLP that modulates ΔW by γ(t_emb).
+        Default False for back-compat with the sync-path (top-K) callers.
+    t_emb_dim
+        Required when time_conditioned=True. Caller usually gets it from
+        ``_infer_t_emb_dim_from_block`` (DiT) or
+        ``_infer_t_emb_dim_from_transformer`` (PixArt).
+
     Returns a dict mapping path → LoRALinear for later management.
     """
+    if time_conditioned and t_emb_dim is None:
+        # Last-chance inference (works for DiT).
+        t_emb_dim = _infer_t_emb_dim_from_block(block)
+        if t_emb_dim is None:
+            # PixArt-style block (no emb on it) — silently downgrade.
+            time_conditioned = False
+
     wrappers: Dict[str, LoRALinear] = {}
     for path in _LORA_TARGET_PATHS:
         try:
             linear = _resolve_path(block, path)
-            lora = LoRALinear(linear, rank=rank, alpha=alpha)
+            lora = LoRALinear(
+                linear, rank=rank, alpha=alpha,
+                time_conditioned=time_conditioned,
+                t_emb_dim=t_emb_dim,
+            )
             # Replace in-place
             *parent_path, attr = path.split(".")
             parent = block
@@ -176,7 +389,10 @@ def attach_lora_to_block(block: nn.Module, rank: int = 8, alpha: int = 16
 
 
 def attach_lora(transformer, layer_ids: List[int],
-                rank: int = 8, alpha: int = 16) -> Dict[int, Dict[str, LoRALinear]]:
+                rank: int = 8, alpha: int = 16,
+                time_conditioned: bool = False,
+                t_emb_dim: "Optional[int]" = None,
+                ) -> Dict[int, Dict[str, LoRALinear]]:
     """Attach LoRA to selected layers of the transformer.
 
     Parameters
@@ -186,23 +402,45 @@ def attach_lora(transformer, layer_ids: List[int],
         Which block indices to attach LoRA to (e.g. [18, 19, 20]).
     rank : int
     alpha : int
+    time_conditioned : bool
+        Enable time-step γ modulation. If True and t_emb_dim is None, will
+        be inferred from the transformer (DiT via block.norm1.emb, PixArt
+        via adaln_single.timestep_embedder).
+    t_emb_dim : int, optional
+        Explicit override for the t_emb conditioning dim.
 
     Returns
     -------
     layer_wrappers : dict
         {layer_id: {path: LoRALinear}} for later management/checkpointing.
     """
+    if time_conditioned and t_emb_dim is None:
+        t_emb_dim = _infer_t_emb_dim_from_transformer(transformer)
+        if t_emb_dim is None:
+            # Couldn't infer — fall back to vanilla LoRA to stay safe.
+            time_conditioned = False
+
     all_wrappers: Dict[int, Dict[str, LoRALinear]] = {}
     for layer_id in layer_ids:
         block = transformer.transformer_blocks[layer_id]
-        wrappers = attach_lora_to_block(block, rank=rank, alpha=alpha)
+        wrappers = attach_lora_to_block(
+            block, rank=rank, alpha=alpha,
+            time_conditioned=time_conditioned,
+            t_emb_dim=t_emb_dim,
+        )
         all_wrappers[layer_id] = wrappers
     return all_wrappers
 
 
-def attach_lora_all_layers(transformer, rank: int = 4, alpha: int = 1.0
+def attach_lora_all_layers(transformer, rank: int = 4, alpha: int = 1.0,
+                           time_conditioned: bool = True,
+                           t_emb_dim: "Optional[int]" = None,
                            ) -> Dict[int, Dict[str, LoRALinear]]:
     """Attach LoRA to **every** transformer block (Phase 2 async trainer).
+
+    Default is ``time_conditioned=True`` — the time-conditioned variant is
+    the production path. Callers pass ``time_conditioned=False`` only when
+    the user opted into ``--vfl-no-time-lora``.
 
     Replaces the old ``select_top_k_layers`` + ``attach_lora`` two-step. In the
     async regime the buffer is sparse when the first training cycle triggers,
@@ -221,6 +459,10 @@ def attach_lora_all_layers(transformer, rank: int = 4, alpha: int = 1.0
         spreading across 28 layers instead of concentrating on 3).
     alpha : int
         LoRA scaling factor.
+    time_conditioned : bool
+        Enable time-step γ modulation (default True).
+    t_emb_dim : int, optional
+        Explicit t_emb dim override. Auto-inferred from transformer otherwise.
 
     Returns
     -------
@@ -229,9 +471,18 @@ def attach_lora_all_layers(transformer, rank: int = 4, alpha: int = 1.0
         block is missing any of ``_LORA_TARGET_PATHS`` simply have fewer
         entries in their inner dict.
     """
+    if time_conditioned and t_emb_dim is None:
+        t_emb_dim = _infer_t_emb_dim_from_transformer(transformer)
+        if t_emb_dim is None:
+            time_conditioned = False
+
     all_wrappers: Dict[int, Dict[str, LoRALinear]] = {}
     for layer_idx, block in enumerate(transformer.transformer_blocks):
-        wrappers = attach_lora_to_block(block, rank=rank, alpha=alpha)
+        wrappers = attach_lora_to_block(
+            block, rank=rank, alpha=alpha,
+            time_conditioned=time_conditioned,
+            t_emb_dim=t_emb_dim,
+        )
         all_wrappers[layer_idx] = wrappers
     return all_wrappers
 
@@ -260,17 +511,28 @@ def detach_lora(transformer, layer_wrappers: Dict[int, Dict[str, LoRALinear]]):
 
 
 def get_lora_params(transformer) -> List[nn.Parameter]:
-    """Collect all LoRA parameters from the transformer."""
+    """Collect all LoRA parameters from the transformer.
+
+    Includes lora_A, lora_B and (if present) t_proj weights/biases.
+    Used to drive the optimizer and ``freeze_backbone`` re-enable pass.
+    """
     params: List[nn.Parameter] = []
     for mod in transformer.modules():
         if isinstance(mod, LoRALinear):
             params.append(mod.lora_A)
             params.append(mod.lora_B)
+            if mod.time_conditioned:
+                for p in mod.t_proj.parameters():
+                    params.append(p)
     return params
 
 
 def freeze_backbone(transformer):
-    """Ensure backbone weights require no grad; only LoRA params train."""
+    """Ensure backbone weights require no grad; only LoRA params train.
+
+    This also re-enables grad on every LoRA-managed parameter, including
+    the t_proj MLP (time-conditioned variant).
+    """
     for name, param in transformer.named_parameters():
         param.requires_grad_(False)
     # Re-enable LoRA params
@@ -323,7 +585,9 @@ def save_lora_checkpoint(layer_wrappers: Dict[int, Dict[str, LoRALinear]],
                          metadata: Optional[Dict] = None):
     """Save LoRA weights to a checkpoint file.
 
-    Only saves lora_A and lora_B — not the full backbone.
+    Saves lora_A, lora_B and (if time-conditioned) t_proj.state_dict per
+    layer. Vanilla LoRA checkpoints omit the ``t_proj`` key — old loaders
+    simply don't see it.
     """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
@@ -332,6 +596,8 @@ def save_lora_checkpoint(layer_wrappers: Dict[int, Dict[str, LoRALinear]],
         "base_model_version": base_model_version,
         "rank": None,
         "alpha": None,
+        "time_conditioned": None,
+        "t_emb_dim": None,
         "layers": {},
         "metadata": metadata or {},
     }
@@ -342,18 +608,50 @@ def save_lora_checkpoint(layer_wrappers: Dict[int, Dict[str, LoRALinear]],
             if state["rank"] is None:
                 state["rank"] = lora.rank
                 state["alpha"] = lora.alpha
-            layer_state[path_str] = {
+                state["time_conditioned"] = lora.time_conditioned
+                if lora.time_conditioned:
+                    # t_emb_dim = first Linear's in_features on t_proj
+                    state["t_emb_dim"] = lora.t_proj[0].in_features
+            entry: Dict[str, torch.Tensor] = {
                 "lora_A": lora.lora_A.data.detach().cpu().clone(),
                 "lora_B": lora.lora_B.data.detach().cpu().clone(),
             }
+            if lora.time_conditioned:
+                entry["t_proj"] = {
+                    k: v.detach().cpu().clone()
+                    for k, v in lora.t_proj.state_dict().items()
+                }
+            layer_state[path_str] = entry
         state["layers"][str(layer_id)] = layer_state
 
     torch.save(state, path)
 
 
-def load_lora_checkpoint(transformer, path: str
+def load_lora_checkpoint(transformer, path: str,
+                         time_conditioned: "Optional[bool]" = None,
+                         t_emb_dim: "Optional[int]" = None,
                          ) -> Tuple[Dict[int, Dict[str, LoRALinear]], Dict]:
     """Load LoRA checkpoint and attach to transformer.
+
+    Parameters
+    ----------
+    transformer
+        Target transformer (will have LoRA attached in-place).
+    path
+        Checkpoint path produced by ``save_lora_checkpoint``.
+    time_conditioned
+        Optional override. If None, follows the checkpoint's stored setting
+        (defaulting to vanilla for legacy checkpoints without the field).
+    t_emb_dim
+        Optional override for the time-conditioning dim. Auto-inferred
+        from the transformer otherwise.
+
+    Backward compatibility:
+        Legacy checkpoints (pre time-conditioning) have no ``t_proj`` key
+        per layer and no top-level ``time_conditioned`` field. Loader
+        handles both: missing t_proj → newly-initialised zero t_proj,
+        equivalent to no modulation (γ=0 → factor 1.0, but B is also 0
+        so the whole adapter is a no-op regardless).
 
     Returns (layer_wrappers, metadata).
     """
@@ -365,32 +663,81 @@ def load_lora_checkpoint(transformer, path: str
     base_model_version = state.get("base_model_version", "unknown")
     metadata = state.get("metadata", {})
 
+    # Decide time-conditioning for the freshly attached LoRA.
+    ckpt_tc = bool(state.get("time_conditioned", False))
+    if time_conditioned is None:
+        time_conditioned = ckpt_tc
+    if time_conditioned and t_emb_dim is None:
+        # Prefer the ckpt's value if it stored one; else infer from model.
+        t_emb_dim = state.get("t_emb_dim") or \
+            _infer_t_emb_dim_from_transformer(transformer)
+        if t_emb_dim is None:
+            time_conditioned = False
+
     layer_ids = sorted(int(k) for k in state["layers"].keys())
-    layer_wrappers = attach_lora(transformer, layer_ids, rank=rank, alpha=alpha)
+    layer_wrappers = attach_lora(
+        transformer, layer_ids,
+        rank=rank, alpha=alpha,
+        time_conditioned=time_conditioned,
+        t_emb_dim=t_emb_dim,
+    )
 
     # Load weights
     for layer_id_str, layer_state in state["layers"].items():
         layer_id = int(layer_id_str)
         wrappers = layer_wrappers[layer_id]
         for path_str, tensors in layer_state.items():
-            if path_str in wrappers:
-                wrappers[path_str].lora_A.data.copy_(
-                    tensors["lora_A"].to(wrappers[path_str].lora_A.device))
-                wrappers[path_str].lora_B.data.copy_(
-                    tensors["lora_B"].to(wrappers[path_str].lora_B.device))
+            if path_str not in wrappers:
+                continue
+            lora = wrappers[path_str]
+            lora.lora_A.data.copy_(
+                tensors["lora_A"].to(lora.lora_A.device))
+            lora.lora_B.data.copy_(
+                tensors["lora_B"].to(lora.lora_B.device))
+
+            ckpt_has_t = "t_proj" in tensors and tensors["t_proj"] is not None
+            if lora.time_conditioned:
+                if ckpt_has_t:
+                    # Materialise into the live t_proj.
+                    converted = {
+                        k: v.to(lora.t_proj[0].weight.device)
+                        for k, v in tensors["t_proj"].items()
+                    }
+                    lora.t_proj.load_state_dict(converted, strict=False)
+                # else: legacy ckpt, leave t_proj at zero-init (no-op).
+            elif ckpt_has_t:
+                # Ckpt has t_proj but caller asked for vanilla LoRA — drop it.
+                # Already handled by attach_lora not creating a t_proj.
+                pass
 
     metadata["checkpoint_version"] = version
     metadata["checkpoint_base_model"] = base_model_version
+    metadata["time_conditioned"] = lora_tc_flag(layer_wrappers)
 
     return layer_wrappers, metadata
 
 
+def lora_tc_flag(layer_wrappers: Dict[int, Dict[str, LoRALinear]]) -> bool:
+    """Return True if any wrapper in the dict is time-conditioned."""
+    for wrappers in layer_wrappers.values():
+        for lora in wrappers.values():
+            if lora.time_conditioned:
+                return True
+    return False
+
+
 def count_lora_params(layer_wrappers: Dict[int, Dict[str, LoRALinear]]) -> int:
-    """Count total LoRA parameters."""
+    """Count total LoRA parameters.
+
+    Includes lora_A, lora_B and t_proj weights/biases when present.
+    """
     total = 0
     for wrappers in layer_wrappers.values():
         for lora in wrappers.values():
             total += lora.lora_A.numel() + lora.lora_B.numel()
+            if lora.time_conditioned:
+                for p in lora.t_proj.parameters():
+                    total += p.numel()
     return total
 
 

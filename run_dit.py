@@ -37,6 +37,10 @@ from utils import CudaTimer, decode_latent, save_image, pil_to_tensor, ensure_re
 from models.dit import (
     DiTTransformer2D, set_vfl_step_info, get_vfl_buffer, set_vfl_sample_id,
 )
+from verification_feedback_loop.lora_adapter import (
+    set_lora_t_emb, clear_lora_t_emb,
+    compute_timestep_emb_for_transformer,
+)
 from accelerators.teacache import (
     teacache_init, teacache_decide, teacache_cache_residual,
     teacache_apply_residual, teacache_step, teacache_reset,
@@ -345,8 +349,18 @@ class DiTGenerator:
         for step_idx, t in enumerate(timesteps):
             # VFL: track current step + real timestep for event recording hooks
             set_vfl_step_info(step_idx, len(timesteps), timestep_actual=int(t))
-            latent_input = scheduler.scale_model_input(latents, t)
+            # Time-conditioned LoRA: cache t_emb once per step so the 168
+            # LoRALinear forwards (28 blocks × 6 Linears) inside the upcoming
+            # transformer call all read the same value without recomputing.
             current_t = t.expand(latents.shape[0]).to(torch.int64)
+            _t_emb = compute_timestep_emb_for_transformer(
+                transformer, current_t,
+                class_labels=class_labels,
+                hidden_dtype=latents.dtype,
+            )
+            if _t_emb is not None:
+                set_lora_t_emb(_t_emb)
+            latent_input = scheduler.scale_model_input(latents, t)
 
             # --------------- method dispatch ---------------
             if method == "teacache":
@@ -415,6 +429,8 @@ class DiTGenerator:
 
             latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
+        # Clear the LoRA t_emb cache so the next image starts clean.
+        clear_lora_t_emb()
         return latents
 
     # ==================================================================
@@ -539,8 +555,18 @@ class DiTGenerator:
         for step_idx, t in enumerate(timesteps):
             # VFL: track current step + real timestep for event recording hooks
             set_vfl_step_info(step_idx, len(timesteps), timestep_actual=int(t))
-            latent_input = scheduler.scale_model_input(latents, t)
+            # Time-conditioned LoRA: cache t_emb once per step so the 168
+            # LoRALinear forwards (28 blocks × 6 Linears) inside the upcoming
+            # transformer call all read the same value without recomputing.
             current_t = t.expand(latents.shape[0]).to(torch.int64)
+            _t_emb = compute_timestep_emb_for_transformer(
+                transformer, current_t,
+                class_labels=class_labels,
+                hidden_dtype=latents.dtype,
+            )
+            if _t_emb is not None:
+                set_lora_t_emb(_t_emb)
+            latent_input = scheduler.scale_model_input(latents, t)
 
             # --- TTT forward (decides teacher/student inside) ---
             noise_pred = transformer.forward_with_cfg_ttt(
@@ -568,6 +594,7 @@ class DiTGenerator:
                 latents = scheduler.step(
                     noise_pred.detach(), t, latents, return_dict=False)[0]
 
+        clear_lora_t_emb()
         return latents
 
 
@@ -710,6 +737,10 @@ def run_c2i(args) -> Dict:
         # but keep it ≥2s to avoid busy-spinning on tiny benchmarks.
         vfl_cfg.poll_interval_s = 5.0
         vfl_cfg.loRA_rank = 4
+        # Default: time-conditioned LoRA (γ(t_emb) gating). --vfl-no-time-lora
+        # falls back to vanilla LoRA for ablation/back-compat.
+        vfl_cfg.time_conditioned_lora = not getattr(
+            args, "vfl_no_time_lora", False)
 
         vfl_cal = OnlineCalibrator(ema_window=100)
         set_vfl_calibrator(vfl_cal)

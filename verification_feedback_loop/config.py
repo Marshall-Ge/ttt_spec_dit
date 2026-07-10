@@ -68,6 +68,11 @@ class VFLConfig:
     loRA_rank: int = 8
     loRA_alpha: int = 16
     top_k_layers: int = 3
+    # Time-conditioned LoRA (default True). When True, each LoRA adapter is
+    # augmented with a small t_proj MLP that modulates ΔW by γ(t_emb), letting
+    # the rank=4 bottleneck adapt across the early/mid/late denoising phases.
+    # Set False via ``--vfl-no-time-lora`` to fall back to vanilla LoRA.
+    time_conditioned_lora: bool = True
 
     # ---- M5: Curvature Loss ----
     lambda_curvature: float = 1e-4

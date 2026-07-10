@@ -36,6 +36,10 @@ from config import (
 from utils import CudaTimer, decode_latent, save_image, pil_to_tensor, ensure_real_299
 
 from models.pixart import PixArtTransformer2D, set_vfl_step_info
+from verification_feedback_loop.lora_adapter import (
+    set_lora_t_emb, clear_lora_t_emb,
+    compute_timestep_emb_for_transformer,
+)
 from accelerators.teacache import (
     teacache_init, teacache_decide, teacache_cache_residual,
     teacache_apply_residual, teacache_step, teacache_reset,
@@ -354,8 +358,16 @@ class PixArtGenerator:
         for step_idx, t in enumerate(sched.timesteps):
             # VFL: track current step + real timestep for event recording hooks
             set_vfl_step_info(step_idx, len(sched.timesteps), timestep_actual=int(t))
-            latent_input = sched.scale_model_input(latents, t)
             current_t = t.expand(latents.shape[0]).to(torch.int64)
+            # Time-conditioned LoRA: cache t_emb once per step so the 168
+            # LoRALinear forwards inside the transformer all read the same
+            # value without recomputing.
+            _t_emb = compute_timestep_emb_for_transformer(
+                transformer, current_t, hidden_dtype=latents.dtype,
+            )
+            if _t_emb is not None:
+                set_lora_t_emb(_t_emb)
+            latent_input = sched.scale_model_input(latents, t)
 
             if current is not None:
                 current.step = len(timesteps) - 1 - step_idx
@@ -378,6 +390,7 @@ class PixArtGenerator:
                 noise_pred = noise_pred[:, :transformer.config.in_channels]
             latents = sched.step(noise_pred, t, latents, return_dict=False)[0]
 
+        clear_lora_t_emb()
         if guidance_scale > 1.0:
             latents = latents.chunk(2, dim=0)[1]
 
@@ -419,8 +432,14 @@ class PixArtGenerator:
         for step_idx, t in enumerate(timesteps):
             # VFL: track current step + real timestep for event recording hooks
             set_vfl_step_info(step_idx, len(timesteps), timestep_actual=int(t))
-            latent_input = scheduler.scale_model_input(latents, t)
             current_t = t.expand(latents.shape[0]).to(torch.int64)
+            # Time-conditioned LoRA: cache t_emb once per step.
+            _t_emb = compute_timestep_emb_for_transformer(
+                transformer, current_t, hidden_dtype=latents.dtype,
+            )
+            if _t_emb is not None:
+                set_lora_t_emb(_t_emb)
+            latent_input = scheduler.scale_model_input(latents, t)
 
             if current is not None:
                 current.step = len(timesteps) - 1 - step_idx
@@ -458,6 +477,7 @@ class PixArtGenerator:
                 noise_pred = noise_pred[:, :transformer.config.in_channels]
             latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
+        clear_lora_t_emb()
         return latents
 
     # ------------------------------------------------------------------
