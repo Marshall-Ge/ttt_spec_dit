@@ -84,6 +84,7 @@ class VFLConfig:
     trigger_min_samples: int = 200
     trigger_min_interval_s: float = 300.0
     trainer_steps_per_trigger: int = 50
+    max_checkpoints: int = 5  # 只保留最近 N 个 checkpoint
 
     # ---- M6 (Phase 2): real async worker ----
     # Polling interval between buffer-readiness checks in the background
