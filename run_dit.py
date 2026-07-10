@@ -1134,6 +1134,7 @@ def run_c2i(args) -> Dict:
             "speca_min_taylor_steps": args.speca_min_taylor_steps if args.method == "speca" else None,
             "speca_max_taylor_steps": args.speca_max_taylor_steps if args.method == "speca" else None,
             "speca_error_metric": args.speca_error_metric if args.method == "speca" else None,
+            "guidance_scale": args.guidance_scale,
             "ttt": args.ttt,
             "ttt_lr": args.ttt_lr if args.ttt else None,
             "ttt_micro_epochs": args.ttt_micro_epochs if args.ttt else None,

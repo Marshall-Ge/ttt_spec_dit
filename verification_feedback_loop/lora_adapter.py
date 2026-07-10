@@ -359,13 +359,33 @@ def load_lora_checkpoint(transformer, path: str
     """
     state = torch.load(path, map_location="cpu")
 
-    rank = state["rank"]
-    alpha = state["alpha"]
+    rank = state.get("rank")
+    alpha = state.get("alpha")
     version = state.get("version", "unknown")
     base_model_version = state.get("base_model_version", "unknown")
     metadata = state.get("metadata", {})
 
+    # Guard against corrupted / empty checkpoints (rank=None means no actual
+    # LoRA weights were saved — likely from a buggy training run).
+    if rank is None or alpha is None:
+        print(f"  [VFL] Skipping empty/corrupted checkpoint: {path} "
+              f"(rank={rank}, alpha={alpha}) — removing from disk")
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        # Return empty wrappers so the caller can detect and skip
+        return {}, metadata
+
     layer_ids = sorted(int(k) for k in state["layers"].keys())
+    # Filter out layers with no weight data
+    layer_ids = [lid for lid in layer_ids
+                 if len(state["layers"].get(str(lid), {})) > 0]
+    if not layer_ids:
+        print(f"  [VFL] Skipping empty checkpoint: {path} "
+              f"(all {len(state['layers'])} layers are empty)")
+        return {}, metadata
+
     layer_wrappers = attach_lora(transformer, layer_ids, rank=rank, alpha=alpha)
 
     # Load weights

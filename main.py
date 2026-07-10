@@ -113,7 +113,7 @@ Examples:
                         choices=["l1", "l2", "relative_l1", "relative_l2",
                                  "cosine_similarity", "all"],
                         help="SpecA error metric for gate/threshold comparison "
-                             "(default: relative_l1)")
+                             "(default: cosine_similarity)")
     # ---- TTT (Test-Time Training plugin, DiT-only) ----
     parser.add_argument("--ttt", action="store_true", default=False,
                         help="Enable online TTT plugin on top of TeaCache "

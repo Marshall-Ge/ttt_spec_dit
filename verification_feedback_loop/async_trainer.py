@@ -68,6 +68,46 @@ from verification_feedback_loop.replay_buffer import StratifiedReplayBuffer
 
 
 # ===========================================================================
+# Checkpoint cleanup helper
+# ===========================================================================
+
+
+def _cleanup_old_checkpoints(output_dir: str, keep: int = 5):
+    """Remove old checkpoint files, keeping only the most recent ``keep`` .pt files.
+
+    Also removes companion ``_summary.json`` files alongside deleted checkpoints.
+    """
+    if not os.path.isdir(output_dir):
+        return
+
+    pt_files = []
+    for name in os.listdir(output_dir):
+        if name.endswith(".pt"):
+            path = os.path.join(output_dir, name)
+            if os.path.isfile(path):
+                try:
+                    pt_files.append((os.path.getmtime(path), path))
+                except OSError:
+                    continue
+
+    if len(pt_files) <= keep:
+        return
+
+    pt_files.sort(key=lambda x: x[0], reverse=True)
+    for _, path in pt_files[keep:]:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        summary_path = path.replace(".pt", "_summary.json")
+        if os.path.exists(summary_path):
+            try:
+                os.remove(summary_path)
+            except OSError:
+                pass
+
+
+# ===========================================================================
 # Phase 2: AsyncTrainingWorker
 # ===========================================================================
 
@@ -399,6 +439,7 @@ class AsyncTrainingWorker:
                 "phase": 2,
             },
         )
+        _cleanup_old_checkpoints(self.output_dir, keep=cfg.max_checkpoints)
 
         # ---- 5. 更新统计 ----
         self._total_updates += 1
@@ -561,6 +602,7 @@ class AsyncTrainer:
                     "lambda_curvature": cfg.lambda_curvature,
                 },
             )
+            _cleanup_old_checkpoints(self.output_dir, keep=cfg.max_checkpoints)
         self._last_train_time = time.time()
         self._last_buffer_sample_count = self.buffer.total_samples
         self._loss_history.extend(losses)
