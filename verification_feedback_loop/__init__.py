@@ -35,6 +35,10 @@ from verification_feedback_loop.lora_adapter import (
     save_lora_checkpoint,
     load_lora_checkpoint,
     find_latest_checkpoint,
+    set_lora_t_emb,
+    clear_lora_t_emb,
+    get_lora_t_emb,
+    compute_timestep_emb_for_transformer,
 )
 from verification_feedback_loop.curvature_loss import (
     trajectory_curvature_loss,
@@ -89,6 +93,10 @@ __all__ = [
     "save_lora_checkpoint",
     "load_lora_checkpoint",
     "find_latest_checkpoint",
+    "set_lora_t_emb",
+    "clear_lora_t_emb",
+    "get_lora_t_emb",
+    "compute_timestep_emb_for_transformer",
     # M5
     "trajectory_curvature_loss",
     "trajectory_curvature_loss_from_buffer",
