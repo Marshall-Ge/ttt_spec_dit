@@ -8,3 +8,4 @@
 output/
 analysis_output/
 scripts/experienment
+*.log
