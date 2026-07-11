@@ -128,7 +128,8 @@ class AsyncTrainingWorker:
                  config: VFLConfig = DEFAULT_VFL_CONFIG,
                  output_dir: str = "./output/vfl_checkpoints",
                  base_model_version: str = "unknown",
-                 train_batch_size: int = 16):
+                 train_batch_size: int = 16,
+                 on_checkpoint_ready=None):
         """
         Parameters
         ----------
@@ -145,12 +146,18 @@ class AsyncTrainingWorker:
             用作 checkpoint 元数据, 标识训练时的 base 模型版本。
         train_batch_size : int
             单次训练周期从 buffer 采样的 batch 大小。
+        on_checkpoint_ready : callable, optional
+            ``on_checkpoint_ready(version: int)`` — called in the training
+            thread after each successful cycle.  Use it to notify the
+            inference thread that a new LoRA snapshot is available for
+            mid-run reload.  Exceptions in the callback are caught and logged.
         """
         self.buffer = buffer
         self.config = config
         self.output_dir = output_dir
         self.base_model_version = base_model_version
         self.train_batch_size = train_batch_size
+        self._on_checkpoint_ready = on_checkpoint_ready
         os.makedirs(output_dir, exist_ok=True)
 
         # ---- 1. Keep a reference to the inference model; deepcopy is LAZY ----
@@ -176,6 +183,10 @@ class AsyncTrainingWorker:
         self._total_updates: int = 0
         self._train_step: int = 0
         self._loss_history: List[float] = []
+
+        # ---- 3. Mid-run reload state ----
+        self._latest_lora_state: Optional[Dict] = None
+        self._swap_lock = threading.Lock()
 
         # ---- 4. 后台线程控制 ----
         self._thread: Optional[threading.Thread] = None
@@ -477,7 +488,73 @@ class AsyncTrainingWorker:
         except OSError:
             pass
 
+        # ---- 6. Mid-run reload: snapshot + notify ----
+        with self._swap_lock:
+            self._latest_lora_state = self._snapshot_lora_state()
+        if self._on_checkpoint_ready:
+            try:
+                self._on_checkpoint_ready(self._candidate_version)
+            except Exception as e:
+                print(f"[VFL:AsyncTrainingWorker] on_checkpoint_ready "
+                      f"callback failed: {e}")
+
         return ckpt_path
+
+    # ------------------------------------------------------------------
+    # Mid-run reload: snapshot & pull
+    # ------------------------------------------------------------------
+
+    def _snapshot_lora_state(self) -> Dict:
+        """Deep-copy current LoRA weights from the training model's wrappers.
+
+        Returns the same dict structure as ``save_lora_checkpoint``'s on-disk
+        format (``{"layers": {str(layer_id): {path: {"lora_A": ..., "lora_B": ..., "t_proj": ...}}}}``),
+        but with in-memory CPU tensors instead of disk I/O.
+        """
+        snapshot: Dict = {"layers": {}}
+        if self._layer_wrappers is None:
+            return snapshot
+        for layer_id, layer_wrappers in self._layer_wrappers.items():
+            layer_state = {}
+            for path, lora in layer_wrappers.items():
+                entry = {
+                    "lora_A": lora.lora_A.data.detach().cpu().clone(),
+                    "lora_B": lora.lora_B.data.detach().cpu().clone(),
+                }
+                if lora.time_conditioned:
+                    entry["t_proj"] = {
+                        k: v.detach().cpu().clone()
+                        for k, v in lora.t_proj.state_dict().items()
+                    }
+                layer_state[path] = entry
+            snapshot["layers"][str(layer_id)] = layer_state
+        return snapshot
+
+    def pull_latest_lora_state(self) -> Optional[Dict]:
+        """Return the latest LoRA weight snapshot (or None).
+
+        Called by the inference thread at image boundaries.  The returned
+        dict is a deep clone — the caller can use it freely without
+        worrying about the next training cycle overwriting it.
+        """
+        with self._swap_lock:
+            if self._latest_lora_state is None:
+                return None
+            # Deep clone so inference thread holds a stable snapshot
+            cloned: Dict = {"layers": {}}
+            for lid_str, layer_state in self._latest_lora_state["layers"].items():
+                cloned["layers"][lid_str] = {}
+                for path, entry in layer_state.items():
+                    cloned_entry = {
+                        "lora_A": entry["lora_A"].clone(),
+                        "lora_B": entry["lora_B"].clone(),
+                    }
+                    if "t_proj" in entry:
+                        cloned_entry["t_proj"] = {
+                            k: v.clone() for k, v in entry["t_proj"].items()
+                        }
+                    cloned["layers"][lid_str][path] = cloned_entry
+            return cloned
 
 
 # ===========================================================================

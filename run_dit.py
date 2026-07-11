@@ -40,6 +40,8 @@ from models.dit import (
 from verification_feedback_loop.lora_adapter import (
     set_lora_t_emb, clear_lora_t_emb,
     compute_timestep_emb_for_transformer,
+    attach_lora_all_layers, count_lora_params,
+    _swap_lora_weights, _load_state_into_wrappers,
 )
 from accelerators.teacache import (
     teacache_init, teacache_decide, teacache_cache_residual,
@@ -793,22 +795,18 @@ def run_c2i(args) -> Dict:
     vfl_buf = None
     vfl_cal = None
     vfl_worker = None
+    inference_lora_wrappers = None
     if getattr(args, "vfl", False):
         from verification_feedback_loop import (
             StratifiedReplayBuffer, OnlineCalibrator,
             AsyncTrainingWorker, VFLConfig,
-            load_lora_checkpoint, find_latest_checkpoint,
+            find_latest_checkpoint,
         )
         from models.dit import set_vfl_buffer, set_vfl_calibrator
 
         vfl_cfg = VFLConfig()
-        # Phase 2: trigger by signal-quality not raw count. Lower the
-        # poll interval so the worker reacts quickly once buffer fills,
-        # but keep it ≥2s to avoid busy-spinning on tiny benchmarks.
         vfl_cfg.poll_interval_s = 5.0
         vfl_cfg.loRA_rank = 4
-        # Default: time-conditioned LoRA (γ(t_emb) gating). --vfl-no-time-lora
-        # falls back to vanilla LoRA for ablation/back-compat.
         vfl_cfg.time_conditioned_lora = not getattr(
             args, "vfl_no_time_lora", False)
 
@@ -819,55 +817,53 @@ def run_c2i(args) -> Dict:
             get_vfl_checkpoint_dir(output_dir, args.method)
         vfl_no_train = getattr(args, "vfl_no_train", False)
 
+        # ---- Unconditionally attach LoRA to inference model (B=0 → no-op) ----
+        inference_lora_wrappers = attach_lora_all_layers(
+            generator.transformer,
+            rank=vfl_cfg.loRA_rank,
+            alpha=1.0,
+            time_conditioned=vfl_cfg.time_conditioned_lora,
+        )
+        n_lora_params = count_lora_params(inference_lora_wrappers)
+        print(f"  Inference model LoRA attached: "
+              f"{n_lora_params:,} params (B zero-init = no-op)")
+
+        # ---- Load previous checkpoint as starting point (if any) ----
+        prev_ckpt = find_latest_checkpoint(vfl_output_dir)
+        if prev_ckpt is None:
+            prev_ckpt = find_latest_checkpoint(
+                getattr(args, "vfl_output_dir", None) or "")
+        if prev_ckpt:
+            try:
+                _load_state_into_wrappers(
+                    inference_lora_wrappers, prev_ckpt,
+                    device=generator.device, dtype=dt)
+                print(f"  Loaded LoRA from previous run: {prev_ckpt}")
+            except Exception as e:
+                print(f"  [WARN] failed to load LoRA checkpoint "
+                      f"{prev_ckpt}: {e} — proceeding with zero-init LoRA")
+
         if vfl_no_train:
             # ---- Threshold-only mode (--vfl --vfl-no-train) ----
             # Only the calibrator is registered; the buffer is left None.
-            # record_speca_event / record_teacache_event see buf=None and
-            # take the scalar fast path — no GPU→CPU tensor transfer, no
-            # VerificationEvent construction, no buffer writes.  We still
-            # load any previous LoRA checkpoint so inference benefits from
-            # past training, but skip all training overhead (no deepcopy,
-            # no LoRA attachment, no background worker).
-            prev_ckpt = find_latest_checkpoint(vfl_output_dir)
-            if prev_ckpt is None:
-                prev_ckpt = find_latest_checkpoint(
-                    getattr(args, "vfl_output_dir", None) or "")
-            if prev_ckpt:
-                try:
-                    load_lora_checkpoint(generator.transformer, prev_ckpt)
-                    print(f"  Loaded LoRA from previous run: {prev_ckpt}")
-                except Exception as e:
-                    print(f"  [WARN] failed to load LoRA checkpoint "
-                          f"{prev_ckpt}: {e} — proceeding without it")
+            # LoRA is already attached + previous weights loaded above.
             print(f"  VFL enabled (threshold-only, no training): "
                   f"calibrator-only hot path, no LoRA worker")
         else:
             # ---- Threshold+LoRA mode (--vfl) ----
-            # Both calibrator and buffer are registered.  record_* builds
-            # full VerificationEvents with detached CPU tensors and writes
-            # them to the buffer so the AsyncTrainingWorker has replay
-            # context for L3 LoRA training.  Hot path pays the GPU→CPU
-            # tensor transfer cost.
             vfl_buf = StratifiedReplayBuffer(
                 capacity_per_stratum=vfl_cfg.buffer_capacity_per_stratum)
             set_vfl_buffer(vfl_buf, model_version="dit-v1")
 
+            def on_checkpoint_ready(version):
+                print(f"[VFL] LoRA v{version} ready — "
+                      f"will swap at next image boundary")
+
             vfl_worker = AsyncTrainingWorker(
                 generator.transformer, vfl_buf, config=vfl_cfg,
                 base_model_version="dit-v1", output_dir=vfl_output_dir,
+                on_checkpoint_ready=on_checkpoint_ready,
             )
-
-            prev_ckpt = find_latest_checkpoint(vfl_output_dir)
-            if prev_ckpt is None:
-                prev_ckpt = find_latest_checkpoint(
-                    getattr(args, "vfl_output_dir", None) or "")
-            if prev_ckpt:
-                try:
-                    load_lora_checkpoint(generator.transformer, prev_ckpt)
-                    print(f"  Loaded LoRA from previous run: {prev_ckpt}")
-                except Exception as e:
-                    print(f"  [WARN] failed to load LoRA checkpoint "
-                          f"{prev_ckpt}: {e} — proceeding without it")
 
             vfl_worker.start()
             print(f"  VFL enabled (Phase 2 async): buffer + calibrator + "
@@ -877,19 +873,23 @@ def run_c2i(args) -> Dict:
 
     # ---- Print model structure (once, after all modifications) ----
     print("\n" + "=" * 70)
-    if vfl_worker is not None:
-        vfl_worker._ensure_train_model()
-        train_model = vfl_worker._train_model
-        print("MODEL STRUCTURE (VFL train_model + LoRA)")
+    if inference_lora_wrappers is not None:
+        print("MODEL STRUCTURE (inference model + LoRA)")
         print("=" * 70)
-        print(train_model)
-        lora_params = sum(p.numel() for p in train_model.parameters() if p.requires_grad)
-        print(f"\nLoRA trainable params: {lora_params:,}")
-        print(f"LoRA layers: {len(vfl_worker._layer_wrappers)}")
-        print("\nTrainable parameters:")
-        for name, p in train_model.named_parameters():
-            if p.requires_grad:
-                print(f"  {name}: {list(p.shape)}")
+        print(generator.transformer)
+        lora_p = count_lora_params(inference_lora_wrappers)
+        print(f"\nLoRA params (inference): {lora_p:,}")
+        print(f"LoRA layers: {len(inference_lora_wrappers)}")
+        if vfl_worker is not None:
+            vfl_worker._ensure_train_model()
+            lora_train = sum(
+                p.numel() for p in vfl_worker._train_model.parameters()
+                if p.requires_grad)
+            print(f"LoRA trainable params (train_model): {lora_train:,}")
+            print("\nTrainable parameters:")
+            for name, p in vfl_worker._train_model.named_parameters():
+                if p.requires_grad:
+                    print(f"  {name}: {list(p.shape)}")
     else:
         print("MODEL STRUCTURE")
         print("=" * 70)
@@ -998,6 +998,21 @@ def run_c2i(args) -> Dict:
     global_idx = 0
 
     for batch_start in tqdm(range(0, n, bs), desc=f"c2i/{dataset_name}", ncols=80):
+        # ---- VFL mid-run reload: pull latest LoRA from training daemon ----
+        if vfl_worker is not None and inference_lora_wrappers is not None:
+            new_state = vfl_worker.pull_latest_lora_state()
+            if new_state is not None:
+                try:
+                    _swap_lora_weights(
+                        inference_lora_wrappers, new_state,
+                        device=generator.device, dtype=dt,
+                    )
+                    print(f"[VFL] swapped LoRA at image {batch_start} "
+                          f"(v{vfl_worker._candidate_version})")
+                except Exception as e:
+                    print(f"[VFL] swap failed at image {batch_start}: {e} "
+                          f"— keeping previous LoRA weights")
+
         batch_end = min(batch_start + bs, n)
         batch_indices = list(range(batch_start, batch_end))
         actual_bs = len(batch_indices)

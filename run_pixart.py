@@ -39,6 +39,8 @@ from models.pixart import PixArtTransformer2D, set_vfl_step_info
 from verification_feedback_loop.lora_adapter import (
     set_lora_t_emb, clear_lora_t_emb,
     compute_timestep_emb_for_transformer,
+    attach_lora_all_layers, count_lora_params,
+    _swap_lora_weights, _load_state_into_wrappers,
 )
 from accelerators.teacache import (
     teacache_init, teacache_decide, teacache_cache_residual,
@@ -682,6 +684,76 @@ def run_t2i(args) -> Dict:
     print(f"transformer_blocks: {n_blocks}")
     print("=" * 70)
 
+    # ---- VFL: mid-run reload (interface-symmetric with run_dit.py) ----
+    # PixArt VFL is not yet end-to-end wired (D1 known gap).  This block
+    # provides the same init + swap scaffolding so that when --vfl is passed
+    # for PixArt it will at least attach LoRA and attempt swaps, but the
+    # data path (buffer events) is not yet connected.
+    vfl_buf = None
+    vfl_cal = None
+    vfl_worker = None
+    inference_lora_wrappers = None
+    if getattr(args, "vfl", False):
+        from verification_feedback_loop import (
+            StratifiedReplayBuffer, OnlineCalibrator,
+            AsyncTrainingWorker, VFLConfig,
+            find_latest_checkpoint,
+        )
+        from models.pixart import set_vfl_buffer, set_vfl_calibrator
+
+        vfl_cfg = VFLConfig()
+        vfl_cfg.loRA_rank = 4
+        vfl_cfg.time_conditioned_lora = not getattr(
+            args, "vfl_no_time_lora", False)
+
+        vfl_cal = OnlineCalibrator(ema_window=100)
+        set_vfl_calibrator(vfl_cal)
+
+        vfl_output_dir = getattr(args, "vfl_output_dir", None) or \
+            os.path.join(output_dir, "vfl_checkpoints")
+        vfl_no_train = getattr(args, "vfl_no_train", False)
+
+        inference_lora_wrappers = attach_lora_all_layers(
+            generator.transformer,
+            rank=vfl_cfg.loRA_rank,
+            alpha=1.0,
+            time_conditioned=vfl_cfg.time_conditioned_lora,
+        )
+        n_lora_params = count_lora_params(inference_lora_wrappers)
+        print(f"  Inference model LoRA attached: "
+              f"{n_lora_params:,} params (B zero-init = no-op)")
+
+        prev_ckpt = find_latest_checkpoint(vfl_output_dir)
+        if prev_ckpt:
+            try:
+                _load_state_into_wrappers(
+                    inference_lora_wrappers, prev_ckpt,
+                    device=generator.device, dtype=dt)
+                print(f"  Loaded LoRA from previous run: {prev_ckpt}")
+            except Exception as e:
+                print(f"  [WARN] failed to load LoRA checkpoint "
+                      f"{prev_ckpt}: {e} — proceeding with zero-init LoRA")
+
+        if not vfl_no_train:
+            vfl_buf = StratifiedReplayBuffer(
+                capacity_per_stratum=vfl_cfg.buffer_capacity_per_stratum)
+            set_vfl_buffer(vfl_buf, model_version="pixart-v1")
+
+            def on_checkpoint_ready(version):
+                print(f"[VFL] LoRA v{version} ready — "
+                      f"will swap at next image boundary")
+
+            vfl_worker = AsyncTrainingWorker(
+                generator.transformer, vfl_buf, config=vfl_cfg,
+                base_model_version="pixart-v1", output_dir=vfl_output_dir,
+                on_checkpoint_ready=on_checkpoint_ready,
+            )
+            vfl_worker.start()
+            print(f"  VFL enabled (Phase 2 async, PixArt): "
+                  f"buffer + calibrator + training thread")
+        else:
+            print(f"  VFL enabled (threshold-only, no training, PixArt)")
+
     # 3. Metrics
     print("\n[3] Setting up metrics...")
     metrics = {}
@@ -746,6 +818,21 @@ def run_t2i(args) -> Dict:
 
     all_results = []
     for batch_start in tqdm(range(0, n, bs), desc=f"t2i/{dataset_name}", ncols=80):
+        # ---- VFL mid-run reload ----
+        if vfl_worker is not None and inference_lora_wrappers is not None:
+            new_state = vfl_worker.pull_latest_lora_state()
+            if new_state is not None:
+                try:
+                    _swap_lora_weights(
+                        inference_lora_wrappers, new_state,
+                        device=generator.device, dtype=dt,
+                    )
+                    print(f"[VFL] swapped LoRA at image {batch_start} "
+                          f"(v{vfl_worker._candidate_version})")
+                except Exception as e:
+                    print(f"[VFL] swap failed at image {batch_start}: {e} "
+                          f"— keeping previous LoRA weights")
+
         batch_end = min(batch_start + bs, n)
         batch_items = items[batch_start:batch_end]
         batch_prompts = [it[0] for it in batch_items]
@@ -998,6 +1085,72 @@ def run_c2i(args) -> Dict:
     print(f"transformer_blocks: {n_blocks}")
     print("=" * 70)
 
+    # ---- VFL: mid-run reload (interface-symmetric with run_dit.py) ----
+    vfl_buf = None
+    vfl_cal = None
+    vfl_worker = None
+    inference_lora_wrappers = None
+    if getattr(args, "vfl", False):
+        from verification_feedback_loop import (
+            StratifiedReplayBuffer, OnlineCalibrator,
+            AsyncTrainingWorker, VFLConfig,
+            find_latest_checkpoint,
+        )
+        from models.pixart import set_vfl_buffer, set_vfl_calibrator
+
+        vfl_cfg = VFLConfig()
+        vfl_cfg.loRA_rank = 4
+        vfl_cfg.time_conditioned_lora = not getattr(
+            args, "vfl_no_time_lora", False)
+
+        vfl_cal = OnlineCalibrator(ema_window=100)
+        set_vfl_calibrator(vfl_cal)
+
+        vfl_output_dir = getattr(args, "vfl_output_dir", None) or \
+            os.path.join(output_dir, "vfl_checkpoints")
+        vfl_no_train = getattr(args, "vfl_no_train", False)
+
+        inference_lora_wrappers = attach_lora_all_layers(
+            generator.transformer,
+            rank=vfl_cfg.loRA_rank,
+            alpha=1.0,
+            time_conditioned=vfl_cfg.time_conditioned_lora,
+        )
+        n_lora_params = count_lora_params(inference_lora_wrappers)
+        print(f"  Inference model LoRA attached: "
+              f"{n_lora_params:,} params (B zero-init = no-op)")
+
+        prev_ckpt = find_latest_checkpoint(vfl_output_dir)
+        if prev_ckpt:
+            try:
+                _load_state_into_wrappers(
+                    inference_lora_wrappers, prev_ckpt,
+                    device=generator.device, dtype=dt)
+                print(f"  Loaded LoRA from previous run: {prev_ckpt}")
+            except Exception as e:
+                print(f"  [WARN] failed to load LoRA checkpoint "
+                      f"{prev_ckpt}: {e} — proceeding with zero-init LoRA")
+
+        if not vfl_no_train:
+            vfl_buf = StratifiedReplayBuffer(
+                capacity_per_stratum=vfl_cfg.buffer_capacity_per_stratum)
+            set_vfl_buffer(vfl_buf, model_version="pixart-v1")
+
+            def on_checkpoint_ready(version):
+                print(f"[VFL] LoRA v{version} ready — "
+                      f"will swap at next image boundary")
+
+            vfl_worker = AsyncTrainingWorker(
+                generator.transformer, vfl_buf, config=vfl_cfg,
+                base_model_version="pixart-v1", output_dir=vfl_output_dir,
+                on_checkpoint_ready=on_checkpoint_ready,
+            )
+            vfl_worker.start()
+            print(f"  VFL enabled (Phase 2 async, PixArt c2i): "
+                  f"buffer + calibrator + training thread")
+        else:
+            print(f"  VFL enabled (threshold-only, no training, PixArt c2i)")
+
     # 3. Metrics
     print("\n[3] Setting up metrics...")
     metrics = {}
@@ -1079,6 +1232,21 @@ def run_c2i(args) -> Dict:
     global_idx = 0
 
     for batch_start in tqdm(range(0, n, bs), desc=f"c2i/{dataset_name}", ncols=80):
+        # ---- VFL mid-run reload ----
+        if vfl_worker is not None and inference_lora_wrappers is not None:
+            new_state = vfl_worker.pull_latest_lora_state()
+            if new_state is not None:
+                try:
+                    _swap_lora_weights(
+                        inference_lora_wrappers, new_state,
+                        device=generator.device, dtype=dt,
+                    )
+                    print(f"[VFL] swapped LoRA at image {batch_start} "
+                          f"(v{vfl_worker._candidate_version})")
+                except Exception as e:
+                    print(f"[VFL] swap failed at image {batch_start}: {e} "
+                          f"— keeping previous LoRA weights")
+
         batch_end = min(batch_start + bs, n)
         batch_indices = list(range(batch_start, batch_end))
         actual_bs = len(batch_indices)

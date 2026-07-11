@@ -820,3 +820,91 @@ def find_latest_checkpoint(output_dir: str) -> Optional[str]:
         return None
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[0][1]
+
+
+# ===========================================================================
+# Mid-run reload: swap weights between train and inference LoRA wrappers
+# ===========================================================================
+
+
+def _swap_lora_weights(inference_wrappers: Dict[int, Dict[str, LoRALinear]],
+                       new_state: Dict,
+                       device: torch.device,
+                       dtype: torch.dtype):
+    """Copy LoRA weights from a training snapshot into inference wrappers.
+
+    Handles fp32 (train) → fp16 (inference) conversion.  Missing layers or
+    paths in *new_state* are silently skipped (the inference wrapper keeps its
+    current weights).  This is the hot-path for mid-run reload — called once
+    per image boundary when a new training cycle has completed.
+
+    Raises ``RuntimeError`` on shape mismatch so the caller can fall back.
+    """
+    for layer_id, layer_wrappers in inference_wrappers.items():
+        if str(layer_id) not in new_state.get("layers", {}):
+            continue
+        layer_state = new_state["layers"][str(layer_id)]
+        for path, inf_lora in layer_wrappers.items():
+            if path not in layer_state:
+                continue
+            entry = layer_state[path]
+            src_A = entry["lora_A"]
+            src_B = entry["lora_B"]
+            if src_A.shape != inf_lora.lora_A.shape:
+                raise RuntimeError(
+                    f"lora_A shape mismatch layer {layer_id}/{path}: "
+                    f"src {src_A.shape} vs dst {inf_lora.lora_A.shape}")
+            if src_B.shape != inf_lora.lora_B.shape:
+                raise RuntimeError(
+                    f"lora_B shape mismatch layer {layer_id}/{path}: "
+                    f"src {src_B.shape} vs dst {inf_lora.lora_B.shape}")
+            inf_lora.lora_A.data.copy_(src_A.to(device=device, dtype=dtype))
+            inf_lora.lora_B.data.copy_(src_B.to(device=device, dtype=dtype))
+            if inf_lora.time_conditioned and "t_proj" in entry:
+                src_t = entry["t_proj"]
+                converted = {k: v.to(device=device, dtype=dtype)
+                             for k, v in src_t.items()}
+                inf_lora.t_proj.load_state_dict(converted, strict=False)
+
+
+def _load_state_into_wrappers(wrappers: Dict[int, Dict[str, LoRALinear]],
+                              ckpt_path: str,
+                              device: torch.device,
+                              dtype: torch.dtype):
+    """Load a checkpoint file into already-attached LoRA wrappers (no re-attach).
+
+    Unlike ``load_lora_checkpoint`` this does **not** call ``attach_lora`` —
+    the wrappers must already exist on the inference model.  Used during VFL
+    init when the inference model has been unconditionally LoRA-attached.
+
+    Legacy checkpoints without ``t_proj`` are handled gracefully: the
+    time-conditioned wrapper's t_proj stays at zero-init (no-op).
+    """
+    state = torch.load(ckpt_path, map_location="cpu")
+    if state.get("rank") is None:
+        raise ValueError(f"corrupted checkpoint: {ckpt_path}")
+
+    for layer_id_str, layer_state in state.get("layers", {}).items():
+        layer_id = int(layer_id_str)
+        if layer_id not in wrappers:
+            continue
+        for path, tensors in layer_state.items():
+            if path not in wrappers[layer_id]:
+                continue
+            lora = wrappers[layer_id][path]
+            lora.lora_A.data.copy_(
+                tensors["lora_A"].to(device=device, dtype=dtype))
+            lora.lora_B.data.copy_(
+                tensors["lora_B"].to(device=device, dtype=dtype))
+            if "t_proj" in tensors and lora.time_conditioned:
+                src_t = tensors["t_proj"]
+                converted = {k: v.to(device=device, dtype=dtype)
+                             for k, v in src_t.items()}
+                # Check for shape mismatch (old Scalar Gate → new AdaLN)
+                live = lora.t_proj.state_dict()
+                shape_ok = all(
+                    k not in live or v.shape == live[k].shape
+                    for k, v in converted.items())
+                if shape_ok:
+                    lora.t_proj.load_state_dict(converted, strict=False)
+                # else: skip t_proj, leave at zero-init
