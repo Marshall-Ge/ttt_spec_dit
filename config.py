@@ -17,10 +17,10 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 # ---------------------------------------------------------------------------
 # Model paths
 # ---------------------------------------------------------------------------
-HF_CACHE_DIR = "/root/autodl-fs/models"
+HF_CACHE_DIR = "~/autodl-fs/models"
 PIXART_REPO = "PixArt-alpha/PixArt-XL-2-512x512"
-DIT_REPO = "/root/autodl-fs/models/dit_2_256"
-CLIP_PATH = "/root/autodl-fs/models/models/clip"
+DIT_REPO = "~/autodl-fs/models/dit_2_256"
+CLIP_PATH = "~/autodl-fs/models/models/clip"
 
 # ---------------------------------------------------------------------------
 # DiT-2-256 constants
@@ -31,10 +31,10 @@ DIT_LATENT_SIZE = 32
 # ---------------------------------------------------------------------------
 # Dataset paths
 # ---------------------------------------------------------------------------
-COCO_DIR = "/root/autodl-fs/data/coco"
-IMAGENET_DIR = "/root/autodl-fs/data/imagenet"
-IMAGENET_299_DIR = "/root/autodl-fs/data/imagenet/val_299"
-COCO_299_DIR = "/root/autodl-fs/data/coco/val_299"
+COCO_DIR = "~/autodl-fs/data/coco"
+IMAGENET_DIR = "~/autodl-fs/data/imagenet"
+IMAGENET_299_DIR = "~/autodl-fs/data/imagenet/val_299"
+COCO_299_DIR = "~/autodl-fs/data/coco/val_299"
 DRAWBENCH_PATH = os.path.join(os.path.dirname(__file__), "drawbench200.txt")
 
 # ---------------------------------------------------------------------------
