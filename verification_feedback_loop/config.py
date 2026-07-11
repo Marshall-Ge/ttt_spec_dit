@@ -111,6 +111,12 @@ class VFLConfig:
     buffer_ready_min_anchors: int = 10
     buffer_ready_min_total_samples: int = 200
 
+    # Maximum events carrying block_input_hidden in the replay buffer.
+    # Each event stores one (B, L, D) tensor ~590KB for DiT, so 500
+    # events ≈ 300MB — much more manageable than the ~99MB/event
+    # SpecA cache snapshot that this replaces.
+    max_block_input_events: int = 500
+
     # Maximum curvature events processed per gradient step (limits GPU memory).
     # Subsamples randomly each step — all events get used across the M steps.
     max_events_per_step: int = 2

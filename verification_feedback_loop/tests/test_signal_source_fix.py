@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Unit tests for the VFL signal-source fix (SpecA snapshot + forward path).
+"""Unit tests for the VFL signal-source fix (block_input_hidden per-block replay).
 
 Verifies:
-  1. Snapshot round-trip: cache_dic/current → snapshot → restore → key fields match
-  2. SpecA forward restore: _run_transformer_forward with snapshot produces
-     output consistent with the SpecA path
-  3. No-op starting point loss > 0: with SpecA snapshots, supervised loss
-     at LoRA no-op (B=0) is non-trivially positive
-  4. Gradient flow: loss.backward() gives non-zero grad to LoRA B matrices
+  1. block_input_hidden is stored in VerificationEvent and survives round-trip
+  2. Per-block replay produces different output than vanilla (loss > 0 at no-op)
+  3. Gradient flows to LoRA B matrices through per-block replay
+  4. Backward compat: events without block_input_hidden fall back to vanilla
 
 Run:
     python verification_feedback_loop/tests/test_signal_source_fix.py
@@ -26,16 +24,12 @@ import torch.nn.functional as F
 from accelerators.speca import SpecACache, SpecAState, speca_init
 from verification_feedback_loop.curvature_loss import (
     compute_training_loss,
-    _restore_cache_dic,
-    _restore_current,
-    _move_snapshot_tensors_to,
-    _run_transformer_forward,
+    _run_block_dit,
+    _run_block_pixart,
 )
 from verification_feedback_loop.verification_hook import (
     VerificationEvent,
     make_speca_event,
-    _snapshot_cache_dic_final,
-    _snapshot_current,
 )
 from verification_feedback_loop.lora_adapter import (
     attach_lora_all_layers,
@@ -48,37 +42,80 @@ from verification_feedback_loop.lora_adapter import (
 # ===========================================================================
 
 
-class _StubSpecABlock(nn.Module):
-    """A single transformer block with submodule names matching real DiT blocks.
+class _StubAttn(nn.Module):
+    """Minimal attention-like module with LoRA-target submodules."""
 
-    Has attn1 (with to_q/to_k/to_v/to_out.0 sub-modules) and ff (with
-    net.0.proj and net.2 sub-modules) so that attach_lora_all_layers
-    can find and wrap them.
+    def __init__(self, dim: int = 16):
+        super().__init__()
+        self.to_q = nn.Linear(dim, dim)
+        self.to_k = nn.Linear(dim, dim)
+        self.to_v = nn.Linear(dim, dim)
+        self.to_out = nn.ModuleList([nn.Linear(dim, dim)])
+
+    def forward(self, x):
+        q = self.to_q(x)
+        k = self.to_k(x)
+        v = self.to_v(x)
+        return self.to_out[0](q + k + v)
+
+
+class _StubFF(nn.Module):
+    """Minimal feed-forward module with LoRA-target submodules."""
+
+    def __init__(self, dim: int = 16):
+        super().__init__()
+        _proj = nn.Module()
+        _proj.proj = nn.Linear(dim, dim)
+        self.net = nn.ModuleList([_proj, nn.Identity(), nn.Linear(dim, dim)])
+
+    def forward(self, x):
+        return self.net[2](torch.relu(self.net[0].proj(x)))
+
+
+class _StubAdaLNZero(nn.Module):
+    """Minimal adaLN-Zero stub: returns (norm_hidden, gate_msa, shift_mlp, scale_mlp, gate_mlp)."""
+
+    def __init__(self, dim: int = 16):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.emb = nn.Linear(1, 6 * dim)
+        self.dim = dim
+
+    def forward(self, x, timestep=None, class_labels=None, hidden_dtype=None):
+        B, L, D = x.shape
+        t = timestep.float().reshape(-1, 1) if timestep is not None else torch.zeros(B, 1, device=x.device)
+        emb = self.emb(t)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
+            emb.chunk(6, dim=1)
+        x_norm = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        return x_norm, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
+
+class _StubSpecABlock(nn.Module):
+    """A single transformer block matching real DiT block structure.
+
+    Has norm1 (AdaLayerNormZero), attn1 (callable), norm3 (LayerNorm),
+    ff (callable). Submodules have LoRA-target names.
     """
 
     def __init__(self, dim: int = 16, seq: int = 4):
         super().__init__()
-        # Mimic BasicTransformerBlock.attn1 structure for LoRA attachment
-        self.attn1 = nn.Module()
-        self.attn1.to_q = nn.Linear(dim, dim)
-        self.attn1.to_k = nn.Linear(dim, dim)
-        self.attn1.to_v = nn.Linear(dim, dim)
-        self.attn1.to_out = nn.ModuleList([nn.Linear(dim, dim)])
-        # Mimic ff structure: ff.net is a ModuleList with [proj_block, ..., final_linear]
-        _ff_proj = nn.Module()
-        _ff_proj.proj = nn.Linear(dim, dim)
-        self.ff = nn.Module()
-        self.ff.net = nn.ModuleList([_ff_proj, nn.Identity(), nn.Linear(dim, dim)])
+        self.norm1 = _StubAdaLNZero(dim)
+        self.attn1 = _StubAttn(dim)
+        self.norm3 = nn.LayerNorm(dim)
+        self.ff = _StubFF(dim)
         self.dim = dim
 
-    def forward(self, x):
-        q = self.attn1.to_q(x)
-        k = self.attn1.to_k(x)
-        v = self.attn1.to_v(x)
-        out = self.attn1.to_out[0](q + k + v)
-        x = x + out
-        proj_out = self.ff.net[0].proj(x)
-        x = x + self.ff.net[2](torch.relu(proj_out))
+    def forward(self, x, timestep=None, class_labels=None):
+        norm_hidden, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
+            x, timestep=timestep, class_labels=class_labels,
+            hidden_dtype=x.dtype)
+        attn_out = self.attn1(norm_hidden)
+        x = x + gate_msa.unsqueeze(1) * attn_out
+        norm_ff = self.norm3(x)
+        modulated_ff = norm_ff * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        ff_out = self.ff(modulated_ff)
+        x = x + gate_mlp.unsqueeze(1) * ff_out
         return x
 
 
@@ -129,15 +166,16 @@ class _StubSpecATransformer(nn.Module):
             step_type = 'full' if (not use_speca) else current.type
 
             if step_type == 'full':
-                # Call block(x) so forward hooks fire
-                x = block(x)
+                x = block(x, timestep=timestep, class_labels=class_labels)
 
             elif step_type == 'Taylor':
                 distance = current.step - current.activated_steps[-1]
                 check_layer = cache_dic.check_layer
                 do_check = (layer_idx == check_layer and cache_dic.check)
+                _block_input = None
                 if do_check:
-                    full_hidden = x.clone()
+                    _block_input = x.clone()
+                    full_hidden = _block_input
 
                 gate_msa = torch.ones(b, self.dim, device=x.device)
                 gate_mlp = torch.ones(b, self.dim, device=x.device)
@@ -149,14 +187,14 @@ class _StubSpecATransformer(nn.Module):
                 )
 
                 if do_check:
-                    full_hidden = block(full_hidden)
+                    full_hidden = block(full_hidden, timestep=timestep,
+                                       class_labels=class_labels)
                     gate_value, _ = compute_error_gate(
                         x, full_hidden,
                         metric=cache_dic.error_metric,
                     )
                     current.last_layer_error = gate_value
 
-        # Tail: pool + project
         x = x.mean(dim=1)
         out = self.head(x)
         out = out.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 2, 2)
@@ -186,98 +224,104 @@ def _build_speca_state(num_layers=4, num_steps=10):
         error_metric="cosine_similarity",
         check_layer=num_layers - 1,
     )
-    # Simulate initial full steps to populate the cache and get past
-    # first_enhance. first_enhance=3 means steps > num_steps-4 are forced
-    # full. We set step = num_steps - 5 to be past that window.
-    # Full step at step = num_steps - 1
     current.step = num_steps - 1
     current.type = 'full'
     current.last_type = 'full'
     current.activated_steps = [num_steps - 1]
-    # Populate cache[-1] with fake Taylor factors
     for layer_idx in range(num_layers):
         for module in ['attn', 'mlp']:
             cache_dic.cache[-1][layer_idx][module] = [
-                torch.randn(2, 4, 16) for _ in range(3)  # order 0, 1, 2
+                torch.randn(2, 4, 16) for _ in range(3)
             ]
     cache_dic.full_count = 1
     cache_dic.cache_counter = 0
 
-    # Now set up for a Taylor step past first_enhance window
-    # step = num_steps - 5 (past first_enhance = 3, window = steps > num_steps-4)
     target_step = num_steps - 5
     current.step = target_step
     current.type = 'Taylor'
     current.last_type = 'Taylor'
     current.activated_steps = [num_steps - 1, num_steps - 2, num_steps - 3, num_steps - 4]
-    cache_dic.taylor_step_counter = 3  # >= min_taylor_steps, so check=True
+    cache_dic.taylor_step_counter = 3
     cache_dic.check = True
-    cache_dic.full_count = 4  # 4 full steps before this Taylor streak
+    cache_dic.full_count = 4
     return cache_dic, current
 
 
 # ===========================================================================
-# Test 1: Snapshot round-trip
+# Test 1: block_input_hidden stored in event
 # ===========================================================================
 
 
-def test_snapshot_round_trip():
-    """Snapshot → restore preserves key cache fields."""
+def test_block_input_stored():
+    """make_speca_event stores block_input_hidden in the event."""
     print("=" * 60)
-    print("Test 1: snapshot round-trip")
+    print("Test 1: block_input_hidden stored in event")
     print("=" * 60)
 
-    cache_dic, current = _build_speca_state(num_layers=4, num_steps=10)
+    torch.manual_seed(10)
+    block_input = torch.randn(1, 4, 16)
+    true_feat = torch.randn(1, 4, 16)
+    pred_feat = torch.randn(1, 4, 16)
+    latent = torch.randn(1, 4, 4, 4)
 
-    # Snapshot
-    cache_snap = _snapshot_cache_dic_final(cache_dic)
-    current_snap = _snapshot_current(current)
+    event = make_speca_event(
+        layer_id=2, timestep_val=500,
+        step_idx=5, num_steps=10,
+        predicted_hidden=pred_feat,
+        full_hidden=true_feat,
+        error_value=0.05,
+        error_metric="cosine_similarity",
+        model="dit", base_model_version="stub-v1",
+        module="block",
+        latent_input=latent,
+        class_labels=torch.tensor([3]),
+        block_input_hidden=block_input,
+    )
 
-    # Verify snapshot structure
-    assert "cache" in cache_snap
-    assert "check_layer" in cache_snap
-    assert "error_metric" in cache_snap
-    assert len(cache_snap["cache"]) == 4  # num_layers
+    assert event.block_input_hidden is not None, "block_input_hidden should be stored"
+    assert event.block_input_hidden.shape == (1, 4, 16), \
+        f"shape mismatch: {event.block_input_hidden.shape}"
+    assert event.block_input_hidden.dtype == torch.float16, \
+        "block_input_hidden should be fp16"
 
-    # Verify current snapshot
-    assert current_snap["step"] == current.step
-    assert current_snap["type"] == current.type
-    assert current_snap["activated_steps"] == current.activated_steps
-    assert current_snap["num_steps"] == current.num_steps
+    # Without block_input_hidden
+    event2 = make_speca_event(
+        layer_id=2, timestep_val=500,
+        step_idx=5, num_steps=10,
+        predicted_hidden=pred_feat,
+        full_hidden=true_feat,
+        error_value=0.05,
+        error_metric="cosine_similarity",
+        model="dit", base_model_version="stub-v1",
+        module="block",
+    )
+    assert event2.block_input_hidden is None, \
+        "block_input_hidden should be None when not provided"
 
-    # Restore and verify cache tensors
-    restored_cache = _restore_cache_dic(cache_snap, num_layers=4)
-    for layer_idx in range(4):
-        for module in ['attn', 'mlp']:
-            orig = cache_dic.cache[-1][layer_idx][module]
-            rest = restored_cache.cache[-1][layer_idx][module]
-            assert len(orig) == len(rest), f"layer {layer_idx} {module}: length mismatch"
-            for k in range(len(orig)):
-                if isinstance(orig[k], torch.Tensor):
-                    # Snapshot is fp16, restored needs casting back for comparison
-                    rest_k = rest[k].to(dtype=orig[k].dtype)
-                    assert torch.allclose(orig[k], rest_k, atol=1e-3), \
-                        f"layer {layer_idx} {module} order {k}: tensor mismatch"
+    # to_dict includes the flag
+    d = event.to_dict()
+    assert d["has_block_input_hidden"] is True
+    d2 = event2.to_dict()
+    assert d2["has_block_input_hidden"] is False
 
-    # Restore current
-    restored_current = _restore_current(current_snap)
-    assert restored_current.step == current.step
-    assert restored_current.type == current.type
-    assert restored_current.activated_steps == current.activated_steps
-
-    print("  ✓ snapshot round-trip preserves all key fields")
+    print("  block_input_hidden stored and serialized correctly")
 
 
 # ===========================================================================
-# Test 2: SpecA forward restore produces consistent output
+# Test 2: Per-block replay differs from vanilla → loss > 0 at no-op
 # ===========================================================================
 
 
-def test_speca_forward_restore():
-    """_run_transformer_forward with snapshot produces same output as direct
-    SpecA forward (within numerical tolerance)."""
+def test_per_block_replay_loss_positive():
+    """Per-block replay on Taylor-predicted input gives loss > 0 at LoRA no-op.
+
+    The block_input_hidden comes from the SpecA Taylor path (accumulated
+    prediction errors from prior layers). Running the block on this input
+    produces a different output than the vanilla forward, giving non-zero
+    supervised loss even when LoRA B=0.
+    """
     print("=" * 60)
-    print("Test 2: SpecA forward restore consistency")
+    print("Test 2: per-block replay loss > 0 at no-op")
     print("=" * 60)
 
     torch.manual_seed(42)
@@ -287,157 +331,71 @@ def test_speca_forward_restore():
 
     cache_dic, current = _build_speca_state(num_layers=num_layers,
                                              num_steps=num_steps)
-
-    latent = torch.randn(2, 4, 4, 4)
-    timestep = torch.tensor([500, 500])
-    class_labels = torch.tensor([0, 1])
-
-    # Snapshot BEFORE the forward call (speca_cal_type mutates state)
-    cache_snap = _snapshot_cache_dic_final(cache_dic)
-    current_snap = _snapshot_current(current)
-
-    # Direct SpecA forward (mutates current and cache_dic)
-    with torch.no_grad():
-        direct_out = transformer(
-            latent, timestep=timestep, class_labels=class_labels,
-            current=current, cache_dic=cache_dic, return_dict=False,
-        )[0]
-
-    # Restore from snapshot and run
-    _move_snapshot_tensors_to(cache_snap, latent.device, latent.dtype)
-    with torch.no_grad():
-        restored_out = _run_transformer_forward(
-            transformer, latent, timestep,
-            class_labels=class_labels,
-            speca_cache_snapshot=cache_snap,
-            speca_current_snapshot=current_snap,
-        )
-    restored_out = restored_out[0] if isinstance(restored_out, tuple) else restored_out
-
-    max_diff = (direct_out - restored_out).abs().max().item()
-    # fp16 round-trip introduces up to ~1e-3 error per element;
-    # Taylor prediction compounds this across layers
-    assert max_diff < 0.5, \
-        f"SpecA forward mismatch: max diff = {max_diff:.6f}"
-
-    print(f"  max diff = {max_diff:.8f}  "
-          f"✓ SpecA forward restore consistent")
-
-
-# ===========================================================================
-# Test 3: No-op starting point loss > 0
-# ===========================================================================
-
-
-def test_noop_loss_positive():
-    """The SpecA forward produces different output than vanilla, providing
-    a training signal even at LoRA no-op.
-
-    This is the core test for the signal-source fix. The SpecA forward
-    produces Taylor-predicted hidden states (which contain prediction
-    errors), while the vanilla forward produces true hidden states.
-    The final transformer outputs differ, meaning the supervised loss
-    comparing the SpecA output against the true_feature target would
-    be > 0 at LoRA no-op.
-
-    We verify by comparing the final transformer outputs and the
-    block-level hidden states at check_layer.
-    """
-    print("=" * 60)
-    print("Test 3: no-op starting point loss > 0")
-    print("=" * 60)
-
-    torch.manual_seed(100)
-    num_layers, num_steps = 4, 10
-    transformer = _StubSpecATransformer(num_layers=num_layers, dim=16, seq=4)
-    transformer.eval()
-
-    cache_dic, current = _build_speca_state(num_layers=num_layers,
-                                             num_steps=num_steps)
+    check_layer = cache_dic.check_layer
 
     latent = torch.randn(2, 4, 4, 4)
     cl = torch.tensor([3, 7])
 
-    # Run vanilla forward → true output
+    # Run SpecA Taylor forward to capture block_input at check_layer
+    block_input_captured = {}
+    def _input_hook(mod, inp):
+        block_input_captured['inp'] = inp[0].detach().clone()
+    h = transformer.transformer_blocks[check_layer].register_forward_pre_hook(
+        _input_hook)
     with torch.no_grad():
-        vanilla_out = transformer(
-            latent, timestep=torch.tensor([current.step]),
-            class_labels=cl, current=None, cache_dic=None,
-            return_dict=False)[0]
+        transformer(latent, timestep=torch.tensor([current.step]),
+                    class_labels=cl, current=current, cache_dic=cache_dic,
+                    return_dict=False)
+    h.remove()
+    block_input = block_input_captured['inp']
 
-    # Run SpecA forward → Taylor-predicted output
-    # Use the SAME cache_dic/current (snapshot before first forward to avoid mutation)
-    cache_snap = _snapshot_cache_dic_final(cache_dic)
-    current_snap = _snapshot_current(current)
-
+    # Also run vanilla forward and capture block output at check_layer
+    target_captured = {}
+    def _target_hook(mod, inp, out):
+        target_captured['out'] = out.detach().clone()
+    h = transformer.transformer_blocks[check_layer].register_forward_hook(
+        _target_hook)
     with torch.no_grad():
-        speca_out = transformer(
-            latent, timestep=torch.tensor([current.step]),
-            class_labels=cl, current=current, cache_dic=cache_dic,
-            return_dict=False)[0]
+        transformer(latent, timestep=torch.tensor([current.step]),
+                    class_labels=cl, current=None, cache_dic=None,
+                    return_dict=False)
+    h.remove()
+    vanilla_output = target_captured['out']
 
-    # The outputs differ because Taylor predictions accumulate errors
-    diff = (vanilla_out - speca_out).abs().max().item()
-    assert diff > 1e-6, \
-        f"SpecA and vanilla outputs should differ, max diff = {diff:.2e}"
-
-    # This means: if compute_training_loss uses the SpecA forward,
-    # the hook-captured output at any layer will differ from what
-    # the vanilla forward would produce. When compared against the
-    # event.true_feature (from original recording), the SpecA forward
-    # output at check_layer will differ because:
-    #   - SpecA path: block output uses Taylor-predicted input
-    #   - Event true_feature: block output from original (also Taylor input, but recorded)
-    #   - At no-op with snapshot: these ARE the same at check_layer
-    #   - But the OVERALL hidden state trajectory is different from vanilla
-    # The key: before the fix, compute_training_loss ran vanilla forward
-    # which made lora_hidden ≠ true_feature at check_layer (because
-    # vanilla true_input ≠ taylor_input). After the fix, the forward
-    # takes the SpecA path, so the direction is correct (LoRA should
-    # learn to make SpecA output closer to vanilla/true).
-
-    # Verify the snapshot round-trip works for the forward restore
-    _move_snapshot_tensors_to(cache_snap, latent.device, latent.dtype)
+    # Per-block replay: run check_layer block on Taylor-predicted input
     with torch.no_grad():
-        restored_out = _run_transformer_forward(
-            transformer, latent, torch.tensor([current.step]),
+        replay_output = _run_block_dit(
+            transformer.transformer_blocks[check_layer],
+            block_input,
+            timestep=torch.tensor([current.step]),
             class_labels=cl,
-            speca_cache_snapshot=cache_snap,
-            speca_current_snapshot=current_snap,
+            dtype=block_input.dtype,
         )
-    restored_out = restored_out[0] if isinstance(restored_out, tuple) else restored_out
 
-    max_restore_diff = (speca_out - restored_out).abs().max().item()
-    assert max_restore_diff < 0.5, \
-        f"Restored forward should match direct SpecA, max diff = {max_restore_diff:.6f}"
+    # The replay output should differ from vanilla
+    diff = (replay_output - vanilla_output).abs().max().item()
+    mse = F.mse_loss(replay_output, vanilla_output).item()
+    assert mse > 1e-6, f"Per-block replay should differ from vanilla, MSE={mse:.2e}"
 
-    # Core assertion: the SpecA forward differs from vanilla
-    mse = F.mse_loss(vanilla_out, speca_out).item()
-    assert mse > 1e-6, f"SpecA vs vanilla MSE should be > 0, got {mse:.2e}"
-
-    print(f"  max |specA - vanilla| = {diff:.6f}")
-    print(f"  MSE(specA, vanilla)  = {mse:.6f}")
-    print(f"  restore consistency   = {max_restore_diff:.8f}")
-    print(f"  ✓ SpecA path produces different output from vanilla → loss > 0 at no-op")
+    print(f"  max |replay - vanilla| = {diff:.6f}")
+    print(f"  MSE(replay, vanilla)  = {mse:.6f}")
+    print(f"  per-block replay differs from vanilla → loss > 0 at no-op")
 
 
 # ===========================================================================
-# Test 4: Gradient flow through LoRA B
+# Test 3: Gradient flows to LoRA B through per-block replay
 # ===========================================================================
 
 
 def test_gradient_flows_to_lora_b():
-    """Verify LoRA B receives gradient from the SpecA Taylor path.
+    """Per-block replay with LoRA gives non-zero gradient to LoRA B.
 
-    In a SpecA Taylor step, all blocks use cached Taylor predictions
-    EXCEPT the check_layer block (which is recomputed during do_check).
-    The check_layer block receives Taylor-predicted input (accumulated
-    from prior layers) which differs from the vanilla forward's input.
-    With LoRA attached, the block output has grad connectivity back to
-    LoRA B, so loss.backward() gives non-zero gradient.
+    The block runs on Taylor-predicted input (block_input_hidden), and
+    the target is the vanilla output. LoRA modifies the block's submodules,
+    so gradient flows through them.
     """
     print("=" * 60)
-    print("Test 4: gradient flows to LoRA B")
+    print("Test 3: gradient flows to LoRA B")
     print("=" * 60)
 
     torch.manual_seed(200)
@@ -449,48 +407,52 @@ def test_gradient_flows_to_lora_b():
     n_lora = sum(len(d) for d in lora_wrappers.values())
     transformer.train()
 
-    # Build a SpecA state for a Taylor step with do_check at check_layer
-    cache_dic, current = _build_speca_state(
-        num_layers=num_layers, num_steps=num_steps)
+    cache_dic, current = _build_speca_state(num_layers=num_layers,
+                                             num_steps=num_steps)
     check_layer = cache_dic.check_layer
 
     latent = torch.randn(2, 4, 4, 4)
     cl = torch.tensor([3, 7])
-    timestep = torch.tensor([current.step])
 
-    # Target: vanilla forward output at check_layer (detached)
+    # Capture block_input from SpecA Taylor path
+    block_input_captured = {}
+    def _input_hook(mod, inp):
+        block_input_captured['inp'] = inp[0].clone()
+    h = transformer.transformer_blocks[check_layer].register_forward_pre_hook(
+        _input_hook)
+    with torch.no_grad():
+        transformer(latent, timestep=torch.tensor([current.step]),
+                    class_labels=cl, current=current, cache_dic=cache_dic,
+                    return_dict=False)
+    h.remove()
+    block_input = block_input_captured['inp']
+
+    # Capture vanilla target
     target_captured = {}
     def _target_hook(mod, inp, out):
         target_captured['out'] = out.detach().clone()
     h = transformer.transformer_blocks[check_layer].register_forward_hook(
         _target_hook)
     with torch.no_grad():
-        transformer(latent, timestep=timestep, class_labels=cl,
-                    current=None, cache_dic=None)
+        transformer(latent, timestep=torch.tensor([current.step]),
+                    class_labels=cl, current=None, cache_dic=None,
+                    return_dict=False)
     h.remove()
     target = target_captured['out']
 
-    # SpecA Taylor forward with LoRA — capture block output at check_layer
-    speca_captured = {}
-    def _speca_hook(mod, inp, out):
-        speca_captured['out'] = out
-    h = transformer.transformer_blocks[check_layer].register_forward_hook(
-        _speca_hook)
-    transformer(latent, timestep=timestep, class_labels=cl,
-                current=current, cache_dic=cache_dic)
-    h.remove()
+    # Per-block replay with LoRA (with grad)
+    lora_hidden = _run_block_dit(
+        transformer.transformer_blocks[check_layer],
+        block_input,
+        timestep=torch.tensor([current.step]),
+        class_labels=cl,
+        dtype=block_input.dtype,
+    )
 
-    lora_hidden = speca_captured['out']
-
-    # SpecA check_layer gets Taylor-predicted input; vanilla gets true
-    # input → outputs differ → loss > 0
     loss = F.mse_loss(lora_hidden, target)
     assert loss.item() > 1e-8, f"Loss should be > 0, got {loss.item():.2e}"
-
     loss.backward()
 
-    # Check LoRA B gradients (only check_layer block gets gradient
-    # since other blocks use cached Taylor factors)
     lora_b_grads = []
     for layer_dict in lora_wrappers.values():
         for name, lora in layer_dict.items():
@@ -505,24 +467,40 @@ def test_gradient_flows_to_lora_b():
     max_grad = max(lora_b_grads) if lora_b_grads else 0
     print(f"  loss = {loss.item():.6f}")
     print(f"  LoRA B params with grad: {len(lora_b_grads)}/{n_lora}")
-    print(f"  max LoRA B grad norm = {max_grad:.8f}  ✓ gradient flows to LoRA B")
+    print(f"  max LoRA B grad norm = {max_grad:.8f}")
+    print(f"  gradient flows to LoRA B")
 
 
 # ===========================================================================
-# Test 5: Backward compatibility — no snapshot → vanilla forward
+# Test 4: Backward compatibility — no block_input_hidden → vanilla forward
 # ===========================================================================
 
 
-def test_backward_compat_no_snapshot():
-    """Events without snapshots fall back to vanilla forward (no crash)."""
+def test_backward_compat_no_block_input():
+    """Events without block_input_hidden fall back to vanilla forward."""
     print("=" * 60)
-    print("Test 5: backward compat — no snapshot")
+    print("Test 4: backward compat — no block_input_hidden")
     print("=" * 60)
 
     torch.manual_seed(300)
     num_layers, num_steps = 4, 10
     transformer = _StubSpecATransformer(num_layers=num_layers, dim=16, seq=4)
     transformer.train()
+
+    # The stub's norm1.emb is a plain nn.Linear that doesn't accept
+    # hidden_dtype (the real CombinedTimestepLabelEmbeddings does).
+    # Patch it to accept and ignore the extra args so the fallback vanilla
+    # forward in compute_training_loss doesn't crash.
+    for block in transformer.transformer_blocks:
+        orig_emb = block.norm1.emb
+        class _PatchedEmb(nn.Module):
+            def __init__(self, inner):
+                super().__init__()
+                self.inner = inner
+            def forward(self, *args, **kwargs):
+                # Only pass the first positional arg (timestep) to nn.Linear
+                return self.inner(args[0].float().reshape(-1, 1))
+        block.norm1.emb = _PatchedEmb(orig_emb)
 
     latent = torch.randn(2, 4, 4, 4)
     cl = torch.tensor([0, 1])
@@ -539,7 +517,7 @@ def test_backward_compat_no_snapshot():
         module="block",
         latent_input=latent,
         class_labels=cl,
-        # cache_dic/current NOT passed → no snapshot
+        # block_input_hidden NOT passed → no snapshot
     )
 
     with warnings.catch_warnings():
@@ -553,7 +531,7 @@ def test_backward_compat_no_snapshot():
         )
 
     assert torch.isfinite(loss).all(), f"loss not finite: {loss}"
-    print(f"  loss = {loss.item():.6f}  ✓ vanilla forward fallback works")
+    print(f"  loss = {loss.item():.6f}  vanilla forward fallback works")
 
 
 # ===========================================================================
@@ -562,11 +540,10 @@ def test_backward_compat_no_snapshot():
 
 
 if __name__ == "__main__":
-    test_snapshot_round_trip()
-    test_speca_forward_restore()
-    test_noop_loss_positive()
+    test_block_input_stored()
+    test_per_block_replay_loss_positive()
     test_gradient_flows_to_lora_b()
-    test_backward_compat_no_snapshot()
+    test_backward_compat_no_block_input()
     print("\n" + "=" * 60)
     print("All signal-source fix tests passed!")
     print("=" * 60)

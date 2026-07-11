@@ -160,7 +160,8 @@ class StratifiedReplayBuffer:
                  num_layers: int = 28,
                  num_timestep_buckets: int = 3,
                  batch_ratio: Optional[Dict[str, float]] = None,
-                 max_encoder_hidden_states_events: int = 200):
+                 max_encoder_hidden_states_events: int = 200,
+                 max_block_input_events: int = 500):
         """
         Parameters
         ----------
@@ -177,6 +178,10 @@ class StratifiedReplayBuffer:
             (内存安全阀; PixArt 每个 ~600KB fp16)。超出后新 event 的
             encoder_hidden_states 会被丢弃, latent_input / class_labels 仍保留。
             设为 0 可完全禁用 encoder_hidden_states 存储。
+        max_block_input_events : int
+            全缓冲区允许携带 block_input_hidden 的 event 数量上限
+            (内存安全阀; ~590KB/event fp16)。超出后新 event 的
+            block_input_hidden 会被丢弃, 退化为 vanilla forward fallback。
         """
         self.capacity_per_stratum = capacity_per_stratum
         self.num_layers = num_layers
@@ -185,6 +190,7 @@ class StratifiedReplayBuffer:
             "hard_negative": 0.5, "normal": 0.3, "anchor": 0.2,
         }
         self.max_ehs_events = max_encoder_hidden_states_events
+        self.max_block_input_events = max_block_input_events
 
         # (layer_id, timestep_bucket) → _Stratum
         self._strata: Dict[Tuple[int, int], _Stratum] = {}
@@ -195,6 +201,8 @@ class StratifiedReplayBuffer:
         # 上限估计值 (reservoir 替换时不去减, 是 conservative upper bound)
         self._ehs_count = 0
         self._ehs_dropped = 0  # 因超限被丢弃的次数
+        self._bi_count = 0
+        self._bi_dropped = 0
 
         # Phase 2: 推理线程写, 训练线程读 — 单把粗粒度锁保护全部操作。
         # 简单优先: buffer 操作本身是 O(1)~O(strata) 级别, 锁竞争极轻;
@@ -244,6 +252,13 @@ class StratifiedReplayBuffer:
                     self._ehs_dropped += 1
                 else:
                     self._ehs_count += 1
+
+            if event.block_input_hidden is not None:
+                if self._bi_count >= self.max_block_input_events:
+                    event.block_input_hidden = None
+                    self._bi_dropped += 1
+                else:
+                    self._bi_count += 1
 
             stratum = self._get_or_create_stratum(
                 event.layer_id, event.timestep_bucket)

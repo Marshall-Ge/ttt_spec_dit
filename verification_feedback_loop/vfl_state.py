@@ -180,8 +180,7 @@ def record_speca_event(layer_id: int,
                        latent_input: "Optional[torch.Tensor]" = None,
                        class_labels: "Optional[torch.Tensor]" = None,
                        encoder_hidden_states: "Optional[torch.Tensor]" = None,
-                       cache_dic=None,
-                       current=None):
+                       block_input_hidden: "Optional[torch.Tensor]" = None):
     """Record a SpecA verification event to the global VFL buffer + calibrator.
 
     Called from within the SpecA Taylor-path error probe (check_layer).
@@ -194,10 +193,10 @@ def record_speca_event(layer_id: int,
       * cal set, buf set    → full VerificationEvent + buffer write +
                               calibrator update (--vfl with training).
 
-    cache_dic / current: SpecA state objects passed through to
-    make_speca_event for snapshot creation (enables SpecA forward
-    replay during L3 training). None for TeaCache-only or
-    calibrate-only mode.
+    block_input_hidden: the hidden_states arriving at check_layer before
+    the block computes (Taylor-predicted path). Stored in the event for
+    per-block replay during L3 training (~590KB/event vs ~99MB for
+    full SpecA cache snapshot).
     """
     cal = _vfl_calibrator
     buf = _vfl_buffer
@@ -226,8 +225,7 @@ def record_speca_event(layer_id: int,
         encoder_hidden_states=encoder_hidden_states,
         sample_id=_vfl_sample_id,
         timestep_actual=_vfl_timestep_actual,
-        cache_dic=cache_dic,
-        current=current,
+        block_input_hidden=block_input_hidden,
     )
     vh.record_event(event, buffer=buf)
     if cal is not None:

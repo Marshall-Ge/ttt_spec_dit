@@ -72,7 +72,7 @@ def _vfl_record_speca_event(layer_id, timestep_val, step_idx, num_steps,
                               predicted_hidden, full_hidden, error_value,
                               module_name="",
                               latent_input=None, class_labels=None,
-                              cache_dic=None, current=None):
+                              block_input_hidden=None):
     """Record SpecA verification events for DiT.
 
     Splits batch tensors into per-sample events.  Without this a single
@@ -89,8 +89,9 @@ def _vfl_record_speca_event(layer_id, timestep_val, step_idx, num_steps,
     scalar updates over a 1000-image run — the instrumentation overhead
     becomes invisible.
 
-    cache_dic / current: SpecA state passed to record_speca_event for
-    snapshot creation. Only used when buffer is registered (full path).
+    block_input_hidden: the hidden_states before the check_layer block
+    computes (Taylor-predicted path). Passed through for per-block
+    replay during L3 training.
     """
     # ---- calibrate-only path: no buffer registered → one scalar update ----
     if get_vfl_buffer() is None:
@@ -125,8 +126,8 @@ def _vfl_record_speca_event(layer_id, timestep_val, step_idx, num_steps,
             model="dit", module_name=module_name,
             latent_input=lat[i:i + 1] if lat is not None else None,
             class_labels=cl[i:i + 1] if cl is not None else None,
-            cache_dic=cache_dic,
-            current=current,
+            block_input_hidden=(block_input_hidden[i:i + 1]
+                                if block_input_hidden is not None else None),
         )
 
 
@@ -364,8 +365,10 @@ class DiTTransformer2D(nn.Module):
                 distance = current.step - current.activated_steps[-1]
                 check_layer = cache_dic.check_layer
                 do_check = (layer_idx == check_layer and cache_dic.check)
+                _block_input = None
                 if do_check:
-                    full_hidden = hidden_states.clone()
+                    _block_input = hidden_states.clone()
+                    full_hidden = _block_input
 
                 hidden_states = cache_step_dit(
                     hidden_states,
@@ -404,8 +407,7 @@ class DiTTransformer2D(nn.Module):
                         module_name="block",
                         latent_input=_vfl_latent_input,
                         class_labels=class_labels,
-                        cache_dic=cache_dic,
-                        current=current,
+                        block_input_hidden=_block_input,
                     )
 
         # ---- TeaCache: save residual after blocks complete ----

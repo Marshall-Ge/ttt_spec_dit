@@ -17,8 +17,10 @@
     L_total = L_supervised + λ_curv * L_curvature + λ_anchor * L_anchor
 
 其中:
-  * ``L_supervised`` — 对每个 verification event, 重跑 forward (带 LoRA),
-    用 hook 捕获目标层输出, MSE 逼近 ``event.true_feature`` (真实计算结果)。
+  * ``L_supervised`` — 对每个 verification event, 用 block_input_hidden
+    直接重跑目标 block (with LoRA), MSE 逼近 ``event.true_feature``。
+    block_input_hidden 来自 SpecA Taylor path (与 vanilla 不同), 保证
+    LoRA no-op 起点 loss > 0。
   * ``L_curvature``  — 对同 (sample, layer) 的时序 hidden 序列拟合多项式,
     惩罚残差, 鼓励轨迹光滑可外推。
   * ``L_anchor``     — 标准 diffusion loss, 在真实 anchor 样本上计算,
@@ -155,94 +157,71 @@ def trajectory_curvature_loss_from_buffer(
 
 
 # ===========================================================================
-# Internal helpers for the buffer-driven training loss
+# Per-block replay for supervised loss
 # ===========================================================================
 
 
-def _restore_cache_dic(speca_cache_snapshot: dict, num_layers: int):
-    """Rebuild a SpecACache from a snapshot for SpecA forward replay.
+def _run_block_dit(block, block_input, timestep, class_labels, dtype):
+    """Run a single DiT block (adaLN-Zero) with LoRA on block_input.
 
-    Creates a minimal SpecACache via speca_init, then overwrites the
-    cache[-1] slot with the snapshot's cached Taylor factors (moved
-    back to device/dtype) and restores runtime counters so
-    speca_cal_type makes the same decision on replay.
+    Replicates the inline submodule calls from dit.py's block loop.
+    Returns the block output with grad connectivity to LoRA params.
     """
-    from accelerators.speca import speca_init
-    num_steps = 50  # placeholder; actual step is set per-event
-    cache_dic, _ = speca_init(
-        num_steps=num_steps,
-        base_threshold=speca_cache_snapshot.get("base_threshold", 0.01),
-        decay_rate=speca_cache_snapshot.get("decay_rate", 0.01),
-        min_taylor_steps=speca_cache_snapshot.get("min_taylor_steps", 3),
-        max_taylor_steps=speca_cache_snapshot.get("max_taylor_steps", 5),
-        num_layers=num_layers,
-        error_metric=speca_cache_snapshot.get("error_metric", "cosine_similarity"),
-        check_layer=speca_cache_snapshot.get("check_layer", num_layers - 1),
+    norm_hidden, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.norm1(
+        block_input, timestep=timestep, class_labels=class_labels,
+        hidden_dtype=dtype,
     )
-    # Overwrite cache[-1] with snapshot data
-    snapshot_cache = speca_cache_snapshot["cache"]
-    for layer_idx, layer_data in snapshot_cache.items():
-        if layer_idx not in cache_dic.cache[-1]:
-            continue
-        for module_name, taylor_list in layer_data.items():
-            cache_dic.cache[-1][layer_idx][module_name] = list(taylor_list)
-    # Restore runtime counters
-    cache_dic.taylor_step_counter = speca_cache_snapshot.get(
-        "taylor_step_counter", 1)
-    cache_dic.check = speca_cache_snapshot.get("check", False)
-    cache_dic.full_count = speca_cache_snapshot.get("full_count", 0)
-    cache_dic.cache_counter = speca_cache_snapshot.get("cache_counter", 0)
-    return cache_dic
+    attn_out = block.attn1(norm_hidden)
+    x = block_input + gate_msa.unsqueeze(1) * attn_out
+    norm_ff = block.norm3(x)
+    modulated_ff = norm_ff * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+    ff_out = block.ff(modulated_ff)
+    x = x + gate_mlp.unsqueeze(1) * ff_out
+    return x
 
 
-def _restore_current(speca_current_snapshot: dict):
-    """Rebuild a SpecAState from a snapshot for SpecA forward replay."""
-    from accelerators.speca import SpecAState
-    num_steps = speca_current_snapshot["num_steps"]
-    current = SpecAState(num_steps=num_steps)
-    current.step = speca_current_snapshot["step"]
-    current.type = speca_current_snapshot["type"]
-    current.last_type = speca_current_snapshot.get("last_type", "None")
-    current.module = speca_current_snapshot["module"]
-    current.layer = speca_current_snapshot["layer"]
-    current.activated_steps = list(speca_current_snapshot["activated_steps"])
-    current.last_layer_error = speca_current_snapshot.get(
-        "last_layer_error", None)
-    return current
+def _run_block_pixart(block, block_input, timestep_emb, encoder_hidden_states,
+                      encoder_attention_mask):
+    """Run a single PixArt block (ada_norm_single) with LoRA on block_input.
 
+    Replicates the inline submodule calls from pixart.py's block loop.
+    Returns the block output with grad connectivity to LoRA params.
+    """
+    B = block_input.shape[0]
+    proj = (block.scale_shift_table[None]
+            + timestep_emb.reshape(B, 6, -1))
+    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
+        proj.chunk(6, dim=1)
 
-def _move_snapshot_tensors_to(snapshot: dict, device, dtype):
-    """Move all tensors in a speca_cache_snapshot to device/dtype in-place."""
-    if snapshot is None:
-        return
-    cache = snapshot.get("cache", {})
-    for layer_idx, layer_data in cache.items():
-        for module_name, taylor_list in layer_data.items():
-            if isinstance(taylor_list, list):
-                snapshot["cache"][layer_idx][module_name] = [
-                    t.to(device=device, dtype=dtype) if isinstance(t, torch.Tensor) else t
-                    for t in taylor_list
-                ]
+    norm_hidden = block.norm1(block_input)
+    modulated = norm_hidden * (1 + scale_msa) + shift_msa
+    attn1_out = block.attn1(modulated)
+    x = block_input + gate_msa * attn1_out
+
+    attn2_out = block.attn2(
+        x,
+        encoder_hidden_states=encoder_hidden_states,
+        attention_mask=encoder_attention_mask,
+    )
+    x = x + attn2_out
+
+    norm_ff = block.norm2(x)
+    modulated_ff = norm_ff * (1 + scale_mlp) + shift_mlp
+    ff_out = block.ff(modulated_ff)
+    x = x + gate_mlp * ff_out
+    return x
 
 
 def _run_transformer_forward(transformer,
                              latent: torch.Tensor,
                              timestep: torch.Tensor,
                              class_labels: Optional[torch.Tensor] = None,
-                             encoder_hidden_states: Optional[torch.Tensor] = None,
-                             speca_cache_snapshot: Optional[dict] = None,
-                             speca_current_snapshot: Optional[dict] = None):
-    """Dispatch a forward call to DiT or PixArt, optionally with SpecA state.
+                             encoder_hidden_states: Optional[torch.Tensor] = None):
+    """Dispatch a vanilla forward call to DiT or PixArt based on inputs.
 
-    When speca_cache_snapshot and speca_current_snapshot are both provided,
-    the forward takes the SpecA Taylor path (using the cached Taylor factors
-    to predict block outputs) instead of the vanilla full-block path. This
-    is critical for L3 training: the LoRA must learn to correct Taylor
-    prediction errors, so its input must come from the SpecA forward
-    (which contains those errors), while the target is the base recomputation
-    (true_feature).
-
-    When snapshots are None, falls back to vanilla forward (backward compat).
+    Both forwards run with current=None, cache_dic=None, teacache_state=None
+    so they take the vanilla path (full 28-block stack). LoRA-modified
+    submodules still apply because LoRA is attached to the block params.
 
     Side effect: sets the global t_emb cache so time-conditioned LoRA layers
     can read it without recomputing per Linear. Cleared in ``finally`` to
@@ -253,9 +232,6 @@ def _run_transformer_forward(transformer,
         compute_timestep_emb_for_transformer,
     )
 
-    use_speca = (speca_cache_snapshot is not None
-                 and speca_current_snapshot is not None)
-
     hidden_dtype = latent.dtype
     t_emb = compute_timestep_emb_for_transformer(
         transformer, timestep, class_labels=class_labels,
@@ -264,30 +240,6 @@ def _run_transformer_forward(transformer,
     if t_emb is not None:
         set_lora_t_emb(t_emb)
     try:
-        if use_speca:
-            num_layers = len(transformer.transformer_blocks)
-            _move_snapshot_tensors_to(speca_cache_snapshot,
-                                      latent.device, latent.dtype)
-            cache_dic = _restore_cache_dic(speca_cache_snapshot, num_layers)
-            current = _restore_current(speca_current_snapshot)
-            if encoder_hidden_states is not None:
-                # PixArt SpecA forward
-                return transformer(
-                    latent,
-                    encoder_hidden_states=encoder_hidden_states,
-                    timestep=timestep,
-                    current=current, cache_dic=cache_dic,
-                    return_dict=False,
-                )
-            # DiT SpecA forward
-            return transformer(
-                latent,
-                timestep=timestep,
-                class_labels=class_labels,
-                current=current, cache_dic=cache_dic,
-                return_dict=False,
-            )
-        # vanilla path (no SpecA state)
         if encoder_hidden_states is not None:
             # PixArt signature: forward(hidden_states, encoder_hidden_states, timestep, ...)
             return transformer(
@@ -336,14 +288,20 @@ def compute_training_loss(
 ):
     """Compute the full L3 training loss with proper gradient connectivity.
 
-    Replaces the previous random-noise version: now drives LoRA training
-    from real buffer events with three loss terms — supervised MSE on
-    event.true_feature, curvature on per-(sample, layer) trajectories, and
-    a standard diffusion anchor on real anchor samples.
-
     L_total = L_supervised
             + λ_curv * L_curvature
             + λ_anchor * L_anchor
+
+    Supervised loss uses per-block replay: when an event has
+    block_input_hidden (the Taylor-predicted hidden arriving at
+    check_layer), we run the target block directly on that input
+    (with LoRA) instead of the full 28-block transformer forward.
+    This avoids the ~99MB/event SpecA cache snapshot and gives
+    the correct training signal (loss > 0 at LoRA no-op because
+    block_input_hidden differs from the vanilla forward's input).
+
+    For events without block_input_hidden (TeaCache or old events),
+    fall back to vanilla full transformer forward + hooks.
 
     Parameters
     ----------
@@ -351,8 +309,8 @@ def compute_training_loss(
         The transformer with LoRA adapters attached. Must be in train mode
         for the LoRA layers, but can have backbone frozen.
     curvature_events : list of VerificationEvent
-        Events with ``latent_input`` / ``class_labels`` / ``encoder_hidden_states``
-        populated. Their ``true_feature`` is the supervised target.
+        Events with replay context populated. Their ``true_feature`` is the
+        supervised target.
     anchor_samples : list of AnchorSample, optional
         Real data anchors for the standard diffusion loss term.
     lambda_curvature : float
@@ -384,14 +342,42 @@ def compute_training_loss(
                             requires_grad=True)
 
     # ----------------------------------------------------------------------
-    # 1. Register forward hooks on the layers we need to capture.
+    # 1. Determine model type from transformer attributes.
+    # ----------------------------------------------------------------------
+    is_pixart = hasattr(transformer, 'adaln_single')
+
+    # Pre-compute timestep_emb for PixArt (shared across blocks per step).
+    # For DiT, block.norm1 computes it internally from (timestep, class_labels).
+    _pixart_t_emb_cache = {}
+
+    def _get_pixart_t_emb(t_val, hidden_dtype):
+        key = int(t_val[0].item()) if t_val.numel() > 0 else 0
+        if key not in _pixart_t_emb_cache:
+            from verification_feedback_loop.lora_adapter import (
+                set_lora_t_emb, clear_lora_t_emb,
+                compute_timestep_emb_for_transformer,
+            )
+            t_emb = compute_timestep_emb_for_transformer(
+                transformer, t_val, hidden_dtype=hidden_dtype)
+            if t_emb is not None:
+                set_lora_t_emb(t_emb)
+            _pixart_t_emb_cache[key] = (t_emb.detach().clone()
+                                        if t_emb is not None else None)
+        return _pixart_t_emb_cache[key]
+
+    # ----------------------------------------------------------------------
+    # 2. Register forward hooks for events without block_input_hidden
+    #    (fallback vanilla path). Events WITH block_input_hidden use
+    #    per-block replay — no hooks needed.
     # ----------------------------------------------------------------------
     num_layers = len(transformer.transformer_blocks)
-    target_layers = set()
+    fallback_layers = set()
     for e in curvature_events:
+        if getattr(e, "block_input_hidden", None) is not None:
+            continue
         if getattr(e, "latent_input", None) is None:
             continue
-        target_layers.add(_resolve_hook_layer(e, num_layers))
+        fallback_layers.add(_resolve_hook_layer(e, num_layers))
 
     captured: dict = {}
     hooks: list = []
@@ -401,78 +387,97 @@ def compute_training_loss(
             captured[lid] = out
         return _hook
 
-    for lid in target_layers:
+    for lid in fallback_layers:
         block = transformer.transformer_blocks[lid]
         hooks.append(block.register_forward_hook(_make_hook(lid)))
 
     # ----------------------------------------------------------------------
-    # 2. For each event, re-run forward (with LoRA) and capture target output.
+    # 3. For each event, compute supervised loss.
     # ----------------------------------------------------------------------
     supervised_losses: List[torch.Tensor] = []
     # (sample_id, hook_layer) → list of (step_idx, lora_hidden)
     curvature_by_layer: dict = defaultdict(list)
 
-    _warned_no_snapshot = False
+    _warned_no_block_input = False
 
     try:
         for event in curvature_events:
-            if getattr(event, "latent_input", None) is None:
-                continue
+            block_input = getattr(event, "block_input_hidden", None)
 
-            latent = event.latent_input.to(device=device, dtype=dtype)
-            # Prefer the real diffusion timestep (e.g. 981) over the legacy
-            # `timestep` field which historically held step_idx. adaLN
-            # modulation depends on the actual t — using step_idx would
-            # force LoRA to compensate for a wrong modulation signal.
-            t_val = getattr(event, "timestep_actual", 0) or event.timestep
-            timestep = torch.tensor(
-                [t_val], device=device, dtype=torch.long,
-            ).expand(latent.shape[0])
+            if block_input is not None:
+                # Per-block replay: run target block on Taylor-predicted input.
+                block = transformer.transformer_blocks[event.layer_id]
+                inp = block_input.to(device=device, dtype=dtype)
 
-            cl = (event.class_labels.to(device=device)
-                  if event.class_labels is not None else None)
-            enc = (event.encoder_hidden_states.to(device=device, dtype=dtype)
-                   if event.encoder_hidden_states is not None else None)
+                t_val = getattr(event, "timestep_actual", 0) or event.timestep
+                timestep = torch.tensor(
+                    [t_val], device=device, dtype=torch.long,
+                ).expand(inp.shape[0])
 
-            # SpecA snapshot: when present, forward takes the Taylor path
-            # so LoRA sees Taylor-predicted hidden states (which differ from
-            # true_feature) → supervised loss > 0 at no-op starting point.
-            speca_cache_snap = getattr(event, "speca_cache_snapshot", None)
-            speca_current_snap = getattr(event, "speca_current_snapshot", None)
-            if speca_cache_snap is None and not _warned_no_snapshot:
-                import warnings
-                warnings.warn(
-                    "[VFL] curvature_loss: event lacks SpecA snapshot — "
-                    "falling back to vanilla forward (loss may be ≈0 at "
-                    "no-op starting point). This is expected for old "
-                    "checkpoints or TeaCache-only events.")
-                _warned_no_snapshot = True
+                cl = (event.class_labels.to(device=device)
+                      if event.class_labels is not None else None)
+                enc = (event.encoder_hidden_states.to(device=device, dtype=dtype)
+                       if event.encoder_hidden_states is not None else None)
 
-            captured.clear()
-            _run_transformer_forward(
-                transformer, latent, timestep,
-                class_labels=cl, encoder_hidden_states=enc,
-                speca_cache_snapshot=speca_cache_snap,
-                speca_current_snapshot=speca_current_snap,
-            )
+                if is_pixart:
+                    t_emb = _get_pixart_t_emb(timestep, dtype)
+                    enc_mask = None  # PixArt encoder_attention_mask not stored
+                    lora_hidden = _run_block_pixart(
+                        block, inp, t_emb, enc, enc_mask)
+                else:
+                    lora_hidden = _run_block_dit(
+                        block, inp, timestep, cl, dtype)
 
-            hook_layer = _resolve_hook_layer(event, num_layers)
-            if hook_layer not in captured:
-                continue  # hook didn't fire (shouldn't happen, but be safe)
+                target = event.true_feature.to(device=device, dtype=dtype)
+                if target.shape != lora_hidden.shape:
+                    continue
+                supervised_losses.append(F.mse_loss(lora_hidden, target))
+                curvature_by_layer[(event.sample_id, event.layer_id)].append(
+                    (event.step_idx, lora_hidden))
 
-            lora_hidden = captured[hook_layer]
-            target = event.true_feature.to(device=device, dtype=dtype)
-            if target.shape != lora_hidden.shape:
-                # Shape mismatch (e.g. CFG-doubled vs single) — skip safely.
-                continue
+            elif getattr(event, "latent_input", None) is not None:
+                # Fallback: vanilla full forward + hooks (loss ≈ 0 at no-op).
+                if not _warned_no_block_input:
+                    import warnings
+                    warnings.warn(
+                        "[VFL] curvature_loss: event lacks block_input_hidden "
+                        "— falling back to vanilla forward (loss may be ≈0 at "
+                        "no-op starting point). This is expected for TeaCache "
+                        "events or old checkpoints.")
+                    _warned_no_block_input = True
 
-            supervised_losses.append(F.mse_loss(lora_hidden, target))
+                latent = event.latent_input.to(device=device, dtype=dtype)
+                t_val = getattr(event, "timestep_actual", 0) or event.timestep
+                timestep = torch.tensor(
+                    [t_val], device=device, dtype=torch.long,
+                ).expand(latent.shape[0])
 
-            curvature_by_layer[(event.sample_id, hook_layer)].append(
-                (event.step_idx, lora_hidden))
+                cl = (event.class_labels.to(device=device)
+                      if event.class_labels is not None else None)
+                enc = (event.encoder_hidden_states.to(device=device, dtype=dtype)
+                       if event.encoder_hidden_states is not None else None)
+
+                captured.clear()
+                _run_transformer_forward(
+                    transformer, latent, timestep,
+                    class_labels=cl, encoder_hidden_states=enc,
+                )
+
+                hook_layer = _resolve_hook_layer(event, num_layers)
+                if hook_layer not in captured:
+                    continue
+
+                lora_hidden = captured[hook_layer]
+                target = event.true_feature.to(device=device, dtype=dtype)
+                if target.shape != lora_hidden.shape:
+                    continue
+
+                supervised_losses.append(F.mse_loss(lora_hidden, target))
+                curvature_by_layer[(event.sample_id, hook_layer)].append(
+                    (event.step_idx, lora_hidden))
 
         # ----------------------------------------------------------------------
-        # 3. Curvature loss: fit polynomial per (sample, layer) trajectory.
+        # 4. Curvature loss: fit polynomial per (sample, layer) trajectory.
         # ----------------------------------------------------------------------
         curv_losses: List[torch.Tensor] = []
         for seq in curvature_by_layer.values():
@@ -484,7 +489,7 @@ def compute_training_loss(
                 hiddens, order=curvature_order))
 
         # ----------------------------------------------------------------------
-        # 4. Anchor diffusion loss on real samples (prevents collapse).
+        # 5. Anchor diffusion loss on real samples (prevents collapse).
         # ----------------------------------------------------------------------
         anchor_losses: List[torch.Tensor] = []
         for anchor in (anchor_samples or []):
@@ -519,13 +524,13 @@ def compute_training_loss(
             anchor_losses.append(F.mse_loss(model_out[:, :ch], a_target[:, :ch]))
     finally:
         # ----------------------------------------------------------------------
-        # 5. Always remove hooks, even on exception.
+        # 6. Always remove hooks, even on exception.
         # ----------------------------------------------------------------------
         for h in hooks:
             h.remove()
 
     # ----------------------------------------------------------------------
-    # 6. Weighted sum. Empty terms contribute zero.
+    # 7. Weighted sum. Empty terms contribute zero.
     # ----------------------------------------------------------------------
     zero = torch.tensor(0.0, device=device, dtype=dtype)
     loss_sup = (sum(supervised_losses) / len(supervised_losses)
