@@ -58,6 +58,10 @@ class VerificationEvent:
     # PixArt: (B, seq, dim) T5 text embeddings; DiT: None
     # Stored as fp16 to halve memory (~1.2MB → ~600KB per event for PixArt).
     encoder_hidden_states: Optional[torch.Tensor] = None
+    # SpecA state snapshot — for L3 training to replay SpecA forward path.
+    # None for TeaCache events or when --vfl-no-train.
+    speca_cache_snapshot: Optional[dict] = None   # cache_dic subset needed for forward
+    speca_current_snapshot: Optional[dict] = None  # current subset needed for forward
     # 标识产生该 event 的去噪轨迹 (用于 curvature loss 按 (sample, layer) 分组)
     sample_id: int = 0
     # 真实扩散 timestep (如 981), NOT step_idx。L3 训练重跑 forward 时必须
@@ -87,6 +91,8 @@ class VerificationEvent:
                                    if self.class_labels is not None else None),
             "encoder_hidden_states_shape": (tuple(self.encoder_hidden_states.shape)
                                             if self.encoder_hidden_states is not None else None),
+            "has_speca_cache_snapshot": self.speca_cache_snapshot is not None,
+            "has_speca_current_snapshot": self.speca_current_snapshot is not None,
         }
 
 
@@ -146,6 +152,56 @@ def record_event(event: VerificationEvent,
     return False
 
 
+def _snapshot_cache_dic_final(cache_dic) -> dict:
+    """Extract cache_dic subset needed for SpecA forward replay.
+
+    Only caches the -1 slot (most recent full step), which contains the
+    Taylor factor lists used by cache_step_dit / cache_step_pixart.
+    Also preserves runtime counters so speca_cal_type makes the same
+    decision on replay.
+    """
+    cache = {}
+    raw_cache = cache_dic.cache[-1]
+    for layer_idx, layer_data in raw_cache.items():
+        layer_snap = {}
+        for module_name, taylor_list in layer_data.items():
+            if isinstance(taylor_list, list):
+                layer_snap[module_name] = [
+                    t.detach().cpu().half() if isinstance(t, torch.Tensor) else t
+                    for t in taylor_list
+                ]
+            else:
+                layer_snap[module_name] = taylor_list
+        cache[layer_idx] = layer_snap
+    return {
+        "cache": cache,
+        "check_layer": cache_dic.check_layer,
+        "error_metric": cache_dic.error_metric,
+        "taylor_step_counter": cache_dic.taylor_step_counter,
+        "check": cache_dic.check,
+        "full_count": cache_dic.full_count,
+        "cache_counter": cache_dic.cache_counter,
+        "min_taylor_steps": cache_dic.min_taylor_steps,
+        "max_taylor_steps": cache_dic.max_taylor_steps,
+        "base_threshold": cache_dic.base_threshold,
+        "decay_rate": cache_dic.decay_rate,
+    }
+
+
+def _snapshot_current(current) -> dict:
+    """Extract current (SpecAState) fields needed for forward replay."""
+    return {
+        "step": current.step,
+        "type": current.type,
+        "last_type": current.last_type,
+        "module": current.module,
+        "layer": current.layer,
+        "num_steps": current.num_steps,
+        "activated_steps": list(current.activated_steps),
+        "last_layer_error": current.last_layer_error,
+    }
+
+
 # ===========================================================================
 # Hook helpers — 从模型 forward 中提取 VerificationEvent
 # ===========================================================================
@@ -168,6 +224,8 @@ def make_speca_event(
     encoder_hidden_states: Optional[torch.Tensor] = None,
     sample_id: int = 0,
     timestep_actual: int = 0,
+    cache_dic=None,
+    current=None,
 ) -> VerificationEvent:
     """从 SpecA check_layer 的比较结果构造 VerificationEvent。
 
@@ -183,6 +241,10 @@ def make_speca_event(
     timestep_actual 是真实扩散 timestep (如 981), NOT step_idx。L3 训练重跑
     forward 时必须用它才能让 adaLN modulation 与录制时一致。
 
+    cache_dic / current: SpecA state objects. When both are provided, a
+    snapshot of the SpecA cache state is stored in the event so that L3
+    training can replay the SpecA forward path (not just vanilla).
+
     Note: the caller passes tensors produced by the SpecA do_check path
     (full_hidden = hidden_states.clone() → recomputed through attn/mlp),
     which are non-leaf intermediates with no grad_fn (forward runs under
@@ -190,6 +252,11 @@ def make_speca_event(
     — it would be a no-op that allocates a wrapper tensor on every call.
     """
     bucket = make_timestep_bucket(step_idx, num_steps)
+    speca_cache_snapshot = None
+    speca_current_snapshot = None
+    if cache_dic is not None and current is not None:
+        speca_cache_snapshot = _snapshot_cache_dic_final(cache_dic)
+        speca_current_snapshot = _snapshot_current(current)
     return VerificationEvent(
         layer_id=layer_id,
         timestep=timestep_val,
@@ -210,6 +277,8 @@ def make_speca_event(
                                if encoder_hidden_states is not None else None),
         sample_id=sample_id,
         timestep_actual=int(timestep_actual) if timestep_actual else 0,
+        speca_cache_snapshot=speca_cache_snapshot,
+        speca_current_snapshot=speca_current_snapshot,
     )
 
 

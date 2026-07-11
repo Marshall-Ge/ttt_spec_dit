@@ -71,7 +71,8 @@ def _get_vfl_probe_layer(num_blocks: int) -> int:
 def _vfl_record_speca_event(layer_id, timestep_val, step_idx, num_steps,
                               predicted_hidden, full_hidden, error_value,
                               module_name="",
-                              latent_input=None, class_labels=None):
+                              latent_input=None, class_labels=None,
+                              cache_dic=None, current=None):
     """Record SpecA verification events for DiT.
 
     Splits batch tensors into per-sample events.  Without this a single
@@ -87,6 +88,9 @@ def _vfl_record_speca_event(layer_id, timestep_val, step_idx, num_steps,
     per-sample events × 3 ``.cpu()`` syncs each into 1 750 batch-level
     scalar updates over a 1000-image run — the instrumentation overhead
     becomes invisible.
+
+    cache_dic / current: SpecA state passed to record_speca_event for
+    snapshot creation. Only used when buffer is registered (full path).
     """
     # ---- calibrate-only path: no buffer registered → one scalar update ----
     if get_vfl_buffer() is None:
@@ -96,9 +100,6 @@ def _vfl_record_speca_event(layer_id, timestep_val, step_idx, num_steps,
             predicted_hidden=predicted_hidden, full_hidden=full_hidden,
             error_value=error_value,
             model="dit", module_name=module_name,
-            # latent_input / class_labels intentionally NOT passed —
-            # calibrate-only path ignores them and we want to avoid even
-            # the reference bump.
         )
         return
 
@@ -124,6 +125,8 @@ def _vfl_record_speca_event(layer_id, timestep_val, step_idx, num_steps,
             model="dit", module_name=module_name,
             latent_input=lat[i:i + 1] if lat is not None else None,
             class_labels=cl[i:i + 1] if cl is not None else None,
+            cache_dic=cache_dic,
+            current=current,
         )
 
 
@@ -401,6 +404,8 @@ class DiTTransformer2D(nn.Module):
                         module_name="block",
                         latent_input=_vfl_latent_input,
                         class_labels=class_labels,
+                        cache_dic=cache_dic,
+                        current=current,
                     )
 
         # ---- TeaCache: save residual after blocks complete ----

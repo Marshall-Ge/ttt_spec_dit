@@ -69,7 +69,8 @@ def _get_vfl_probe_layer(num_blocks: int) -> int:
 def _vfl_record_speca_event(layer_id, timestep_val, step_idx, num_steps,
                               predicted_hidden, full_hidden, error_value,
                               module_name="",
-                              latent_input=None, encoder_hidden_states=None):
+                              latent_input=None, encoder_hidden_states=None,
+                              cache_dic=None, current=None):
     """Record SpecA verification events for PixArt.
 
     Splits batch tensors into per-sample events — see the DiT counterpart
@@ -79,6 +80,9 @@ def _vfl_record_speca_event(layer_id, timestep_val, step_idx, num_steps,
     --vfl-no-train``), skip the per-sample GPU→CPU tensor transfer entirely
     and feed the calibrator a single scalar (the batch-level ``error_value``
     already computed by ``compute_error_gate``).
+
+    cache_dic / current: SpecA state passed to record_speca_event for
+    snapshot creation. Only used when buffer is registered.
     """
     if get_vfl_buffer() is None:
         record_speca_event(
@@ -106,6 +110,8 @@ def _vfl_record_speca_event(layer_id, timestep_val, step_idx, num_steps,
             model="pixart", module_name=module_name,
             latent_input=lat[i:i + 1] if lat is not None else None,
             encoder_hidden_states=enc[i:i + 1] if enc is not None else None,
+            cache_dic=cache_dic,
+            current=current,
         )
 
 
@@ -420,6 +426,8 @@ class PixArtTransformer2D(nn.Module):
                         module_name="block",
                         latent_input=_vfl_latent_input,
                         encoder_hidden_states=_vfl_encoder_hidden_states,
+                        cache_dic=cache_dic,
+                        current=current,
                     )
 
         # ---- TeaCache: save residual after blocks complete ----

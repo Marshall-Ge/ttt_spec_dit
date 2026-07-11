@@ -75,10 +75,16 @@ class VFLConfig:
     time_conditioned_lora: bool = True
 
     # ---- M5: Curvature Loss ----
-    lambda_curvature: float = 1e-4
+    lambda_curvature: float = 1e-2
     lambda_curvature_min: float = 1e-6
-    lambda_curvature_max: float = 1e-2
+    lambda_curvature_max: float = 1e-1
     curvature_order: int = 2
+    # Anchor loss weight — temporarily disabled (0.0). The self-distillation
+    # target (noise_pred from base forward) yields loss=0 at LoRA no-op
+    # starting point, providing no training signal. Re-enable after
+    # redesigning anchor target (candidates: DDIM-inferred x̂_0 or
+    # next-step noise_pred temporal consistency).
+    lambda_anchor: float = 0.0
 
     # ---- M6: 异步训练 ----
     trigger_min_samples: int = 200
