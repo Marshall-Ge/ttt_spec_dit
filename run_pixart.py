@@ -82,10 +82,11 @@ class PixArtGenerator:
     """
 
     def __init__(self, num_steps: int = 20, device: str = "cuda",
-                 dtype: torch.dtype = torch.float16):
+                 dtype: torch.dtype = torch.float16, debug: bool = False):
         self.num_steps = num_steps
         self.device = device
         self._dtype = dtype
+        self._debug = debug
         self._transformer: Optional[PixArtTransformer2D] = None
         self._vae = None
         self._tokenizer = None
@@ -102,15 +103,67 @@ class PixArtGenerator:
         if self._transformer is not None:
             return
 
-        model, vae, tokenizer, text_encoder = PixArtTransformer2D.from_pretrained(
-            PIXART_REPO, cache_dir=HF_CACHE_DIR, dtype=self._dtype)
-        self._transformer = model.to(device=self.device, dtype=self._dtype)
-        self._transformer.eval()
-        self._vae = vae.to(device=self.device, dtype=self._dtype)
-        self._vae.eval()
-        self._tokenizer = tokenizer
-        self._text_encoder = text_encoder.to(device=self.device, dtype=self._dtype)
-        self._text_encoder.eval()
+        if self._debug:
+            # Debug mode: tiny model (hidden_dim=96), random weights,
+            # no pretrained files needed. Structure identical to full PixArt.
+            self._transformer = PixArtTransformer2D(
+                num_attention_heads=4,
+                attention_head_dim=24,
+                in_channels=4,
+                out_channels=8,
+                num_layers=1,
+                sample_size=64,
+                patch_size=2,
+                cross_attention_dim=96,
+                use_additional_conditions=False,
+                caption_channels=4096,
+            )
+            self._transformer.to(device=self.device, dtype=self._dtype)
+            self._transformer.eval()
+
+            # VAE: construct from known SD VAE config (random weights).
+            from diffusers import AutoencoderKL
+            self._vae = AutoencoderKL.from_config({
+                "_class_name": "AutoencoderKL",
+                "in_channels": 3,
+                "out_channels": 3,
+                "down_block_types": [
+                    "DownEncoderBlock2D", "DownEncoderBlock2D",
+                    "DownEncoderBlock2D", "DownEncoderBlock2D"],
+                "up_block_types": [
+                    "UpDecoderBlock2D", "UpDecoderBlock2D",
+                    "UpDecoderBlock2D", "UpDecoderBlock2D"],
+                "block_out_channels": [64, 128, 256, 256],
+                "latent_channels": 4,
+                "layers_per_block": 1,
+                "sample_size": 256,
+                "scaling_factor": 0.18215,
+            }).to(device=self.device, dtype=self._dtype)
+            self._vae.eval()
+
+            # T5: load tokenizer + text encoder from HuggingFace (small download).
+            # If offline, fall back to a stub that produces zero embeddings.
+            from transformers import T5Tokenizer, T5EncoderModel
+            try:
+                self._tokenizer = T5Tokenizer.from_pretrained(
+                    "google-t5/t5-base", legacy=False)
+                self._text_encoder = T5EncoderModel.from_pretrained(
+                    "google-t5/t5-base").to(device=self.device, dtype=self._dtype)
+                self._text_encoder.eval()
+            except Exception:
+                print("[DEBUG MODE] T5 unavailable, using stub text encoder")
+                self._tokenizer = None
+                self._text_encoder = None
+        else:
+            model, vae, tokenizer, text_encoder = PixArtTransformer2D.from_pretrained(
+                PIXART_REPO, cache_dir=HF_CACHE_DIR, dtype=self._dtype)
+            self._transformer = model.to(device=self.device, dtype=self._dtype)
+            self._transformer.eval()
+            self._vae = vae.to(device=self.device, dtype=self._dtype)
+            self._vae.eval()
+            self._tokenizer = tokenizer
+            self._text_encoder = text_encoder.to(device=self.device, dtype=self._dtype)
+            self._text_encoder.eval()
 
         sample_size = self._transformer.config.sample_size
         self._latent_shape = (1, 4, sample_size, sample_size)
@@ -154,6 +207,18 @@ class PixArtGenerator:
 
     def _build_scheduler(self):
         """Build DPM-Solver++ scheduler."""
+        if self._debug:
+            sched = DPMSolverMultistepScheduler(
+                num_train_timesteps=1000,
+                prediction_type="epsilon",
+                beta_start=0.00085,
+                beta_end=0.012,
+                beta_schedule="scaled_linear",
+                algorithm_type="dpmsolver++",
+            )
+            sched.set_timesteps(self.num_steps, device=self.device)
+            self._scheduler = sched
+            return
         sched = DPMSolverMultistepScheduler.from_pretrained(
             PIXART_REPO, subfolder="scheduler", cache_dir=HF_CACHE_DIR,
             local_files_only=True)
@@ -175,6 +240,16 @@ class PixArtGenerator:
         """
         if isinstance(prompts, str):
             prompts = [prompts]
+
+        # Stub path when T5 is unavailable (debug mode without network)
+        # Produce pre-projection embeddings (caption_channels dim);
+        # caption_projection inside the transformer will project to hidden_dim.
+        if self._tokenizer is None or self._text_encoder is None:
+            B = len(prompts)
+            cap_ch = self._transformer.config.caption_channels
+            embeds = torch.zeros(B, 120, cap_ch, device=self.device, dtype=self._dtype)
+            masks = torch.ones(B, 120, device=self.device, dtype=torch.long)
+            return embeds, masks
 
         # Use the pipeline's encode_prompt method via a temporary fixture
         from diffusers import PixArtAlphaPipeline
@@ -584,7 +659,8 @@ def run_t2i(args) -> Dict:
 
     # 2. Model
     print("\n[2] Loading PixArt-α model...")
-    generator = PixArtGenerator(num_steps=args.num_steps, device=device, dtype=dt)
+    generator = PixArtGenerator(num_steps=args.num_steps, device=device, dtype=dt,
+                                debug=getattr(args, "debug", False))
     generator.load()
 
     # ---- Debug: truncate to 1 transformer block ----
@@ -899,7 +975,8 @@ def run_c2i(args) -> Dict:
 
     # 2. Model
     print("\n[2] Loading PixArt-α model...")
-    generator = PixArtGenerator(num_steps=args.num_steps, device=device, dtype=dt)
+    generator = PixArtGenerator(num_steps=args.num_steps, device=device, dtype=dt,
+                                debug=getattr(args, "debug", False))
     generator.load()
 
     # ---- Debug: truncate to 1 transformer block ----

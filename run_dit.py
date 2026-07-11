@@ -89,10 +89,11 @@ class DiTGenerator:
     """
 
     def __init__(self, num_steps: int = 20, device: str = "cuda",
-                 dtype: torch.dtype = torch.float16):
+                 dtype: torch.dtype = torch.float16, debug: bool = False):
         self.num_steps = num_steps
         self.device = device
         self._dtype = dtype
+        self._debug = debug
         self._transformer: Optional[DiTTransformer2D] = None
         self._vae = None
         self._scheduler = None
@@ -109,18 +110,54 @@ class DiTGenerator:
         if self._transformer is not None:
             return
 
-        # Transformer
-        self._transformer = DiTTransformer2D.from_pretrained(DIT_REPO)
-        self._transformer.to(device=self.device, dtype=self._dtype)
-        self._transformer.eval()
+        if self._debug:
+            # Debug mode: tiny model (hidden_dim=96), random weights,
+            # no pretrained files needed. Structure identical to full DiT.
+            self._transformer = DiTTransformer2D(
+                num_attention_heads=4,
+                attention_head_dim=24,
+                in_channels=4,
+                out_channels=8,
+                num_layers=1,
+                sample_size=32,
+                patch_size=2,
+                num_embeds_ada_norm=1001,
+            )
+            self._transformer.to(device=self.device, dtype=self._dtype)
+            self._transformer.eval()
 
-        # VAE
-        from diffusers import AutoencoderKL
-        vae_path = os.path.join(DIT_REPO, "vae")
-        self._vae = AutoencoderKL.from_pretrained(
-            vae_path, local_files_only=True,
-        ).to(device=self.device, dtype=self._dtype)
-        self._vae.eval()
+            # VAE: construct from known SD VAE config (random weights).
+            from diffusers import AutoencoderKL
+            self._vae = AutoencoderKL.from_config({
+                "_class_name": "AutoencoderKL",
+                "in_channels": 3,
+                "out_channels": 3,
+                "down_block_types": [
+                    "DownEncoderBlock2D", "DownEncoderBlock2D",
+                    "DownEncoderBlock2D", "DownEncoderBlock2D"],
+                "up_block_types": [
+                    "UpDecoderBlock2D", "UpDecoderBlock2D",
+                    "UpDecoderBlock2D", "UpDecoderBlock2D"],
+                "block_out_channels": [64, 128, 256, 256],
+                "latent_channels": 4,
+                "layers_per_block": 1,
+                "sample_size": 256,
+                "scaling_factor": 0.18215,
+            }).to(device=self.device, dtype=self._dtype)
+            self._vae.eval()
+        else:
+            # Transformer
+            self._transformer = DiTTransformer2D.from_pretrained(DIT_REPO)
+            self._transformer.to(device=self.device, dtype=self._dtype)
+            self._transformer.eval()
+
+            # VAE
+            from diffusers import AutoencoderKL
+            vae_path = os.path.join(DIT_REPO, "vae")
+            self._vae = AutoencoderKL.from_pretrained(
+                vae_path, local_files_only=True,
+            ).to(device=self.device, dtype=self._dtype)
+            self._vae.eval()
 
         # Derived props
         self._latent_shape = (1, 4, DIT_LATENT_SIZE, DIT_LATENT_SIZE)
@@ -128,7 +165,7 @@ class DiTGenerator:
 
         # id2label
         model_index_path = os.path.join(DIT_REPO, "model_index.json")
-        if os.path.exists(model_index_path):
+        if not self._debug and os.path.exists(model_index_path):
             with open(model_index_path) as f:
                 self._id2label = json.load(f).get("id2label", {})
         else:
@@ -178,6 +215,18 @@ class DiTGenerator:
 
     def _build_scheduler(self):
         """Build DDIM scheduler from default config."""
+        if self._debug:
+            sched = DDIMScheduler(
+                num_train_timesteps=1000,
+                prediction_type="epsilon",
+                beta_start=0.00085,
+                beta_end=0.012,
+                beta_schedule="scaled_linear",
+                clip_sample=False,
+            )
+            sched.set_timesteps(self.num_steps, device=self.device)
+            self._scheduler = sched
+            return
         cfg = DDIMScheduler.load_config(
             os.path.join(DIT_REPO, "scheduler", "scheduler_config.json"))
         sched = DDIMScheduler.from_config(cfg)
@@ -714,7 +763,8 @@ def run_c2i(args) -> Dict:
     # 2. Load model
     # ===================================================================
     print("\n[2] Loading DiT-2-256 model...")
-    generator = DiTGenerator(num_steps=args.num_steps, device=device, dtype=dt)
+    generator = DiTGenerator(num_steps=args.num_steps, device=device, dtype=dt,
+                            debug=getattr(args, "debug", False))
     generator.load()
 
     # ---- Debug: truncate to 1 transformer block ----
@@ -827,14 +877,33 @@ def run_c2i(args) -> Dict:
 
     # ---- Print model structure (once, after all modifications) ----
     print("\n" + "=" * 70)
-    print("MODEL STRUCTURE")
-    print("=" * 70)
-    print(generator.transformer)
-    total_params = sum(p.numel() for p in generator.transformer.parameters())
-    trainable = sum(p.numel() for p in generator.transformer.parameters() if p.requires_grad)
-    print(f"\nTotal params: {total_params:,}  |  Trainable: {trainable:,}")
-    n_blocks = len(generator.transformer.transformer_blocks)
-    print(f"transformer_blocks: {n_blocks}")
+    if vfl_worker is not None:
+        vfl_worker._ensure_train_model()
+        train_model = vfl_worker._train_model
+        print("MODEL STRUCTURE (VFL train_model + LoRA)")
+        print("=" * 70)
+        print(train_model)
+        lora_params = sum(p.numel() for p in train_model.parameters() if p.requires_grad)
+        print(f"\nLoRA trainable params: {lora_params:,}")
+        print(f"LoRA layers: {len(vfl_worker._layer_wrappers)}")
+        print("\nTrainable parameters:")
+        for name, p in train_model.named_parameters():
+            if p.requires_grad:
+                print(f"  {name}: {list(p.shape)}")
+    else:
+        print("MODEL STRUCTURE")
+        print("=" * 70)
+        print(generator.transformer)
+        total_params = sum(p.numel() for p in generator.transformer.parameters())
+        trainable = sum(p.numel() for p in generator.transformer.parameters() if p.requires_grad)
+        print(f"\nTotal params: {total_params:,}  |  Trainable: {trainable:,}")
+        n_blocks = len(generator.transformer.transformer_blocks)
+        print(f"transformer_blocks: {n_blocks}")
+        if trainable > 0:
+            print("\nTrainable parameters:")
+            for name, p in generator.transformer.named_parameters():
+                if p.requires_grad:
+                    print(f"  {name}: {list(p.shape)}")
     print("=" * 70)
 
     # ===================================================================

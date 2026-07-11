@@ -21,14 +21,16 @@ DiT block 线性层结构::
 每 block 6 个 Linear, rank=8 时每 block ~221K 参数。
 Top-K=3 → ~663K 参数。
 
-Time-conditioned LoRA (默认开启)::
-    在 A→B 瓶颈层注入时间步 embedding 调制 (ControlNet 风格)。
-    ΔW(x) = (x @ A^T) @ B^T · γ(t_emb)
-    γ(t_emb) 由 t_proj MLP 输出 (末层零初始化 → 起点 γ=0 → no-op)。
-    这样让 rank=4 的小网络可以随 t 变化, 不再被迫一组参数
-    同时拟合早/中/晚三个去噪阶段。
-    关键不变量: lora_B=0 && t_proj[-1].weight=0 → 第一次 forward
-    与原模型严格相等。
+AdaLN-LoRA (时间步调制, 默认开启)::
+    在 A→B 瓶颈层注入时间步 embedding 做 AdaLN 风格调制。
+    h = Ax                              shape: (B, L, r)
+    γ, β = t_proj(t_emb)               shape: (B, r) each
+    h' = h ⊙ (1 + γ) + β              broadcast: (B, 1, r)
+    y = Wx + (α/r) · B h'
+    两条零初始化: lora_B=0 && t_proj[-1]=0 → 起点 h'=h, delta=0
+    → 第一次 forward 与原模型严格相等。
+    相比旧标量门控 γ(t)·(BA)x, AdaLN-LoRA 可改变修正方向
+    (β 允许平移), 且 per-sample 调制天然支持 batch 训练。
 """
 
 from __future__ import annotations
@@ -185,10 +187,16 @@ class LoRALinear(nn.Module):
 
         y = W·x + (α/r) · (B @ A) @ x
 
-    Forward (time-conditioned)::
+    Forward (AdaLN-LoRA, time-conditioned)::
 
-        y = W·x + (α/r) · γ(t_emb) · (B @ A) @ x
-        γ(t_emb) = t_proj(t_emb)   # scalar per batch, init = 0 → 1.0
+        h   = A·x              (B, L, r)
+        γ,β = t_proj(t_emb)    (B, r) each
+        h'  = h ⊙ (1+γ) + β   broadcast (B, 1, r)
+        y   = W·x + (α/r) · B·h'
+
+    Design mirrors DiT's adaLN-Zero: ``x * (1+scale) + shift``.
+    Zero-init invariant: lora_B=0 AND t_proj[-1]=0 → h'=h, delta=0
+    → first forward equals base(x) exactly.
 
     where A ∈ R^{r×in}, B ∈ R^{out×r}, B 零初始化。
     ``α`` is the scaling factor (default = rank).
@@ -218,15 +226,14 @@ class LoRALinear(nn.Module):
         self.lora_B = nn.Parameter(torch.zeros(out_features, rank, device=device, dtype=dtype))
 
         if self.time_conditioned:
-            # ControlNet-style γ modulation MLP.
-            #   γ: (B, 1) scalar gate, broadcast across the whole output.
+            # AdaLN-LoRA: t_proj outputs (2*rank) → split into γ, β.
+            # h' = h * (1 + γ) + β  (mirrors DiT adaLN-Zero).
             # Two-zero-init invariant: lora_B=0 AND t_proj[-1].weight=0
-            # guarantees that the very first forward (even once B is trained)
-            # with γ=0 → delta * (1+0) = delta, no contribution to base.
+            # guarantees that the very first forward equals base(x).
             self.t_proj = nn.Sequential(
-                nn.Linear(t_emb_dim, rank, device=device, dtype=dtype),
+                nn.Linear(t_emb_dim, rank * 2, device=device, dtype=dtype),
                 nn.SiLU(),
-                nn.Linear(rank, 1, device=device, dtype=dtype),
+                nn.Linear(rank * 2, rank * 2, device=device, dtype=dtype),
             )
             nn.init.zeros_(self.t_proj[-1].weight)
             nn.init.zeros_(self.t_proj[-1].bias)
@@ -242,24 +249,28 @@ class LoRALinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base_out = self.base(x)
-        # LoRA correction: x @ A^T @ B^T  (x: ... × in, A: r×in, B: out×r)
-        delta = (x @ self.lora_A.T) @ self.lora_B.T
+        # h: (..., r) — LoRA bottleneck
+        h = x @ self.lora_A.T
 
         if self.time_conditioned:
             t_emb = get_lora_t_emb()
             if t_emb is not None:
-                # γ: (B, 1) — ControlNet-style gate. Start = 0 → factor = 1.0.
-                gamma = self.t_proj(t_emb)
-                # Match dtype defensively (t_emb may be fp32 from TimestepEmbedder
-                # while backbone is fp16).
-                if gamma.dtype != delta.dtype:
-                    gamma = gamma.to(delta.dtype)
-                # Broadcast over output feature dim & any trailing spatial dims.
-                # delta is (..., out_features); gamma is (B, 1).
-                # Expand to (B, 1) → (B, 1, 1, ...) for broadcasting.
-                view = gamma.shape + (1,) * (delta.ndim - gamma.ndim)
-                delta = delta * (1.0 + gamma.view(view))
+                # gb: (B, 2*r) → split into γ, β each (B, r)
+                gb = self.t_proj(t_emb)
+                gamma, beta = gb.chunk(2, dim=-1)
+                # Match dtype defensively
+                if gamma.dtype != h.dtype:
+                    gamma = gamma.to(h.dtype)
+                    beta = beta.to(h.dtype)
+                # Reshape for broadcast over sequence dim
+                if h.ndim == 3:
+                    # (B, L, r): unsqueeze to (B, 1, r)
+                    gamma = gamma.unsqueeze(1)
+                    beta = beta.unsqueeze(1)
+                # AdaLN modulation: h' = h * (1 + γ) + β
+                h = h * (1.0 + gamma) + beta
 
+        delta = h @ self.lora_B.T
         return base_out + delta * self.scaling
 
     @property
@@ -271,8 +282,8 @@ class LoRALinear(nn.Module):
         """Merge LoRA into base weights, returning a plain nn.Linear.
 
         Used when deploying a validated adapter: eliminates the LoRA overhead.
-        Time-conditioned LoRA cannot be cleanly merged (gamma depends on
-        runtime t_emb); fall back to the mean ΔW with gamma=0 (no-op).
+        Time-conditioned LoRA cannot be cleanly merged (γ/β depend on
+        runtime t_emb); fall back to the mean ΔW with γ=0,β=0 (no-op).
         """
         merged_weight = self.base.weight.data + (
             self.lora_B.data @ self.lora_A.data
@@ -716,13 +727,33 @@ def load_lora_checkpoint(transformer, path: str,
             ckpt_has_t = "t_proj" in tensors and tensors["t_proj"] is not None
             if lora.time_conditioned:
                 if ckpt_has_t:
-                    # Materialise into the live t_proj.
-                    converted = {
-                        k: v.to(lora.t_proj[0].weight.device)
-                        for k, v in tensors["t_proj"].items()
-                    }
-                    lora.t_proj.load_state_dict(converted, strict=False)
-                # else: legacy ckpt, leave t_proj at zero-init (no-op).
+                    # Check for shape mismatch between old Scalar Gate
+                    # t_proj (last layer outputs 1) and new AdaLN-LoRA
+                    # t_proj (last layer outputs 2*rank).
+                    ckpt_state = tensors["t_proj"]
+                    live_state = lora.t_proj.state_dict()
+                    shape_mismatch = False
+                    for k, v in ckpt_state.items():
+                        if k not in live_state:
+                            continue
+                        if v.shape != live_state[k].shape:
+                            shape_mismatch = True
+                            break
+                    if shape_mismatch:
+                        # Old Scalar Gate checkpoint — skip t_proj loading.
+                        # New t_proj stays zero-init → no-op, forward safe.
+                        print(f"  [VFL] WARNING: t_proj shape mismatch in "
+                              f"layer {layer_id}/{path_str} — old Scalar Gate "
+                              f"checkpoint, skipping t_proj load (keeping "
+                              f"zero-init)")
+                    else:
+                        # Shapes match — safe to load.
+                        converted = {
+                            k: v.to(lora.t_proj[0].weight.device)
+                            for k, v in ckpt_state.items()
+                        }
+                        lora.t_proj.load_state_dict(converted, strict=False)
+                # else: legacy ckpt without t_proj, leave at zero-init (no-op).
             elif ckpt_has_t:
                 # Ckpt has t_proj but caller asked for vanilla LoRA — drop it.
                 # Already handled by attach_lora not creating a t_proj.
