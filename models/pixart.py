@@ -58,7 +58,12 @@ from verification_feedback_loop.vfl_state import (
     record_teacache_event,
 )
 
-_VFL_PROBE_LAYER = 24  # TeaCache + SpecA check layer for PixArt
+_VFL_PROBE_LAYER_DEFAULT = 24  # TeaCache + SpecA check layer for PixArt (28 blocks)
+
+
+def _get_vfl_probe_layer(num_blocks: int) -> int:
+    """Return the VFL probe layer ID, clamped to valid range."""
+    return min(_VFL_PROBE_LAYER_DEFAULT, max(0, num_blocks - 1))
 
 
 def _vfl_record_speca_event(layer_id, timestep_val, step_idx, num_steps,
@@ -276,7 +281,8 @@ class PixArtTransformer2D(nn.Module):
                 self, hidden_states, timestep_emb)
             should_calc, _ = teacache_decide(teacache_state, modulated,
                                             calibrator=get_vfl_calibrator(),
-                                            probe_layer=_VFL_PROBE_LAYER)
+                                            probe_layer=_get_vfl_probe_layer(
+                                                len(self.transformer_blocks)))
 
             if not should_calc:
                 hidden_states = teacache_apply_residual(
@@ -422,7 +428,8 @@ class PixArtTransformer2D(nn.Module):
 
             # ---- VFL: TeaCache probe — record (predicted_via_skip, true_full) pair ----
             _vfl_record_teacache_event(
-                layer_id=_VFL_PROBE_LAYER,
+                layer_id=_get_vfl_probe_layer(
+                    len(self.transformer_blocks)),
                 timestep_val=get_vfl_step_idx(),
                 step_idx=get_vfl_step_idx(),
                 num_steps=get_vfl_num_steps(),

@@ -2,6 +2,7 @@
 """CUDA timer, VAE decode, tensor↔PIL, image I/O helpers."""
 
 import numpy as np
+import time
 import torch
 from PIL import Image
 
@@ -11,21 +12,33 @@ from PIL import Image
 # ---------------------------------------------------------------------------
 
 class CudaTimer:
-    """Accurate GPU-side timer using CUDA events."""
+    """Accurate GPU-side timer using CUDA events, with MPS/CPU fallback."""
 
     def __init__(self, device="cuda"):
-        self.start = torch.cuda.Event(enable_timing=True)
-        self.end = torch.cuda.Event(enable_timing=True)
+        self._device = device
         self.total_ms = 0.0
+        self._use_cuda_events = (device == "cuda" and torch.cuda.is_available())
+        if self._use_cuda_events:
+            self.start = torch.cuda.Event(enable_timing=True)
+            self.end = torch.cuda.Event(enable_timing=True)
+        else:
+            self._t0 = 0.0
 
     def __enter__(self):
-        self.start.record()
+        if self._use_cuda_events:
+            self.start.record()
+        else:
+            self._t0 = time.perf_counter()
         return self
 
     def __exit__(self, *a):
-        self.end.record()
-        torch.cuda.synchronize()
-        self.total_ms += self.start.elapsed_time(self.end)
+        if self._use_cuda_events:
+            self.end.record()
+            torch.cuda.synchronize()
+            self.total_ms += self.start.elapsed_time(self.end)
+        else:
+            elapsed = (time.perf_counter() - self._t0) * 1000.0
+            self.total_ms += elapsed
 
 
 # ---------------------------------------------------------------------------

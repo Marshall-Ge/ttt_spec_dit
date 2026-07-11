@@ -524,8 +524,21 @@ def run_t2i(args) -> Dict:
         print(f"  [ERROR] No valid metrics remain for t2i/{dataset_name}.")
         return {}
 
-    device = "cuda"
-    dt = torch.float16
+    # ---- Device / dtype ----
+    if getattr(args, "debug", False):
+        if torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            print("[DEBUG MODE] MPS not available, falling back to cpu")
+            device = "cpu"
+        dt = torch.float32
+        print("=" * 60)
+        print("[DEBUG MODE] 1 layer, mps, fp32 — metrics meaningless")
+        print("[DEBUG MODE] for smoke-test only, do NOT trust FID/IS/CLIP")
+        print("=" * 60)
+    else:
+        device = "cuda"
+        dt = torch.float16
 
     dir_suffix = f"{args.method}_{args.num_steps}" if args.method == "ddim" else args.method
     output_dir = args.output_dir or os.path.join(
@@ -574,6 +587,13 @@ def run_t2i(args) -> Dict:
     generator = PixArtGenerator(num_steps=args.num_steps, device=device, dtype=dt)
     generator.load()
 
+    # ---- Debug: truncate to 1 transformer block ----
+    if getattr(args, "debug", False):
+        n_before = len(generator.transformer.transformer_blocks)
+        generator.transformer.transformer_blocks = \
+            generator.transformer.transformer_blocks[:1]
+        print(f"[DEBUG MODE] truncated transformer_blocks: {n_before} -> 1")
+
     # 3. Metrics
     print("\n[3] Setting up metrics...")
     metrics = {}
@@ -611,7 +631,8 @@ def run_t2i(args) -> Dict:
         ddim_steps = args.num_steps
         print(f"  DDIM sampling ({args.num_steps} steps, no caching)")
     elif args.method == "speca":
-        check_layer = 24  # PixArt optimal
+        num_blocks = len(generator.transformer.transformer_blocks)
+        check_layer = 0 if getattr(args, "debug", False) else min(24, num_blocks - 1)
         speca_cache_dic, speca_current = speca_init(
             num_steps=args.num_steps,
             base_threshold=args.speca_base_threshold,
@@ -656,8 +677,10 @@ def run_t2i(args) -> Dict:
                 max_order=4,
                 num_layers=len(generator.transformer.transformer_blocks),
                 error_metric=args.speca_error_metric,
-                check_layer=24,
+                check_layer=0 if getattr(args, "debug", False)
+                else min(24, len(generator.transformer.transformer_blocks) - 1),
             )
+
 
         t0 = time.time()
         if args.method == "ddim":
@@ -803,8 +826,21 @@ def run_c2i(args) -> Dict:
         print(f"  [ERROR] No valid metrics remain for c2i/{dataset_name}.")
         return {}
 
-    device = "cuda"
-    dt = torch.float16
+    # ---- Device / dtype ----
+    if getattr(args, "debug", False):
+        if torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            print("[DEBUG MODE] MPS not available, falling back to cpu")
+            device = "cpu"
+        dt = torch.float32
+        print("=" * 60)
+        print("[DEBUG MODE] 1 layer, mps, fp32 — metrics meaningless")
+        print("[DEBUG MODE] for smoke-test only, do NOT trust FID/IS/CLIP")
+        print("=" * 60)
+    else:
+        device = "cuda"
+        dt = torch.float16
 
     dir_suffix = f"{args.method}_{args.num_steps}" if args.method == "ddim" else args.method
     output_dir = args.output_dir or os.path.join(
@@ -854,6 +890,13 @@ def run_c2i(args) -> Dict:
     generator = PixArtGenerator(num_steps=args.num_steps, device=device, dtype=dt)
     generator.load()
 
+    # ---- Debug: truncate to 1 transformer block ----
+    if getattr(args, "debug", False):
+        n_before = len(generator.transformer.transformer_blocks)
+        generator.transformer.transformer_blocks = \
+            generator.transformer.transformer_blocks[:1]
+        print(f"[DEBUG MODE] truncated transformer_blocks: {n_before} -> 1")
+
     # 3. Metrics
     print("\n[3] Setting up metrics...")
     metrics = {}
@@ -902,7 +945,8 @@ def run_c2i(args) -> Dict:
         ddim_steps = args.num_steps
         print(f"  DDIM sampling ({args.num_steps} steps, no caching)")
     elif args.method == "speca":
-        check_layer = 24
+        num_blocks = len(generator.transformer.transformer_blocks)
+        check_layer = 0 if getattr(args, "debug", False) else min(24, num_blocks - 1)
         speca_cache_dic, speca_current = speca_init(
             num_steps=args.num_steps,
             base_threshold=args.speca_base_threshold,
@@ -962,8 +1006,10 @@ def run_c2i(args) -> Dict:
                 max_order=4,
                 num_layers=len(generator.transformer.transformer_blocks),
                 error_metric=args.speca_error_metric,
-                check_layer=24,
+                check_layer=0 if getattr(args, "debug", False)
+                else min(24, len(generator.transformer.transformer_blocks) - 1),
             )
+
 
         t0 = time.time()
         if args.method == "ddim":

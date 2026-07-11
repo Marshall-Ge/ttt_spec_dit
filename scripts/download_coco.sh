@@ -11,12 +11,12 @@
 #   1. val2014.zip          (~6.2 GB, 40,504 images)
 #   2. annotations_trainval2014.zip  (~241 MB, captions)
 #
-# Target directory: /root/autodl-fs/data/coco
+# Target directory: ~/autodl-fs/data/coco
 # ===========================================================================
 
 set -euo pipefail
 
-DATA_DIR="${1:-/root/autodl-fs/data/coco}"
+DATA_DIR="${1:-~/autodl-fs/data/coco}"
 mkdir -p "$DATA_DIR"
 
 echo "============================================"

@@ -11,7 +11,7 @@ Runs 200 images × 20 steps through SpecA with:
 Outputs: skip ratio, FLOPs reduction, wall time → flywheel_session2/results.json
 """
 
-import sys; sys.path.insert(0, '/root/ttt_spec_dit')
+import sys; sys.path.insert(0, '~/ttt_spec_dit')
 import torch, os, json, time
 import numpy as np
 from diffusers import DDIMScheduler
@@ -73,7 +73,7 @@ else:
 # 4. Dataset
 # =====================================================================
 print(f"\n[4] Loading ImageNet dataset ({n_images} images)...")
-ds = ImageNetDataset(imagenet_dir='/root/autodl-fs/data/imagenet', n_images=n_images, seed=seed)
+ds = ImageNetDataset(imagenet_dir='~/autodl-fs/data/imagenet', n_images=n_images, seed=seed)
 
 # =====================================================================
 # 5. Scheduler

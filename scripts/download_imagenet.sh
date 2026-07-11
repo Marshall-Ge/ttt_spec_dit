@@ -16,12 +16,12 @@
 #   B) Kaggle (requires API token)
 #   C) Academic Torrents
 #
-# Target directory: /root/autodl-fs/data/imagenet
+# Target directory: ~/autodl-fs/data/imagenet
 # ===========================================================================
 
 set -euo pipefail
 
-DATA_DIR="${1:-/root/autodl-fs/data/imagenet}"
+DATA_DIR="${1:-~/autodl-fs/data/imagenet}"
 mkdir -p "$DATA_DIR"
 
 echo "============================================"

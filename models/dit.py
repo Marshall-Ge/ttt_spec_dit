@@ -60,7 +60,12 @@ from verification_feedback_loop.vfl_state import (
     record_teacache_event,
 )
 
-_VFL_PROBE_LAYER = 20  # TeaCache + SpecA check layer for DiT
+_VFL_PROBE_LAYER_DEFAULT = 20  # TeaCache + SpecA check layer for DiT (28 blocks)
+
+
+def _get_vfl_probe_layer(num_blocks: int) -> int:
+    """Return the VFL probe layer ID, clamped to valid range."""
+    return min(_VFL_PROBE_LAYER_DEFAULT, max(0, num_blocks - 1))
 
 
 def _vfl_record_speca_event(layer_id, timestep_val, step_idx, num_steps,
@@ -275,7 +280,8 @@ class DiTTransformer2D(nn.Module):
                 self, hidden_states, timestep, class_labels)
             should_calc, _ = teacache_decide(teacache_state, modulated,
                                               calibrator=get_vfl_calibrator(),
-                                              probe_layer=_VFL_PROBE_LAYER)
+                                              probe_layer=_get_vfl_probe_layer(
+                                                  len(self.transformer_blocks)))
 
             # ===========================================================
             # Session-TTT: persistent plugin modulation of the cache.
@@ -407,7 +413,8 @@ class DiTTransformer2D(nn.Module):
             # This produces layer-level supervision from TeaCache's step-level
             # decisions — using the full-stack residual as the "prediction".
             _vfl_record_teacache_event(
-                layer_id=_VFL_PROBE_LAYER,
+                layer_id=_get_vfl_probe_layer(
+                    len(self.transformer_blocks)),
                 timestep_val=get_vfl_step_idx(),
                 step_idx=get_vfl_step_idx(),
                 num_steps=get_vfl_num_steps(),
@@ -518,7 +525,8 @@ class DiTTransformer2D(nn.Module):
             #    clean — fp16 activations in the 28-block stack can spike
             #    beyond 65504 and produce NaN, which would corrupt φ.
             with torch.no_grad():
-                with torch.amp.autocast('cuda', dtype=torch.float32):
+                _autocast_dev = 'cuda' if hidden_states.is_cuda else 'cpu'
+                with torch.amp.autocast(_autocast_dev, dtype=torch.float32):
                     z_true = self._run_full_blocks(
                         hidden_states, timestep, class_labels)
 
@@ -550,7 +558,8 @@ class DiTTransformer2D(nn.Module):
             plugin.train()
             for me in range(micro_epochs):
                 ttt_state["optimizer"].zero_grad(set_to_none=True)
-                with torch.amp.autocast('cuda', dtype=torch.float32):
+                _autocast_dev = 'cuda' if cached.is_cuda else 'cpu'
+                with torch.amp.autocast(_autocast_dev, dtype=torch.float32):
                     z_pred = plugin(cached.to(plugin_dtype),
                                     t_emb.to(plugin_dtype))
                     loss = F.mse_loss(z_pred, z_true_target)

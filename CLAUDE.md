@@ -13,20 +13,20 @@
 
 | 模型 | 参数量 | 分辨率 | 架构 | 权重路径 |
 |------|--------|--------|------|----------|
-| DiT-2-256 | 675M | 256×256 | adaLN-Zero, class-conditional | `/root/autodl-fs/models/dit_2_256/` |
-| PixArt-XL-2 | 2.5B | 512×512 | adaLN-Single, T5 text encoder | `/root/autodl-fs/models/models--PixArt-alpha--PixArt-XL-2-512x512/` |
+| DiT-2-256 | 675M | 256×256 | adaLN-Zero, class-conditional | `~/autodl-fs/models/dit_2_256/` |
+| PixArt-XL-2 | 2.5B | 512×512 | adaLN-Single, T5 text encoder | `~/autodl-fs/models/models--PixArt-alpha--PixArt-XL-2-512x512/` |
 
 - DiT: 28 blocks, 16 heads × 72 dim, in_channels=4, out_channels=8 (learned sigma: noise + variance)
 - PixArt: 28 blocks, cross_attention_dim=1152, T5 caption_channels=4096, 3 submodules (attn1/attn2/ff)
-- SD VAE: `/root/autodl-fs/models/dit_2_256/vae/`, scaling_factor=0.18215
-- ImageNet val: `/root/autodl-fs/data/imagenet/val/` (1000 个类目录, 每类 50 张, 共 50k)
-- COCO: `/root/autodl-fs/data/coco/`
-- devkit: `/root/autodl-fs/data/imagenet/ILSVRC2012_devkit_t12/`
+- SD VAE: `~/autodl-fs/models/dit_2_256/vae/`, scaling_factor=0.18215
+- ImageNet val: `~/autodl-fs/data/imagenet/val/` (1000 个类目录, 每类 50 张, 共 50k)
+- COCO: `~/autodl-fs/data/coco/`
+- devkit: `~/autodl-fs/data/imagenet/ILSVRC2012_devkit_t12/`
 
 ## 3. 目录结构和各文件职责
 
 ```
-/root/ttt_spec_dit/
+~/ttt_spec_dit/
 ├── config.py                  # 全局路径、默认超参 (DIT_REPO, IMAGENET_DIR, SPECA_DEFAULTS...)
 ├── main.py                    # CLI 入口: parse_args() + validate_args() → 分发到 run_dit/run_pixart
 ├── utils.py                   # CudaTimer, VAE decode, save_image, ensure_real_299()

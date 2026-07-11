@@ -24,22 +24,22 @@ Accelerating [DiT-2-256](https://arxiv.org/abs/2212.09748) and [PixArt-α](https
 
 | Model | Params | Resolution | Architecture | Weight Path |
 |-------|--------|------------|--------------|-------------|
-| DiT-2-256 | 675M | 256×256 | adaLN-Zero, class-conditional | `/root/autodl-fs/models/dit_2_256/` |
-| PixArt-XL-2 | 2.5B | 512×512 | adaLN-Single, T5 text encoder | `/root/autodl-fs/models/models--PixArt-alpha--PixArt-XL-2-512x512/` |
+| DiT-2-256 | 675M | 256×256 | adaLN-Zero, class-conditional | `~/autodl-fs/models/dit_2_256/` |
+| PixArt-XL-2 | 2.5B | 512×512 | adaLN-Single, T5 text encoder | `~/autodl-fs/models/models--PixArt-alpha--PixArt-XL-2-512x512/` |
 
 **Key specs:**
 - Both: 28 transformer blocks, 16 attention heads × 72 dim, hidden_dim=1152, in_channels=4, out_channels=8 (learned sigma)
 - PixArt: 3 submodules per block (attn1/attn2/ff), cross_attention_dim=1152, T5 caption_channels=4096; attn2 has **no gate**
-- SD VAE: `/root/autodl-fs/models/dit_2_256/vae/`, scaling_factor=0.18215
-- ImageNet val: `/root/autodl-fs/data/imagenet/val/` (1000 classes, 50 images/class, 50k total)
-- COCO 30K: `/root/autodl-fs/data/coco/`
+- SD VAE: `~/autodl-fs/models/dit_2_256/vae/`, scaling_factor=0.18215
+- ImageNet val: `~/autodl-fs/data/imagenet/val/` (1000 classes, 50 images/class, 50k total)
+- COCO 30K: `~/autodl-fs/data/coco/`
 
 ---
 
 ## Directory Structure
 
 ```
-/root/ttt_spec_dit/
+~/ttt_spec_dit/
 ├── config.py                  # Global paths, defaults, coefficient loading
 ├── main.py                    # CLI entry: parse_args() → validate_args() → dispatch
 ├── utils.py                   # CudaTimer, VAE decode, PIL↔tensor, FID preprocessing

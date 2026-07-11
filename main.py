@@ -170,6 +170,10 @@ Examples:
                              f"(default: {IMG_SAVE_LIMIT}). Set to a large "
                              f"number for full saves.")
 
+    parser.add_argument("--debug", action="store_true", default=False,
+                        help="Debug mode: 1-layer DiT + MPS + fp32, for "
+                             "local smoke-test only. Metrics are meaningless.")
+
     return parser.parse_args()
 
 

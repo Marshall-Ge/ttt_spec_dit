@@ -64,7 +64,7 @@ class VersionRegistry:
         registry = VersionRegistry(state_dir="./output/vfl_checkpoints")
 
         # On startup / model load:
-        current_ver = registry.detect_version(model_path="/root/.../dit_2_256")
+        current_ver = registry.detect_version(model_path="~/.../dit_2_256")
         registry.set_current_version(current_ver)
 
         # Before loading an adapter:
