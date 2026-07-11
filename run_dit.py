@@ -825,6 +825,18 @@ def run_c2i(args) -> Dict:
                   f"min_strata={vfl_cfg.buffer_ready_min_strata}, "
                   f"min_anchors={vfl_cfg.buffer_ready_min_anchors})")
 
+    # ---- Print model structure (once, after all modifications) ----
+    print("\n" + "=" * 70)
+    print("MODEL STRUCTURE")
+    print("=" * 70)
+    print(generator.transformer)
+    total_params = sum(p.numel() for p in generator.transformer.parameters())
+    trainable = sum(p.numel() for p in generator.transformer.parameters() if p.requires_grad)
+    print(f"\nTotal params: {total_params:,}  |  Trainable: {trainable:,}")
+    n_blocks = len(generator.transformer.transformer_blocks)
+    print(f"transformer_blocks: {n_blocks}")
+    print("=" * 70)
+
     # ===================================================================
     # 3. Setup metrics
     # ===================================================================

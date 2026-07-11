@@ -594,6 +594,18 @@ def run_t2i(args) -> Dict:
             generator.transformer.transformer_blocks[:1]
         print(f"[DEBUG MODE] truncated transformer_blocks: {n_before} -> 1")
 
+    # ---- Print model structure (once, after all modifications) ----
+    print("\n" + "=" * 70)
+    print("MODEL STRUCTURE")
+    print("=" * 70)
+    print(generator.transformer)
+    total_params = sum(p.numel() for p in generator.transformer.parameters())
+    trainable = sum(p.numel() for p in generator.transformer.parameters() if p.requires_grad)
+    print(f"\nTotal params: {total_params:,}  |  Trainable: {trainable:,}")
+    n_blocks = len(generator.transformer.transformer_blocks)
+    print(f"transformer_blocks: {n_blocks}")
+    print("=" * 70)
+
     # 3. Metrics
     print("\n[3] Setting up metrics...")
     metrics = {}
@@ -896,6 +908,18 @@ def run_c2i(args) -> Dict:
         generator.transformer.transformer_blocks = \
             generator.transformer.transformer_blocks[:1]
         print(f"[DEBUG MODE] truncated transformer_blocks: {n_before} -> 1")
+
+    # ---- Print model structure (once, after all modifications) ----
+    print("\n" + "=" * 70)
+    print("MODEL STRUCTURE")
+    print("=" * 70)
+    print(generator.transformer)
+    total_params = sum(p.numel() for p in generator.transformer.parameters())
+    trainable = sum(p.numel() for p in generator.transformer.parameters() if p.requires_grad)
+    print(f"\nTotal params: {total_params:,}  |  Trainable: {trainable:,}")
+    n_blocks = len(generator.transformer.transformer_blocks)
+    print(f"transformer_blocks: {n_blocks}")
+    print("=" * 70)
 
     # 3. Metrics
     print("\n[3] Setting up metrics...")
