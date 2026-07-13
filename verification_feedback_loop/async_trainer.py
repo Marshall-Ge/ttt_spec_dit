@@ -466,10 +466,25 @@ class AsyncTrainingWorker:
         self._loss_history.extend(losses)
 
         elapsed = time.time() - t0
+
+        # ---- 5.1 LoRA B 范数监控 (P0: 验证信号源修复是否生效) ----
+        # B 零初始化 → ||B||_F > 1e-6 表示梯度真的回流了。
+        # 若长期接近 0, 说明 supervised loss 在 no-op 起点退化 (信号源 bug 复现)。
+        b_norms = []
+        for layer_wrappers in self._layer_wrappers.values():
+            for lora in layer_wrappers.values():
+                b_norms.append(
+                    float(lora.lora_B.data.detach().float().norm().item()))
+        b_mean = sum(b_norms) / len(b_norms) if b_norms else 0.0
+        b_max = max(b_norms) if b_norms else 0.0
+        b_min = min(b_norms) if b_norms else 0.0
+
         print(f"  [VFL:AsyncTrainingWorker] cycle #{self._candidate_version} "
               f"done in {elapsed:.1f}s: "
               f"loss_mean={sum(losses)/len(losses):.6f}, "
-              f"steps={len(losses)} → {ckpt_path}")
+              f"steps={len(losses)}, "
+              f"||B||_F mean={b_mean:.6f} max={b_max:.6f} min={b_min:.6f} "
+              f"→ {ckpt_path}")
 
         # 顺便写一个 summary.json 方便离线分析
         try:
@@ -484,6 +499,9 @@ class AsyncTrainingWorker:
                     "elapsed_s": elapsed,
                     "buffer_samples": self.buffer.total_samples,
                     "crash_count": self._crash_count,
+                    "lora_b_norm_mean": b_mean,
+                    "lora_b_norm_max": b_max,
+                    "lora_b_norm_min": b_min,
                 }, f, indent=2)
         except OSError:
             pass
