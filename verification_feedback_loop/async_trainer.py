@@ -108,6 +108,38 @@ def _cleanup_old_checkpoints(output_dir: str, keep: int = 5):
 
 
 # ===========================================================================
+# Existing-LoRA discovery — deepcopy-safe wrapper collection
+# ===========================================================================
+
+
+def _collect_existing_lora_wrappers(transformer):
+    """扫描 transformer 中已有的 LoRALinear（来自推理模型 deepcopy），
+    构建 layer_wrappers 引用字典。
+
+    当推理模型已被预 attach LoRA (run_dit.py:821) 时使用此函数。
+    再次调用 attach_lora_all_layers 会静默失败：_resolve_path 拒绝
+    LoRALinear（继承 nn.Module 而非 nn.Linear），TypeError 被
+    attach_lora_to_block 的 except 吞掉。
+    """
+    from verification_feedback_loop.lora_adapter import (
+        _LORA_TARGET_PATHS, LoRALinear)
+    wrappers: Dict[int, Dict[str, Any]] = {}
+    for layer_idx, block in enumerate(transformer.transformer_blocks):
+        layer_w: Dict[str, Any] = {}
+        for path in _LORA_TARGET_PATHS:
+            try:
+                obj = block
+                for part in path.split("."):
+                    obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
+                if isinstance(obj, LoRALinear):
+                    layer_w[path] = obj
+            except (AttributeError, TypeError):
+                pass
+        wrappers[layer_idx] = layer_w
+    return wrappers
+
+
+# ===========================================================================
 # Phase 2: AsyncTrainingWorker
 # ===========================================================================
 
@@ -318,12 +350,14 @@ class AsyncTrainingWorker:
         self._train_model.float()
         self._train_model.train()
 
-        self._layer_wrappers = attach_lora_all_layers(
-            self._train_model,
-            rank=self.config.loRA_rank,
-            alpha=self.config.loRA_alpha,
-            time_conditioned=self.config.time_conditioned_lora,
-        )
+        # The inference model has already been LoRA-attached (run_dit.py:821),
+        # so the deepcopy carries LoRALinear wrappers with it. Re-attaching via
+        # attach_lora_all_layers fails silently because _resolve_path rejects
+        # LoRALinear (inherits nn.Module, not nn.Linear) and the TypeError is
+        # swallowed by attach_lora_to_block's broad except — leaving an empty
+        # {layer_id: {}} dict that makes every checkpoint save/load a no-op.
+        # Scan existing wrappers instead.
+        self._layer_wrappers = _collect_existing_lora_wrappers(self._train_model)
         freeze_backbone(self._train_model)
 
         n_params = count_lora_params(self._layer_wrappers)
@@ -470,11 +504,14 @@ class AsyncTrainingWorker:
         # ---- 5.1 LoRA B 范数监控 (P0: 验证信号源修复是否生效) ----
         # B 零初始化 → ||B||_F > 1e-6 表示梯度真的回流了。
         # 若长期接近 0, 说明 supervised loss 在 no-op 起点退化 (信号源 bug 复现)。
+        # 遍历 modules() 而非 _layer_wrappers：监控独立于字典填充状态，
+        # 即使未来收集逻辑再次出问题也能直接反映训练副本的真实参数。
+        from verification_feedback_loop.lora_adapter import LoRALinear
         b_norms = []
-        for layer_wrappers in self._layer_wrappers.values():
-            for lora in layer_wrappers.values():
+        for module in self._train_model.modules():
+            if isinstance(module, LoRALinear):
                 b_norms.append(
-                    float(lora.lora_B.data.detach().float().norm().item()))
+                    float(module.lora_B.data.detach().float().norm().item()))
         b_mean = sum(b_norms) / len(b_norms) if b_norms else 0.0
         b_max = max(b_norms) if b_norms else 0.0
         b_min = min(b_norms) if b_norms else 0.0
