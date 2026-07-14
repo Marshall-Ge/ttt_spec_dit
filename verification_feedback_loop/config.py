@@ -86,6 +86,16 @@ class VFLConfig:
     # next-step noise_pred temporal consistency).
     lambda_anchor: float = 0.0
 
+    # ---- M5 (v3): Homing + Identity loss ----
+    # Weight for L_identity = MSE(lora_hidden, true_feature), same computation
+    # as L_homing but independently weighted. L_total = (1 + lambda_identity)
+    # * MSE(lora_hidden, true_feature) + lambda_anchor * L_anchor.
+    # For SpecA check events, true_feature = base_block(block_input_hidden),
+    # so MSE(lora_hidden, true_feature) = ||LoRA(block_input_hidden)||^2,
+    # which is both L_homing (push LoRA toward true_feature) and L_identity
+    # (penalize LoRA residual magnitude).
+    lambda_identity: float = 1.0
+
     # ---- M6: 异步训练 ----
     trigger_min_samples: int = 200
     trigger_min_interval_s: float = 300.0

@@ -454,8 +454,7 @@ class AsyncTrainingWorker:
                 self._train_model,
                 curvature_events=step_events,
                 anchor_samples=anchors if anchors else None,
-                lambda_curvature=cfg.lambda_curvature,
-                curvature_order=cfg.curvature_order,
+                lambda_identity=cfg.lambda_identity,
             )
             if not torch.isfinite(loss) or loss.item() <= 0:
                 # 零 loss (e.g. 所有 events shape mismatch) → 跳过 step 但
@@ -489,7 +488,7 @@ class AsyncTrainingWorker:
                 "loss_mean": float(sum(losses) / max(1, len(losses))),
                 "loss_last": losses[-1],
                 "attached_layers": sorted(self._layer_wrappers.keys()),
-                "lambda_curvature": cfg.lambda_curvature,
+                "lambda_identity": cfg.lambda_identity,
                 "phase": 2,
             },
         )
@@ -710,8 +709,7 @@ class AsyncTrainer:
                 self.transformer,
                 curvature_events=usable_events,
                 anchor_samples=anchors if anchors else None,
-                lambda_curvature=cfg.lambda_curvature,
-                curvature_order=cfg.curvature_order,
+                lambda_identity=cfg.lambda_identity,
             )
             if torch.isfinite(loss_scaled) and loss_scaled.item() > 0:
                 loss_scaled.backward()
@@ -740,7 +738,7 @@ class AsyncTrainer:
                     "loss_mean": float(sum(losses) / max(1, len(losses))),
                     "loss_last": losses[-1] if losses else 0.0,
                     "attached_layers": self._attached_layers,
-                    "lambda_curvature": cfg.lambda_curvature,
+                    "lambda_identity": cfg.lambda_identity,
                 },
             )
             _cleanup_old_checkpoints(self.output_dir, keep=cfg.max_checkpoints)

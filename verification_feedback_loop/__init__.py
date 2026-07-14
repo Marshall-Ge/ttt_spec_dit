@@ -43,8 +43,6 @@ from verification_feedback_loop.lora_adapter import (
     compute_timestep_emb_for_transformer,
 )
 from verification_feedback_loop.curvature_loss import (
-    trajectory_curvature_loss,
-    trajectory_curvature_loss_from_buffer,
     compute_training_loss,
 )
 from verification_feedback_loop.async_trainer import (
@@ -102,8 +100,6 @@ __all__ = [
     "get_lora_t_emb",
     "compute_timestep_emb_for_transformer",
     # M5
-    "trajectory_curvature_loss",
-    "trajectory_curvature_loss_from_buffer",
     "compute_training_loss",
     # M6
     "AsyncTrainer",

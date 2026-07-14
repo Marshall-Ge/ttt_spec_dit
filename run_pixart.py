@@ -705,6 +705,7 @@ def run_t2i(args) -> Dict:
         vfl_cfg.loRA_rank = 4
         vfl_cfg.time_conditioned_lora = not getattr(
             args, "vfl_no_time_lora", False)
+        vfl_cfg.lambda_identity = getattr(args, "vfl_lambda_identity", 1.0)
 
         vfl_cal = OnlineCalibrator(ema_window=100)
         set_vfl_calibrator(vfl_cal)
@@ -1102,6 +1103,7 @@ def run_c2i(args) -> Dict:
         vfl_cfg.loRA_rank = 4
         vfl_cfg.time_conditioned_lora = not getattr(
             args, "vfl_no_time_lora", False)
+        vfl_cfg.lambda_identity = getattr(args, "vfl_lambda_identity", 1.0)
 
         vfl_cal = OnlineCalibrator(ema_window=100)
         set_vfl_calibrator(vfl_cal)

@@ -142,6 +142,11 @@ Examples:
                              "(γ(t_emb) gating on the A→B bottleneck). "
                              "Default: time-conditioning is ON; pass this "
                              "flag to fall back to vanilla LoRA.")
+    parser.add_argument("--vfl-lambda-identity", type=float, default=1.0,
+                        help="Weight for L_identity (no-op regularization) "
+                             "in VFL L3 loss. L_total = (1 + lambda_identity) "
+                             "* MSE(lora_hidden, true_feature) + lambda_anchor "
+                             "* L_anchor (default: 1.0)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
     parser.add_argument("--guidance_scale", type=float, default=DEFAULT_GUIDANCE_SCALE,
