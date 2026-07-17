@@ -24,6 +24,13 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from .compute_controller import (
+    ComputeAction,
+    ComputeController,
+    ComputeOpportunity,
+    VerificationResult,
+)
+
 
 # Precomputed 1 / n! for Taylor coefficients (up to order 6)
 _INV_FACTORIAL = [1.0, 1.0, 1.0 / 2.0, 1.0 / 6.0, 1.0 / 24.0, 1.0 / 120.0, 1.0 / 720.0]
@@ -54,7 +61,9 @@ class SpecAState:
         * ``module`` — current submodule name (``'attn'``/``'mlp'`` etc.).
     """
 
-    def __init__(self, num_steps: int):
+    def __init__(self, num_steps: int,
+                 controller: Optional[ComputeController] = None,
+                 trajectory_id: int = 0):
         # Written by the denoising loop.
         self.step: int = 0
 
@@ -62,6 +71,7 @@ class SpecAState:
         self.type: str = 'full'          # safe default; overwritten each forward
         self.last_type: str = 'None'
         self.last_layer_error: Optional[float] = 0.0
+        self.decision_threshold: Optional[float] = None
 
         # Written by the model during ``forward()``.
         self.layer: int = 0
@@ -69,6 +79,8 @@ class SpecAState:
 
         # Immutable after init.
         self.num_steps: int = num_steps
+        self.controller = controller
+        self.trajectory_id: int = trajectory_id
         self.activated_steps: List[int] = [num_steps - 1]  # descending order
 
 
@@ -123,6 +135,10 @@ class SpecACache:
         self.taylor_step_counter: int = 0
         self.check: bool = False
         self.full_count: int = 0
+        self.taylor_count: int = 0
+        self.probe_full_blocks: int = 0
+        self.corrected_probe_blocks: int = 0
+        self.recompute_full_blocks: int = 0
 
 
 # ===========================================================================
@@ -331,6 +347,8 @@ def speca_init(
     num_layers: int = 28,
     error_metric: str = 'cosine_similarity',
     check_layer: int = 27,
+    controller: Optional[ComputeController] = None,
+    trajectory_id: int = 0,
 ) -> Tuple[SpecACache, SpecAState]:
     """Allocate the SpecA cache and current-state objects.
 
@@ -356,8 +374,60 @@ def speca_init(
         error_metric=error_metric,
         check_layer=check_layer,
     )
-    current = SpecAState(num_steps=num_steps)
+    current = SpecAState(
+        num_steps=num_steps,
+        controller=controller,
+        trajectory_id=trajectory_id,
+    )
     return cache_dic, current
+
+
+def speca_controller_action(
+    current: SpecAState,
+    layer_idx: int,
+    distance: int,
+    verification_requested: bool,
+) -> Tuple[Optional[ComputeOpportunity], ComputeAction]:
+    if current.controller is None:
+        action = (ComputeAction.VERIFY if verification_requested
+                  else ComputeAction.APPROXIMATE)
+        return None, action
+
+    step_idx = current.num_steps - 1 - current.step
+    timestep_bucket = min(
+        int(step_idx * 3 / current.num_steps) if current.num_steps > 0 else 0,
+        2,
+    )
+    opportunity = ComputeOpportunity(
+        model="dit",
+        method="speca",
+        trajectory_id=current.trajectory_id,
+        step_idx=step_idx,
+        num_steps=current.num_steps,
+        layer_idx=layer_idx,
+        timestep_bucket=timestep_bucket,
+        approximation_distance=distance,
+        verification_requested=verification_requested,
+    )
+    return opportunity, current.controller.decide(opportunity)
+
+
+def speca_controller_observe(
+    current: SpecAState,
+    opportunity: Optional[ComputeOpportunity],
+    error_value: float,
+) -> bool:
+    if current.controller is None or opportunity is None:
+        return False
+    threshold = current.decision_threshold
+    if threshold is None:
+        return False
+    result = VerificationResult(
+        error_value=error_value,
+        threshold=threshold,
+        accepted=error_value <= threshold,
+    )
+    return current.controller.observe(opportunity, result)
 
 
 # ===========================================================================
@@ -380,6 +450,7 @@ def speca_cal_type(cache_dic: SpecACache, current: SpecAState,
     """
     min_taylor_steps = cache_dic.min_taylor_steps
     max_taylor_steps = cache_dic.max_taylor_steps
+    current.decision_threshold = None
 
     if current.last_type == 'full':
         # a full step just happened → next step is Taylor (at least try)
@@ -422,6 +493,8 @@ def speca_cal_type(cache_dic: SpecACache, current: SpecAState,
                 default=threshold)
             threshold = online_thresh
 
+        current.decision_threshold = threshold
+
         if cache_dic.taylor_step_counter >= min_taylor_steps:
             cache_dic.check = True
         else:
@@ -457,4 +530,5 @@ def speca_cal_type(cache_dic: SpecACache, current: SpecAState,
         cache_dic.cache_counter = 0
         current.activated_steps.append(current.step)
     else:
+        cache_dic.taylor_count += 1
         cache_dic.cache_counter += 1

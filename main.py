@@ -114,6 +114,12 @@ Examples:
                                  "cosine_similarity", "all"],
                         help="SpecA error metric for gate/threshold comparison "
                              "(default: cosine_similarity)")
+    parser.add_argument("--compute-controller", type=str, default="none",
+                        choices=["none", "probe_correct"],
+                        help="Verification-guided compute controller")
+    parser.add_argument("--controller-correction-policy", type=str,
+                        default="reject", choices=["reject", "always"],
+                        help="When probe_correct adopts the verified full output")
     # ---- TTT (Test-Time Training plugin, DiT-only) ----
     parser.add_argument("--ttt", action="store_true", default=False,
                         help="Enable online TTT plugin on top of TeaCache "
@@ -226,6 +232,14 @@ def validate_args(args):
         print(f"  [INFO] --thresh is ignored when --method ddim")
     if args.method == "speca" and args.thresh != DEFAULT_REL_L1_THRESH:
         print(f"  [INFO] --thresh is ignored when --method speca")
+    if args.compute_controller != "none":
+        if args.model != "dit" or args.method != "speca":
+            print("[ERROR] --compute-controller currently requires "
+                  "--model dit --method speca.")
+            return False
+    elif args.controller_correction_policy != "reject":
+        print("  [INFO] --controller-correction-policy is ignored when "
+              "--compute-controller none")
 
     # Metrics: warn about unknown, but don't remove yet (pipelines filter)
     unknown = set(args.metrics) - ALL_METRICS

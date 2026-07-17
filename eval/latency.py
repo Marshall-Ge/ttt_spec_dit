@@ -187,6 +187,21 @@ class FLOPsMetric(Metric):
         self._total_accel += n_calc * self._flops_full + n_skip * self._flops_skip
         self._n += 1
 
+    def add_speca_generation(self, full_steps: int, taylor_steps: int,
+                             probe_full_blocks: int, num_layers: int):
+        """Accumulate SpecA FLOPs using full-block-equivalent accounting."""
+        self._profile_once()
+        total_steps = full_steps + taylor_steps
+        block_flops = ((self._flops_full - self._flops_skip) / num_layers
+                       if num_layers > 0 else 0.0)
+        self._total_vanilla += total_steps * self._flops_full
+        self._total_accel += (
+            full_steps * self._flops_full
+            + taylor_steps * self._flops_skip
+            + probe_full_blocks * block_flops
+        )
+        self._n += 1
+
     def add_vanilla_steps(self, n_steps: int):
         """Accumulate FLOPs for a vanilla-only generation (no TeaCache)."""
         self._profile_once()

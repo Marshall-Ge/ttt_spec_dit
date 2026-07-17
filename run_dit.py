@@ -946,6 +946,15 @@ def run_c2i(args) -> Dict:
     ttt_state = None
     speca_cache_dic = None
     speca_current = None
+    speca_init_kwargs = None
+    compute_controller = None
+    speca_totals = {
+        "full_steps": 0,
+        "taylor_steps": 0,
+        "probe_full_blocks": 0,
+        "corrected_probe_blocks": 0,
+        "recompute_full_blocks": 0,
+    }
     ddim_steps = None
 
     if args.method == "teacache":
@@ -966,19 +975,24 @@ def run_c2i(args) -> Dict:
     elif args.method == "speca":
         num_blocks = len(generator.transformer.transformer_blocks)
         check_layer = 0 if getattr(args, "debug", False) else min(20, num_blocks - 1)
-        speca_cache_dic, speca_current = speca_init(
-            num_steps=args.num_steps,
-            base_threshold=args.speca_base_threshold,
-            decay_rate=args.speca_decay_rate,
-            min_taylor_steps=args.speca_min_taylor_steps,
-            max_taylor_steps=args.speca_max_taylor_steps,
-            max_order=4,
-            num_layers=len(generator.transformer.transformer_blocks),
-            error_metric=args.speca_error_metric,
-            check_layer=check_layer,
-        )
+        speca_init_kwargs = {
+            "num_steps": args.num_steps,
+            "base_threshold": args.speca_base_threshold,
+            "decay_rate": args.speca_decay_rate,
+            "min_taylor_steps": args.speca_min_taylor_steps,
+            "max_taylor_steps": args.speca_max_taylor_steps,
+            "max_order": 4,
+            "num_layers": num_blocks,
+            "error_metric": args.speca_error_metric,
+            "check_layer": check_layer,
+        }
+        if args.compute_controller == "probe_correct":
+            from accelerators.compute_controller import ProbeCorrectController
+            compute_controller = ProbeCorrectController(
+                correction_policy=args.controller_correction_policy)
         print(f"  SpecA ready (base_thresh={args.speca_base_threshold}, "
-              f"check_layer={check_layer})")
+              f"check_layer={check_layer}, "
+              f"controller={args.compute_controller})")
     else:
         print("  Baseline (full DDIM, no acceleration)")
 
@@ -1036,19 +1050,15 @@ def run_c2i(args) -> Dict:
             teacache_reset(teacache_state)
         if args.ttt and ttt_state is not None:
             ttt_reset_for_image(ttt_state)
-        if args.method == "speca":
+        if speca_init_kwargs is not None:
+            trajectory_id = batch_start // bs
             speca_cache_dic, speca_current = speca_init(
-                num_steps=args.num_steps,
-                base_threshold=args.speca_base_threshold,
-                decay_rate=args.speca_decay_rate,
-                min_taylor_steps=args.speca_min_taylor_steps,
-                max_taylor_steps=args.speca_max_taylor_steps,
-                max_order=4,
-                num_layers=len(generator.transformer.transformer_blocks),
-                error_metric=args.speca_error_metric,
-                check_layer=0 if getattr(args, "debug", False)
-                else min(20, len(generator.transformer.transformer_blocks) - 1),
+                **speca_init_kwargs,
+                controller=compute_controller,
+                trajectory_id=trajectory_id,
             )
+            if compute_controller is not None:
+                compute_controller.begin_trajectory(trajectory_id)
 
         # VFL (Phase 2): tag this batch's denoising trajectory with a unique
         # sample_id so curvature loss can group events from the same image.
@@ -1080,6 +1090,17 @@ def run_c2i(args) -> Dict:
                 ddim_steps=ddim_steps,
             )
         wall_s = time.time() - t0
+
+        if speca_cache_dic is not None:
+            speca_totals["full_steps"] += speca_cache_dic.full_count
+            speca_totals["taylor_steps"] += speca_cache_dic.taylor_count
+            speca_totals["probe_full_blocks"] += speca_cache_dic.probe_full_blocks
+            speca_totals["corrected_probe_blocks"] += (
+                speca_cache_dic.corrected_probe_blocks)
+            speca_totals["recompute_full_blocks"] += (
+                speca_cache_dic.recompute_full_blocks)
+            if compute_controller is not None:
+                compute_controller.end_trajectory()
         wall_times.append(wall_s)
         per_img_s = wall_s / actual_bs
 
@@ -1142,12 +1163,15 @@ def run_c2i(args) -> Dict:
             elif args.method == "teacache" and teacache_state is not None:
                 metrics["flops"].add_generation(
                     SimpleNamespace(decisions=teacache_state["decisions"]))
-            elif args.method == "speca":
-                full_cnt = speca_cache_dic.full_count
-                taylor_cnt = args.num_steps - full_cnt
-                metrics["flops"].add_generation(
-                    SimpleNamespace(
-                        decisions=["calc"] * full_cnt + ["skip"] * taylor_cnt))
+            elif args.method == "speca" and speca_cache_dic is not None:
+                metrics["flops"].add_speca_generation(
+                    full_steps=speca_cache_dic.full_count,
+                    taylor_steps=speca_cache_dic.taylor_count,
+                    probe_full_blocks=(
+                        speca_cache_dic.probe_full_blocks
+                        + speca_cache_dic.recompute_full_blocks),
+                    num_layers=len(generator.transformer.transformer_blocks),
+                )
             else:
                 metrics["flops"].add_vanilla_steps(args.num_steps)
 
@@ -1239,15 +1263,28 @@ def run_c2i(args) -> Dict:
         agg["ttt_trained_steps"] = ts["trained_steps"]
         agg["ttt_loss_mean"] = ts["session_loss_mean"]
         agg["ttt_plugin_params"] = ts["plugin_params"]
-    elif args.method == "speca" and speca_cache_dic is not None:
-        full_cnt = speca_cache_dic.full_count
-        taylor_cnt = args.num_steps - full_cnt
+    elif args.method == "speca":
+        full_cnt = speca_totals["full_steps"]
+        taylor_cnt = speca_totals["taylor_steps"]
         total = full_cnt + taylor_cnt
         agg["skip_ratio"] = taylor_cnt / total if total > 0 else 0.0
         agg["taylor_steps"] = taylor_cnt
         agg["full_steps"] = full_cnt
         agg["total_calc"] = full_cnt
         agg["total_skip"] = taylor_cnt
+        agg["speca_probe_full_blocks"] = speca_totals["probe_full_blocks"]
+        agg["speca_corrected_probe_blocks"] = (
+            speca_totals["corrected_probe_blocks"])
+        agg["speca_recompute_full_blocks"] = (
+            speca_totals["recompute_full_blocks"])
+        num_layers = len(generator.transformer.transformer_blocks)
+        agg["speca_full_block_equivalents"] = (
+            full_cnt * num_layers
+            + speca_totals["probe_full_blocks"]
+            + speca_totals["recompute_full_blocks"]
+        )
+        if compute_controller is not None:
+            agg["compute_controller"] = compute_controller.stats()
 
     # ---- VFL stats ----
     if vfl_buf is not None:

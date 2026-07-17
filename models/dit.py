@@ -27,10 +27,13 @@ import torch.nn.functional as F
 
 from diffusers.models.transformers.transformer_2d import Transformer2DModel
 
+from accelerators.compute_controller import ComputeAction
 from accelerators.speca import (
     SpecACache,
     SpecAState,
     speca_cal_type,
+    speca_controller_action,
+    speca_controller_observe,
     taylor_cache_init,
     derivative_approximation,
     cache_step_dit,
@@ -364,7 +367,21 @@ class DiTTransformer2D(nn.Module):
             elif step_type == 'Taylor':
                 distance = current.step - current.activated_steps[-1]
                 check_layer = cache_dic.check_layer
-                do_check = (layer_idx == check_layer and cache_dic.check)
+                verification_requested = (
+                    layer_idx == check_layer and cache_dic.check)
+                opportunity = None
+                compute_action = None
+                if current.controller is None:
+                    do_check = verification_requested
+                else:
+                    opportunity, compute_action = speca_controller_action(
+                        current,
+                        layer_idx=layer_idx,
+                        distance=distance,
+                        verification_requested=verification_requested,
+                    )
+                    do_check = compute_action in {
+                        ComputeAction.VERIFY, ComputeAction.RECOMPUTE}
                 _block_input = None
                 if do_check:
                     _block_input = hidden_states.clone()
@@ -378,6 +395,11 @@ class DiTTransformer2D(nn.Module):
                 )
 
                 if do_check:
+                    taylor_hidden = hidden_states
+                    if compute_action == ComputeAction.RECOMPUTE:
+                        cache_dic.recompute_full_blocks += 1
+                    else:
+                        cache_dic.probe_full_blocks += 1
                     fnh, fgate_msa, fshift_mlp, fscale_mlp, fgate_mlp = block.norm1(
                         full_hidden, timestep=timestep, class_labels=class_labels,
                         hidden_dtype=full_hidden.dtype,
@@ -401,7 +423,7 @@ class DiTTransformer2D(nn.Module):
                         timestep_val=get_vfl_step_idx(),
                         step_idx=get_vfl_step_idx(),
                         num_steps=get_vfl_num_steps(),
-                        predicted_hidden=hidden_states,
+                        predicted_hidden=taylor_hidden,
                         full_hidden=full_hidden,
                         error_value=gate_value,
                         module_name="block",
@@ -409,6 +431,16 @@ class DiTTransformer2D(nn.Module):
                         class_labels=class_labels,
                         block_input_hidden=_block_input,
                     )
+
+                    use_verified = False
+                    if compute_action == ComputeAction.RECOMPUTE:
+                        use_verified = True
+                    elif compute_action == ComputeAction.VERIFY:
+                        use_verified = speca_controller_observe(
+                            current, opportunity, gate_value)
+                    if use_verified:
+                        hidden_states = full_hidden
+                        cache_dic.corrected_probe_blocks += 1
 
         # ---- TeaCache: save residual after blocks complete ----
         if use_teacache:

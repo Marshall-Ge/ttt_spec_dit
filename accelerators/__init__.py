@@ -7,11 +7,20 @@
              loop (the model itself is agnostic to it).
 """
 
+from .compute_controller import (
+    ComputeAction,
+    ComputeController,
+    ComputeOpportunity,
+    ProbeCorrectController,
+    VerificationResult,
+)
 from .speca import (
     SpecACache,
     SpecAState,
     speca_init,
     speca_cal_type,
+    speca_controller_action,
+    speca_controller_observe,
     derivative_approximation,
     taylor_formula,
     taylor_cache_init,
