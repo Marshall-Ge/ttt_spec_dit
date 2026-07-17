@@ -114,6 +114,8 @@ Examples:
                                  "cosine_similarity", "all"],
                         help="SpecA error metric for gate/threshold comparison "
                              "(default: cosine_similarity)")
+    parser.add_argument("--speca_check_layer", type=int, default=None,
+                        help="DiT SpecA probe layer index (default: 20)")
     parser.add_argument("--compute-controller", type=str, default="none",
                         choices=["none", "probe_correct"],
                         help="Verification-guided compute controller")
@@ -232,6 +234,10 @@ def validate_args(args):
         print(f"  [INFO] --thresh is ignored when --method ddim")
     if args.method == "speca" and args.thresh != DEFAULT_REL_L1_THRESH:
         print(f"  [INFO] --thresh is ignored when --method speca")
+    if getattr(args, "speca_check_layer", None) is not None:
+        if args.model != "dit" or args.method != "speca":
+            print("[ERROR] --speca_check_layer requires --model dit --method speca.")
+            return False
     if args.compute_controller != "none":
         if args.model != "dit" or args.method != "speca":
             print("[ERROR] --compute-controller currently requires "

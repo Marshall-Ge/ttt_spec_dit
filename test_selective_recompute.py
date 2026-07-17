@@ -80,6 +80,21 @@ def test_speca_counts_every_step_once():
     assert cache.full_count + cache.taylor_count == 6
     assert cache.full_count > 0
     assert cache.taylor_count > 0
+    assert cache.check_layer == 0
+
+
+@pytest.mark.parametrize("check_layer", [-1, 1])
+def test_speca_rejects_out_of_range_check_layer(check_layer):
+    with pytest.raises(ValueError, match="check_layer must be in"):
+        speca_init(
+            num_steps=6,
+            base_threshold=0.01,
+            decay_rate=0.01,
+            min_taylor_steps=1,
+            max_taylor_steps=4,
+            num_layers=1,
+            check_layer=check_layer,
+        )
 
 
 def test_speca_flops_include_probe_blocks_once():

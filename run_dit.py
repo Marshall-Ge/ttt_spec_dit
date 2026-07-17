@@ -974,7 +974,11 @@ def run_c2i(args) -> Dict:
         print(f"  DDIM sampling ({args.num_steps} steps, no caching)")
     elif args.method == "speca":
         num_blocks = len(generator.transformer.transformer_blocks)
-        check_layer = 0 if getattr(args, "debug", False) else min(20, num_blocks - 1)
+        default_check_layer = (
+            0 if getattr(args, "debug", False) else min(20, num_blocks - 1))
+        check_layer = getattr(args, "speca_check_layer", None)
+        if check_layer is None:
+            check_layer = default_check_layer
         speca_init_kwargs = {
             "num_steps": args.num_steps,
             "base_threshold": args.speca_base_threshold,
@@ -1272,6 +1276,7 @@ def run_c2i(args) -> Dict:
         agg["full_steps"] = full_cnt
         agg["total_calc"] = full_cnt
         agg["total_skip"] = taylor_cnt
+        agg["speca_check_layer"] = speca_init_kwargs["check_layer"]
         agg["speca_probe_full_blocks"] = speca_totals["probe_full_blocks"]
         agg["speca_corrected_probe_blocks"] = (
             speca_totals["corrected_probe_blocks"])

@@ -107,6 +107,10 @@ class SpecACache:
                  max_order: int = 4,
                  error_metric: str = 'cosine_similarity',
                  check_layer: int = 27):
+        if not 0 <= check_layer < num_layers:
+            raise ValueError(
+                f"check_layer must be in [0, {num_layers - 1}], got {check_layer}")
+
         # ---- Nested cache ----
         cache: Dict[int, Dict[int, Dict[str, list]]] = {}
         # Active slot (most recent full step).
