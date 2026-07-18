@@ -97,6 +97,39 @@ def test_speca_rejects_out_of_range_check_layer(check_layer):
         )
 
 
+def test_speca_suffix_budget_is_per_trajectory():
+    _, current = speca_init(
+        num_steps=6,
+        base_threshold=0.01,
+        decay_rate=0.01,
+        min_taylor_steps=1,
+        max_taylor_steps=4,
+        num_layers=4,
+        check_layer=1,
+        suffix_recompute_blocks=3,
+        suffix_recompute_budget=7,
+    )
+
+    assert current.request_suffix_recompute(4) == 3
+    assert current.request_suffix_recompute(4) == 3
+    assert current.request_suffix_recompute(4) == 1
+    assert current.request_suffix_recompute(4) == 0
+
+
+def test_speca_rejects_partial_suffix_settings():
+    with pytest.raises(ValueError, match="must both be zero or positive"):
+        speca_init(
+            num_steps=6,
+            base_threshold=0.01,
+            decay_rate=0.01,
+            min_taylor_steps=1,
+            max_taylor_steps=4,
+            num_layers=1,
+            check_layer=0,
+            suffix_recompute_blocks=1,
+        )
+
+
 def test_speca_flops_include_probe_blocks_once():
     metric = FLOPsMetric.__new__(FLOPsMetric)
     metric._profiled = True
@@ -118,7 +151,8 @@ def test_speca_flops_include_probe_blocks_once():
     assert metric._n == 1
 
 
-def _run_tiny_speca(model, controller, monkeypatch):
+def _run_tiny_speca(model, controller, monkeypatch,
+                     suffix_recompute_blocks=0, suffix_recompute_budget=0):
     import models.dit as dit_module
 
     events = []
@@ -136,10 +170,12 @@ def _run_tiny_speca(model, controller, monkeypatch):
         decay_rate=0.01,
         min_taylor_steps=1,
         max_taylor_steps=4,
-        num_layers=1,
+        num_layers=len(model.transformer_blocks),
         check_layer=0,
         controller=controller,
         trajectory_id=0,
+        suffix_recompute_blocks=suffix_recompute_blocks,
+        suffix_recompute_budget=suffix_recompute_budget,
     )
     if controller is not None:
         controller.begin_trajectory(0)
@@ -197,3 +233,33 @@ def test_probe_correction_preserves_pre_correction_event(monkeypatch):
     assert baseline_cache.corrected_probe_blocks == 0
     assert corrected_cache.corrected_probe_blocks == len(corrected_events)
     assert corrected_cache.probe_full_blocks == len(corrected_events)
+
+
+def test_suffix_recompute_uses_budget_without_extra_events(monkeypatch):
+    from models.dit import DiTTransformer2D
+
+    torch.manual_seed(13)
+    model = DiTTransformer2D(
+        num_attention_heads=1,
+        attention_head_dim=4,
+        in_channels=4,
+        out_channels=8,
+        num_layers=2,
+        sample_size=4,
+        patch_size=2,
+        num_embeds_ada_norm=10,
+    ).eval()
+
+    controller = ProbeCorrectController("always")
+    cache, events = _run_tiny_speca(
+        model,
+        controller=controller,
+        monkeypatch=monkeypatch,
+        suffix_recompute_blocks=1,
+        suffix_recompute_budget=1,
+    )
+
+    assert events
+    assert cache.probe_full_blocks == len(events)
+    assert cache.corrected_probe_blocks == len(events)
+    assert cache.recompute_full_blocks == 1

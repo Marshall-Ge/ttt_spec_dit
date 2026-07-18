@@ -7,7 +7,7 @@ cd "$REPO_ROOT"
 
 MODE="${1:-smoke}"
 if [[ $# -gt 1 ]]; then
-    echo "Usage: bash scripts/run_selective_recompute.sh [smoke|diagnostic]" >&2
+    echo "Usage: bash scripts/run_selective_recompute.sh [smoke|diagnostic|suffix]" >&2
     exit 2
 fi
 
@@ -16,15 +16,26 @@ case "$MODE" in
         DEFAULT_N_PROMPTS=80
         DEFAULT_SEEDS="42"
         DEFAULT_CHECK_LAYERS="20"
+        DEFAULT_SUFFIX_LENGTHS="0"
+        DEFAULT_SUFFIX_BUDGET=0
         ;;
     diagnostic)
         DEFAULT_N_PROMPTS=500
         DEFAULT_SEEDS="42 43 44"
         DEFAULT_CHECK_LAYERS="20 27"
+        DEFAULT_SUFFIX_LENGTHS="0"
+        DEFAULT_SUFFIX_BUDGET=0
+        ;;
+    suffix)
+        DEFAULT_N_PROMPTS=500
+        DEFAULT_SEEDS="42"
+        DEFAULT_CHECK_LAYERS="20"
+        DEFAULT_SUFFIX_LENGTHS="0 1 3 7"
+        DEFAULT_SUFFIX_BUDGET=21
         ;;
     *)
         echo "Unknown mode: $MODE" >&2
-        echo "Usage: bash scripts/run_selective_recompute.sh [smoke|diagnostic]" >&2
+        echo "Usage: bash scripts/run_selective_recompute.sh [smoke|diagnostic|suffix]" >&2
         exit 2
         ;;
 esac
@@ -33,6 +44,8 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 N_PROMPTS="${N_PROMPTS:-$DEFAULT_N_PROMPTS}"
 SEEDS="${SEEDS:-${SEED:-$DEFAULT_SEEDS}}"
 SPECA_CHECK_LAYERS="${SPECA_CHECK_LAYERS:-${SPECA_CHECK_LAYER:-$DEFAULT_CHECK_LAYERS}}"
+SUFFIX_LENGTHS="${SUFFIX_LENGTHS:-$DEFAULT_SUFFIX_LENGTHS}"
+CONTROLLER_SUFFIX_BUDGET="${CONTROLLER_SUFFIX_BUDGET:-$DEFAULT_SUFFIX_BUDGET}"
 STEPS="${STEPS:-50}"
 GUIDANCE="${GUIDANCE:-2.0}"
 BATCH="${BATCH:-32}"
@@ -64,7 +77,13 @@ fi
 
 read -r -a seed_values <<< "$SEEDS"
 read -r -a check_layer_values <<< "$SPECA_CHECK_LAYERS"
-case_count=$((${#seed_values[@]} * ${#check_layer_values[@]} * 3))
+read -r -a suffix_length_values <<< "$SUFFIX_LENGTHS"
+if [[ "$MODE" == "suffix" ]]; then
+    policies_per_group=$((${#suffix_length_values[@]} + 1))
+else
+    policies_per_group=3
+fi
+case_count=$((${#seed_values[@]} * ${#check_layer_values[@]} * policies_per_group))
 
 echo "Selective recompute comparison"
 echo "Mode: $MODE"
@@ -73,6 +92,9 @@ echo "Cases: $case_count"
 echo "Prompts=$N_PROMPTS Seeds=[$SEEDS] CheckLayers=[$SPECA_CHECK_LAYERS]"
 echo "Steps=$STEPS Guidance=$GUIDANCE Batch=$BATCH"
 echo "SpecA: base=$SPECA_BASE_THRESHOLD decay=$SPECA_DECAY_RATE min=$SPECA_MIN_TAYLOR_STEPS max=$SPECA_MAX_TAYLOR_STEPS metric=$SPECA_ERROR_METRIC"
+if [[ "$MODE" == "suffix" ]]; then
+    echo "Suffix lengths=[$SUFFIX_LENGTHS] budget=$CONTROLLER_SUFFIX_BUDGET blocks/trajectory"
+fi
 
 run_case() {
     local group_root="$1"
@@ -81,6 +103,8 @@ run_case() {
     local name="$4"
     local controller="$5"
     local policy="${6:-}"
+    local suffix_blocks="${7:-0}"
+    local suffix_budget="${8:-0}"
     local output_dir="$group_root/$name"
     local log_file="$output_dir/run.log"
 
@@ -105,6 +129,8 @@ run_case() {
         --speca_error_metric "$SPECA_ERROR_METRIC"
         --speca_check_layer "$check_layer"
         --compute-controller "$controller"
+        --controller-suffix-blocks "$suffix_blocks"
+        --controller-suffix-budget "$suffix_budget"
         --metrics fid is latency flops speed
         --output_dir "$output_dir"
     )
@@ -129,9 +155,24 @@ for seed in "${seed_values[@]}"; do
         else
             group_root="$RUN_ROOT/layer_${check_layer}/seed_${seed}"
         fi
-        run_case "$group_root" "$check_layer" "$seed" "none" "none"
-        run_case "$group_root" "$check_layer" "$seed" "reject" "probe_correct" "reject"
-        run_case "$group_root" "$check_layer" "$seed" "always" "probe_correct" "always"
+
+        if [[ "$MODE" == "suffix" ]]; then
+            run_case "$group_root" "$check_layer" "$seed" "none" "none" "" 0 0
+            for suffix_blocks in "${suffix_length_values[@]}"; do
+                if [[ "$suffix_blocks" -eq 0 ]]; then
+                    suffix_budget=0
+                else
+                    suffix_budget="$CONTROLLER_SUFFIX_BUDGET"
+                fi
+                run_case "$group_root" "$check_layer" "$seed" \
+                    "always_k${suffix_blocks}" "probe_correct" "always" \
+                    "$suffix_blocks" "$suffix_budget"
+            done
+        else
+            run_case "$group_root" "$check_layer" "$seed" "none" "none"
+            run_case "$group_root" "$check_layer" "$seed" "reject" "probe_correct" "reject"
+            run_case "$group_root" "$check_layer" "$seed" "always" "probe_correct" "always"
+        fi
     done
 done
 

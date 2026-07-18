@@ -122,6 +122,10 @@ Examples:
     parser.add_argument("--controller-correction-policy", type=str,
                         default="reject", choices=["reject", "always"],
                         help="When probe_correct adopts the verified full output")
+    parser.add_argument("--controller-suffix-blocks", type=int, default=0,
+                        help="Additional full blocks after a verified probe")
+    parser.add_argument("--controller-suffix-budget", type=int, default=0,
+                        help="Per-trajectory budget for suffix full blocks")
     # ---- TTT (Test-Time Training plugin, DiT-only) ----
     parser.add_argument("--ttt", action="store_true", default=False,
                         help="Enable online TTT plugin on top of TeaCache "
@@ -246,6 +250,18 @@ def validate_args(args):
     elif args.controller_correction_policy != "reject":
         print("  [INFO] --controller-correction-policy is ignored when "
               "--compute-controller none")
+
+    suffix_blocks = getattr(args, "controller_suffix_blocks", 0)
+    suffix_budget = getattr(args, "controller_suffix_budget", 0)
+    if suffix_blocks < 0 or suffix_budget < 0:
+        print("[ERROR] suffix blocks and budget must be non-negative.")
+        return False
+    if (suffix_blocks == 0) != (suffix_budget == 0):
+        print("[ERROR] suffix blocks and budget must both be zero or positive.")
+        return False
+    if suffix_blocks > 0 and args.compute_controller == "none":
+        print("[ERROR] suffix recompute requires --compute-controller probe_correct.")
+        return False
 
     # Metrics: warn about unknown, but don't remove yet (pipelines filter)
     unknown = set(args.metrics) - ALL_METRICS

@@ -63,7 +63,9 @@ class SpecAState:
 
     def __init__(self, num_steps: int,
                  controller: Optional[ComputeController] = None,
-                 trajectory_id: int = 0):
+                 trajectory_id: int = 0,
+                 suffix_recompute_blocks: int = 0,
+                 suffix_recompute_budget: int = 0):
         # Written by the denoising loop.
         self.step: int = 0
 
@@ -82,6 +84,25 @@ class SpecAState:
         self.controller = controller
         self.trajectory_id: int = trajectory_id
         self.activated_steps: List[int] = [num_steps - 1]  # descending order
+        if suffix_recompute_blocks < 0 or suffix_recompute_budget < 0:
+            raise ValueError("suffix recompute settings must be non-negative")
+        if (suffix_recompute_blocks == 0) != (suffix_recompute_budget == 0):
+            raise ValueError(
+                "suffix_recompute_blocks and suffix_recompute_budget "
+                "must both be zero or positive")
+        self.suffix_recompute_blocks = suffix_recompute_blocks
+        self.suffix_recompute_remaining = suffix_recompute_budget
+
+    def request_suffix_recompute(self, available_blocks: int) -> int:
+        if self.suffix_recompute_blocks == 0:
+            return 0
+        granted = min(
+            self.suffix_recompute_blocks,
+            self.suffix_recompute_remaining,
+            available_blocks,
+        )
+        self.suffix_recompute_remaining -= granted
+        return granted
 
 
 # ===========================================================================
@@ -353,6 +374,8 @@ def speca_init(
     check_layer: int = 27,
     controller: Optional[ComputeController] = None,
     trajectory_id: int = 0,
+    suffix_recompute_blocks: int = 0,
+    suffix_recompute_budget: int = 0,
 ) -> Tuple[SpecACache, SpecAState]:
     """Allocate the SpecA cache and current-state objects.
 
@@ -382,6 +405,8 @@ def speca_init(
         num_steps=num_steps,
         controller=controller,
         trajectory_id=trajectory_id,
+        suffix_recompute_blocks=suffix_recompute_blocks,
+        suffix_recompute_budget=suffix_recompute_budget,
     )
     return cache_dic, current
 

@@ -178,6 +178,17 @@ def _vfl_record_teacache_event(layer_id, timestep_val, step_idx, num_steps,
         )
 
 
+def _compute_dit_block_from_norm(block, hidden_states, norm_hidden,
+                                 gate_msa, shift_mlp, scale_mlp, gate_mlp):
+    attn_out = block.attn1(norm_hidden)
+    hidden_states = hidden_states + gate_msa.unsqueeze(1) * attn_out
+    norm_ff = block.norm3(hidden_states)
+    modulated_ff = norm_ff * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+    ff_out = block.ff(modulated_ff)
+    hidden_states = hidden_states + gate_mlp.unsqueeze(1) * ff_out
+    return hidden_states
+
+
 class DiTTransformer2D(nn.Module):
     """Explicit DiT-2-256 transformer with SpecA + TeaCache-aware forward.
 
@@ -334,10 +345,14 @@ class DiTTransformer2D(nn.Module):
             ori_hidden = hidden_states.clone()
 
         # 3. Block loop (visible, no monkeypatch).
+        suffix_recompute_until = -1
         for layer_idx, block in enumerate(self.transformer_blocks):
             if use_speca:
                 current.layer = layer_idx
             step_type = 'full' if (vanilla or use_teacache) else current.type
+            if (use_speca and current.type == 'Taylor'
+                    and layer_idx <= suffix_recompute_until):
+                step_type = 'suffix_full'
 
             # adaLN-Zero: returns (norm_hidden, gate_msa, shift_mlp, scale_mlp, gate_mlp)
             norm_hidden, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.norm1(
@@ -363,6 +378,12 @@ class DiTTransformer2D(nn.Module):
                 if use_speca:
                     derivative_approximation(cache_dic, current, ff_out)
                 hidden_states = hidden_states + gate_mlp.unsqueeze(1) * ff_out
+
+            elif step_type == 'suffix_full':
+                hidden_states = _compute_dit_block_from_norm(
+                    block, hidden_states, norm_hidden, gate_msa,
+                    shift_mlp, scale_mlp, gate_mlp)
+                cache_dic.recompute_full_blocks += 1
 
             elif step_type == 'Taylor':
                 distance = current.step - current.activated_steps[-1]
@@ -404,12 +425,9 @@ class DiTTransformer2D(nn.Module):
                         full_hidden, timestep=timestep, class_labels=class_labels,
                         hidden_dtype=full_hidden.dtype,
                     )
-                    attn_full = block.attn1(fnh)
-                    full_hidden = full_hidden + fgate_msa.unsqueeze(1) * attn_full
-                    norm_ff = block.norm3(full_hidden)
-                    modulated_ff = norm_ff * (1 + fscale_mlp[:, None]) + fshift_mlp[:, None]
-                    ff_full = block.ff(modulated_ff)
-                    full_hidden = full_hidden + fgate_mlp.unsqueeze(1) * ff_full
+                    full_hidden = _compute_dit_block_from_norm(
+                        block, full_hidden, fnh, fgate_msa,
+                        fshift_mlp, fscale_mlp, fgate_mlp)
 
                     gate_value, _ = compute_error_gate(
                         hidden_states, full_hidden,
@@ -441,6 +459,9 @@ class DiTTransformer2D(nn.Module):
                     if use_verified:
                         hidden_states = full_hidden
                         cache_dic.corrected_probe_blocks += 1
+                        suffix_blocks = current.request_suffix_recompute(
+                            len(self.transformer_blocks) - layer_idx - 1)
+                        suffix_recompute_until = layer_idx + suffix_blocks
 
         # ---- TeaCache: save residual after blocks complete ----
         if use_teacache:

@@ -989,6 +989,10 @@ def run_c2i(args) -> Dict:
             "num_layers": num_blocks,
             "error_metric": args.speca_error_metric,
             "check_layer": check_layer,
+            "suffix_recompute_blocks": getattr(
+                args, "controller_suffix_blocks", 0),
+            "suffix_recompute_budget": getattr(
+                args, "controller_suffix_budget", 0),
         }
         if args.compute_controller == "probe_correct":
             from accelerators.compute_controller import ProbeCorrectController
@@ -1277,6 +1281,10 @@ def run_c2i(args) -> Dict:
         agg["total_calc"] = full_cnt
         agg["total_skip"] = taylor_cnt
         agg["speca_check_layer"] = speca_init_kwargs["check_layer"]
+        agg["speca_suffix_recompute_blocks"] = speca_init_kwargs[
+            "suffix_recompute_blocks"]
+        agg["speca_suffix_recompute_budget"] = speca_init_kwargs[
+            "suffix_recompute_budget"]
         agg["speca_probe_full_blocks"] = speca_totals["probe_full_blocks"]
         agg["speca_corrected_probe_blocks"] = (
             speca_totals["corrected_probe_blocks"])
