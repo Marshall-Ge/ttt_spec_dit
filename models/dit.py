@@ -208,6 +208,7 @@ class DiTTransformer2D(nn.Module):
                  patch_size: int = 2,
                  num_embeds_ada_norm: int = 1000):
         super().__init__()
+        self.last_cfg_disagreement = 0.0
 
         # Build a stock diffusers Transformer2DModel purely to harvest its
         # submodule tree (names + shapes match the checkpoint exactly).
@@ -687,7 +688,8 @@ class DiTTransformer2D(nn.Module):
                          cache_dic: Optional[SpecACache],
                          teacache_state: Optional[dict] = None,
                          class_labels: torch.Tensor = None,
-                         cfg_scale: float = 4.0):
+                         cfg_scale: float = 4.0,
+                         track_cfg_disagreement: bool = False) -> torch.Tensor:
         half = hidden_states[: len(hidden_states) // 2]
         combined = torch.cat([half, half], dim=0)
         model_out = self.forward(combined, timestep, current, cache_dic,
@@ -697,9 +699,15 @@ class DiTTransformer2D(nn.Module):
         # noise channels = config.in_channels (= 4 for SD VAE latent).
         eps, rest = model_out[:, :self.config.in_channels], model_out[:, self.config.in_channels:]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+        cfg_delta = cond_eps - uncond_eps
+        half_eps = uncond_eps + cfg_scale * cfg_delta
         eps = torch.cat([half_eps, half_eps], dim=0)
-        return torch.cat([eps, rest], dim=1)
+        guided_output = torch.cat([eps, rest], dim=1)
+        if track_cfg_disagreement:
+            denominator = uncond_eps.detach().float().norm().clamp_min(1e-8)
+            self.last_cfg_disagreement = float(
+                cfg_delta.detach().float().norm().div(denominator).item())
+        return guided_output
 
     def forward_with_cfg_ttt(self,
                              hidden_states: torch.Tensor,

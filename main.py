@@ -126,6 +126,18 @@ Examples:
                         help="Additional full blocks after a verified probe")
     parser.add_argument("--controller-suffix-budget", type=int, default=0,
                         help="Per-trajectory budget for suffix full blocks")
+    # ---- COVR-Spec counterfactual shadow auditing (DiT + SpecA) ----
+    parser.add_argument("--covr-shadow", action="store_true", default=False,
+                        help="Record paired Taylor/full counterfactual labels "
+                             "without changing the SpecA trajectory")
+    parser.add_argument("--covr-output-dir", type=str, default=None,
+                        help="COVR event directory (default: <output_dir>/covr)")
+    parser.add_argument("--covr-session-id", type=str, default=None,
+                        help="Stable COVR session ID (default: timestamp + seed)")
+    parser.add_argument("--covr-max-events", type=int, default=None,
+                        help="Maximum scalar COVR events to record")
+    parser.add_argument("--covr-base-model-version", type=str, default=None,
+                        help="Base model version recorded in COVR event metadata")
     # ---- TTT (Test-Time Training plugin, DiT-only) ----
     parser.add_argument("--ttt", action="store_true", default=False,
                         help="Enable online TTT plugin on top of TeaCache "
@@ -261,6 +273,22 @@ def validate_args(args):
         return False
     if suffix_blocks > 0 and args.compute_controller == "none":
         print("[ERROR] suffix recompute requires --compute-controller probe_correct.")
+        return False
+
+    if args.covr_shadow:
+        if args.model != "dit" or args.method != "speca":
+            print("[ERROR] --covr-shadow requires --model dit --method speca.")
+            return False
+        if args.compute_controller != "none":
+            print("[ERROR] --covr-shadow cannot be combined with the legacy "
+                  "--compute-controller experiment.")
+            return False
+        if args.vfl:
+            print("[ERROR] --covr-shadow cannot be combined with VFL; Gate data "
+                  "must use an unchanged backbone and static SpecA policy.")
+            return False
+    if args.covr_max_events is not None and args.covr_max_events <= 0:
+        print("[ERROR] --covr-max-events must be positive.")
         return False
 
     # Metrics: warn about unknown, but don't remove yet (pipelines filter)

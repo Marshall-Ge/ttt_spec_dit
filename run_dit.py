@@ -14,6 +14,7 @@ Sampling methods (controlled by ``args.method``):
   - speca     (Speculative Taylor acceleration via cache_dic/current)
 """
 
+import copy
 import json
 import os
 import time
@@ -49,6 +50,15 @@ from accelerators.teacache import (
     teacache_stats, compute_modulated_input_dit,
 )
 from accelerators.speca import SpecACache, SpecAState, speca_init
+from accelerators.covr import (
+    COVRAction,
+    COVRContext,
+    COVRVersion,
+    CounterfactualEvent,
+    ShadowAuditRecorder,
+    summarize_taylor_cache,
+    transition_defects,
+)
 from models.ttt_plugin import (
     SessionAdaLNModulator, ttt_state_init, ttt_reset_for_image,
     ttt_train_step, ttt_record_skip, ttt_session_stats,
@@ -71,6 +81,78 @@ C2I_VALID_METRICS = {
 DIT_IMAGE_SIZE = 256
 DIT_LATENT_SIZE = 32
 DIT_NULL_CLASS = 1000
+
+
+def _covr_log_snr(scheduler, timestep) -> float:
+    alphas_cumprod = getattr(scheduler, "alphas_cumprod", None)
+    if alphas_cumprod is None:
+        return 0.0
+    index = int(timestep.item()) if torch.is_tensor(timestep) else int(timestep)
+    alpha = float(alphas_cumprod[index].detach().float().item())
+    alpha = min(max(alpha, 1e-8), 1.0 - 1e-8)
+    return float(np.log(alpha / (1.0 - alpha)))
+
+
+def _covr_step_size(timesteps, step_idx: int) -> float:
+    if step_idx + 1 >= len(timesteps):
+        return 0.0
+    current = float(timesteps[step_idx])
+    following = float(timesteps[step_idx + 1])
+    return abs(current - following) / max(abs(current), 1.0)
+
+
+def _covr_scheduler_pair(scheduler, noise_approx, noise_full, timestep, latents):
+    approx_scheduler = copy.deepcopy(scheduler)
+    full_scheduler = copy.deepcopy(scheduler)
+    x_prev_approx = approx_scheduler.step(
+        noise_approx.detach(), timestep, latents.detach(), return_dict=False)[0]
+    x_prev_full = full_scheduler.step(
+        noise_full.detach(), timestep, latents.detach(), return_dict=False)[0]
+    return x_prev_approx, x_prev_full
+
+
+def _covr_shadow_full(transformer, latent_input, timestep, class_labels,
+                      guidance_scale):
+    if guidance_scale > 1.0:
+        return transformer.forward_with_cfg(
+            latent_input, timestep,
+            current=None, cache_dic=None, teacache_state=None,
+            class_labels=class_labels, cfg_scale=guidance_scale,
+        )
+    return transformer(
+        latent_input, timestep=timestep,
+        current=None, cache_dic=None, teacache_state=None,
+        class_labels=class_labels, return_dict=False,
+    )[0]
+
+
+def _covr_context(recorder, scheduler, timesteps, step_idx, timestep,
+                  current, cache_dic, cfg_disagreement):
+    if current.activated_steps:
+        distance = abs(current.step - current.activated_steps[-1])
+    else:
+        distance = 0
+    cache_features = summarize_taylor_cache(cache_dic, distance)
+    if recorder.max_events is None:
+        remaining_budget = 1.0
+    else:
+        remaining_budget = max(
+            recorder.max_events - recorder.count, 0) / recorder.max_events
+    return COVRContext(
+        step_idx=step_idx,
+        num_steps=len(timesteps),
+        timestep=float(timestep),
+        log_snr=_covr_log_snr(scheduler, timestep),
+        scheduler_step_size=_covr_step_size(timesteps, step_idx),
+        distance_since_refresh=distance,
+        taylor_term_norms=cache_features["taylor_term_norms"],
+        order_2_4_disagreement=cache_features["order_2_4_disagreement"],
+        attn_curvature=cache_features["attn_curvature"],
+        mlp_curvature=cache_features["mlp_curvature"],
+        cfg_draft_disagreement=cfg_disagreement,
+        previous_defect=recorder.previous_defect,
+        remaining_budget=remaining_budget,
+    )
 
 
 # ===========================================================================
@@ -291,6 +373,9 @@ class DiTGenerator:
                  cache_dic: Optional[SpecACache] = None,
                  current: Optional[SpecAState] = None,
                  ddim_steps: Optional[int] = None,
+                 covr_recorder: Optional[ShadowAuditRecorder] = None,
+                 covr_trajectory_id: int = 0,
+                 covr_sample_ids: Optional[List[str]] = None,
                  ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Generate image(s).
 
@@ -341,6 +426,9 @@ class DiTGenerator:
             sched, method=method,
             teacache_state=teacache_state,
             cache_dic=cache_dic, current=current,
+            covr_recorder=covr_recorder,
+            covr_trajectory_id=covr_trajectory_id,
+            covr_sample_ids=covr_sample_ids,
         )
 
         # Unchunk: cond half (index 0 — cond comes first)
@@ -364,6 +452,9 @@ class DiTGenerator:
                        teacache_state: Optional[dict],
                        cache_dic: Optional[SpecACache],
                        current: Optional[SpecAState],
+                       covr_recorder: Optional[ShadowAuditRecorder] = None,
+                       covr_trajectory_id: int = 0,
+                       covr_sample_ids: Optional[List[str]] = None,
                        ) -> torch.Tensor:
         """Single denoising loop with method dispatch.
 
@@ -372,6 +463,13 @@ class DiTGenerator:
         """
         transformer = self.transformer
         base_bs = class_labels.shape[0] // 2 if guidance_scale > 1.0 else class_labels.shape[0]
+        if covr_recorder is not None and method != "speca":
+            raise ValueError("COVR shadow auditing requires method='speca'")
+        if covr_sample_ids is None:
+            covr_sample_ids = [
+                f"{covr_trajectory_id}:{index}" for index in range(base_bs)]
+        if len(covr_sample_ids) != base_bs:
+            raise ValueError("COVR sample IDs must match the unguided batch size")
 
         # Init latents
         if isinstance(seed, list):
@@ -412,6 +510,7 @@ class DiTGenerator:
             if _t_emb is not None:
                 set_lora_t_emb(_t_emb)
             latent_input = scheduler.scale_model_input(latents, t)
+            cfg_draft_disagreement = 0.0
 
             # --------------- method dispatch ---------------
             if method == "teacache":
@@ -436,11 +535,20 @@ class DiTGenerator:
                 if current is not None:
                     current.step = len(timesteps) - 1 - step_idx
                 if guidance_scale > 1.0:
-                    noise_pred = transformer.forward_with_cfg(
-                        latent_input, current_t,
-                        current=current, cache_dic=cache_dic,
-                        class_labels=class_labels, cfg_scale=guidance_scale,
-                    )
+                    if covr_recorder is not None and covr_recorder.enabled:
+                        noise_pred = transformer.forward_with_cfg(
+                            latent_input, current_t,
+                            current=current, cache_dic=cache_dic,
+                            class_labels=class_labels, cfg_scale=guidance_scale,
+                            track_cfg_disagreement=True,
+                        )
+                        cfg_draft_disagreement = transformer.last_cfg_disagreement
+                    else:
+                        noise_pred = transformer.forward_with_cfg(
+                            latent_input, current_t,
+                            current=current, cache_dic=cache_dic,
+                            class_labels=class_labels, cfg_scale=guidance_scale,
+                        )
                 else:
                     noise_pred = transformer(
                         latent_input, timestep=current_t,
@@ -463,8 +571,49 @@ class DiTGenerator:
                     )[0]
 
             # Learned-sigma: keep noise channels, discard variance channels
-            if transformer.config.out_channels // 2 == transformer.config.in_channels:
-                noise_pred = noise_pred[:, :transformer.config.in_channels]
+            in_channels = int(getattr(transformer.config, "in_channels"))
+            out_channels = int(getattr(transformer.config, "out_channels"))
+            if out_channels // 2 == in_channels:
+                noise_pred = noise_pred[:, :in_channels]
+
+            if (covr_recorder is not None and covr_recorder.enabled
+                    and method == "speca" and current is not None
+                    and cache_dic is not None and current.type == "Taylor"):
+                context = _covr_context(
+                    covr_recorder, scheduler, timesteps, step_idx, t,
+                    current, cache_dic, cfg_draft_disagreement)
+                full_noise_pred = _covr_shadow_full(
+                    transformer, latent_input, current_t,
+                    class_labels, guidance_scale)
+                if out_channels // 2 == in_channels:
+                    full_noise_pred = full_noise_pred[:, :in_channels]
+                x_prev_approx, x_prev_full = _covr_scheduler_pair(
+                    scheduler, noise_pred, full_noise_pred, t, latents)
+                defects = transition_defects(
+                    x_prev_approx[:base_bs], x_prev_full[:base_bs], latents[:base_bs])
+                local_probe_error = (
+                    current.last_layer_error if cache_dic.check else None)
+                for sample_index, defect in enumerate(defects):
+                    event = CounterfactualEvent(
+                        session_id=covr_recorder.session_id,
+                        trajectory_id=covr_trajectory_id,
+                        sample_id=covr_sample_ids[sample_index],
+                        version_key=covr_recorder.version.key,
+                        context=context,
+                        action=COVRAction.REFRESH,
+                        propensity=1.0,
+                        policy="shadow_static_speca",
+                        incremental_cost=1.0,
+                        one_step_defect=defect,
+                        local_probe_error=local_probe_error,
+                        accepted_approximation=True,
+                        metadata={
+                            "committed_action": COVRAction.ACCEPT.value,
+                            "class_id": int(class_labels[sample_index].item()),
+                        },
+                    )
+                    if not covr_recorder.record(event):
+                        break
 
             # ---- VFL: anchor sample collection (low frequency) ----
             if step_idx % 5 == 0:
@@ -1004,6 +1153,34 @@ def run_c2i(args) -> Dict:
     else:
         print("  Baseline (full DDIM, no acceleration)")
 
+    covr_recorder = None
+    if getattr(args, "covr_shadow", False):
+        covr_session_id = args.covr_session_id or (
+            f"{time.strftime('%Y%m%d-%H%M%S')}-seed{args.seed}")
+        scheduler_instance = generator.scheduler
+        scheduler_config = json.dumps(
+            dict(getattr(scheduler_instance, "config", {})),
+            sort_keys=True, default=str)
+        speca_config = json.dumps(speca_init_kwargs, sort_keys=True, default=str)
+        covr_version = COVRVersion(
+            model="dit",
+            base_model_version=(
+                args.covr_base_model_version or os.path.expanduser(DIT_REPO)),
+            scheduler=scheduler_instance.__class__.__name__,
+            scheduler_config=scheduler_config,
+            num_steps=args.num_steps,
+            cfg_scale=args.guidance_scale,
+            speca_config=speca_config,
+        )
+        covr_output_dir = args.covr_output_dir or os.path.join(output_dir, "covr")
+        covr_recorder = ShadowAuditRecorder(
+            output_dir=covr_output_dir,
+            session_id=covr_session_id,
+            version=covr_version,
+            max_events=args.covr_max_events,
+        )
+        print(f"  COVR shadow recorder: {covr_recorder.event_path}")
+
     # ===================================================================
     # 5. Generate images
     # ===================================================================
@@ -1054,12 +1231,12 @@ def run_c2i(args) -> Dict:
             batch_seeds.append(100000 + idx)
 
         # Reset accelerator state
+        trajectory_id = batch_start // bs
         if args.method == "teacache" and teacache_state is not None:
             teacache_reset(teacache_state)
         if args.ttt and ttt_state is not None:
             ttt_reset_for_image(ttt_state)
         if speca_init_kwargs is not None:
-            trajectory_id = batch_start // bs
             speca_cache_dic, speca_current = speca_init(
                 **speca_init_kwargs,
                 controller=compute_controller,
@@ -1096,6 +1273,9 @@ def run_c2i(args) -> Dict:
                 cache_dic=speca_cache_dic,
                 current=speca_current,
                 ddim_steps=ddim_steps,
+                covr_recorder=covr_recorder,
+                covr_trajectory_id=trajectory_id,
+                covr_sample_ids=[str(index) for index in batch_indices],
             )
         wall_s = time.time() - t0
 
@@ -1318,6 +1498,11 @@ def run_c2i(args) -> Dict:
         if ws.get("latest_checkpoint"):
             agg["vfl_latest_checkpoint"] = ws["latest_checkpoint"]
 
+    covr_summary = None
+    if covr_recorder is not None:
+        covr_summary = covr_recorder.close()
+        agg["covr_shadow"] = covr_summary
+
     if "speed" in selected and all_results:
         unique_walls = list(dict.fromkeys(r["wall_s"] for r in all_results))
         agg["speed_img_per_s"] = float(n / np.sum(unique_walls)) if unique_walls else 0.0
@@ -1340,6 +1525,11 @@ def run_c2i(args) -> Dict:
             "speca_max_taylor_steps": args.speca_max_taylor_steps if args.method == "speca" else None,
             "speca_error_metric": args.speca_error_metric if args.method == "speca" else None,
             "guidance_scale": args.guidance_scale,
+            "covr_shadow": bool(covr_recorder is not None),
+            "covr_session_id": (
+                covr_recorder.session_id if covr_recorder is not None else None),
+            "covr_version_key": (
+                covr_recorder.version.key if covr_recorder is not None else None),
             "ttt": args.ttt,
             "ttt_lr": args.ttt_lr if args.ttt else None,
             "ttt_micro_epochs": args.ttt_micro_epochs if args.ttt else None,

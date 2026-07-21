@@ -14,6 +14,25 @@ from .compute_controller import (
     ProbeCorrectController,
     VerificationResult,
 )
+from .covr import (
+    FEATURE_NAMES,
+    BudgetLedger,
+    COVRAction,
+    COVRContext,
+    COVRDecision,
+    COVRPolicy,
+    COVRVersion,
+    CounterfactualEvent,
+    OnlineRidgeUCB,
+    PrimalDualBudget,
+    ShadowAuditRecorder,
+    load_policy_state,
+    normalized_transition_defect,
+    read_events,
+    save_policy_state,
+    summarize_taylor_cache,
+    transition_defects,
+)
 from .speca import (
     SpecACache,
     SpecAState,
