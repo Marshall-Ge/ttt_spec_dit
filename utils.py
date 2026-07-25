@@ -98,12 +98,12 @@ def load_real_image(path: str, size: int = 299) -> torch.Tensor:
 # FID real-image preprocessing (one-time, shared across runs)
 # ---------------------------------------------------------------------------
 
-def ensure_real_299(ds, output_dir: str, n: int) -> str:
-    """Ensure real images at 299×299 exist for FID.
+def ensure_real_299(ds, output_dir: str, n: int, start_index: int = 0) -> str:
+    """Ensure a deterministic real-image slice at 299×299 exists for FID.
 
     Pre-processes all dataset images to 299×299 once into a flat directory,
-    then creates a lightweight subset via symlinks for the current run's
-    shuffle order and sample count.
+    then creates a lightweight subset via symlinks for the requested absolute
+    slice in the dataset's deterministic order.
 
     Returns path to the subset directory (symlinks into the pre-processed cache).
     """
@@ -120,6 +120,8 @@ def ensure_real_299(ds, output_dir: str, n: int) -> str:
     # Pre-process all dataset images once (including class name in filename)
     existing = set(_os.listdir(cache_dir))
     total_items = len(ds.items) if hasattr(ds, 'items') else len(ds)
+    if start_index < 0 or n < 0 or start_index + n > total_items:
+        raise ValueError("real-image slice exceeds the loaded dataset prefix")
     need_preprocess = sum(1 for i in range(total_items)
                           if not any(f.startswith(f"{i:06d}_") for f in existing))
 
@@ -154,7 +156,7 @@ def ensure_real_299(ds, output_dir: str, n: int) -> str:
         if _os.path.islink(p) or f.endswith('.png'):
             _os.remove(p)
 
-    for idx in range(n):
+    for idx in range(start_index, start_index + n):
         _, prompt, _ = ds[idx] if hasattr(ds, '__getitem__') else (None, "unknown", None)
         cls_name = prompt.replace("a photo of a ", "").replace(" ", "_")
         fname = f"{idx:06d}_{cls_name}.png"

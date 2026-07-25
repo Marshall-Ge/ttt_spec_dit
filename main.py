@@ -89,6 +89,8 @@ Examples:
                              "speca=Speculative Acceleration")
     parser.add_argument("--n_prompts", type=int, default=None,
                         help="Number of prompts/images (default varies by dataset)")
+    parser.add_argument("--dataset-start-index", type=int, default=0,
+                        help="Absolute start index in the deterministic dataset order")
 
     # ---- Model ----
     parser.add_argument("--num_steps", type=int, default=DEFAULT_NUM_STEPS,
@@ -142,6 +144,8 @@ Examples:
                         help="Select one equal-FLOPs refresh template per SpecA trajectory")
     parser.add_argument("--covr-template-manifest", type=str, default=None,
                         help="Equal-FLOPs COVR template manifest")
+    parser.add_argument("--covr-force-template-id", type=str, default=None,
+                        help="Evaluate one manifest template without bandit state")
     parser.add_argument("--covr-bandit-state", type=str, default=None,
                         help="Explicit COVR template-bandit state to resume/save")
     parser.add_argument("--covr-bandit-epsilon", type=float, default=0.1,
@@ -253,6 +257,16 @@ def validate_args(args):
                 print(f"          --task {task} --dataset {ds}")
         return False
 
+    dataset_start_index = getattr(args, "dataset_start_index", 0)
+    if dataset_start_index < 0:
+        print("[ERROR] --dataset-start-index must be non-negative.")
+        return False
+    if dataset_start_index and (
+            args.model != "dit" or args.task != "c2i" or args.dataset != "imagenet"):
+        print("[ERROR] nonzero --dataset-start-index requires "
+              "--model dit --task c2i --dataset imagenet.")
+        return False
+
     # Default n_prompts
     if args.n_prompts is None:
         args.n_prompts = DATASET_DEFAULTS.get(args.dataset, 200)
@@ -329,6 +343,26 @@ def validate_args(args):
             print("[ERROR] --covr-sentinel-horizon must be between 0 and "
                   "--num-steps.")
             return False
+
+    if args.covr_force_template_id:
+        if args.model != "dit" or args.method != "speca":
+            print("[ERROR] --covr-force-template-id requires "
+                  "--model dit --method speca.")
+            return False
+        if not args.covr_template_manifest:
+            print("[ERROR] --covr-template-manifest is required with "
+                  "--covr-force-template-id.")
+            return False
+        if (args.covr_shadow or args.covr_template_bandit or args.vfl or
+                getattr(args, "vfl_no_train", False)):
+            print("[ERROR] --covr-force-template-id cannot be combined with "
+                  "COVR shadow, template bandit, or VFL.")
+            return False
+        if args.compute_controller != "none" or suffix_blocks or suffix_budget:
+            print("[ERROR] --covr-force-template-id cannot use a compute "
+                  "controller or suffix recompute.")
+            return False
+
     if args.covr_max_events is not None and args.covr_max_events <= 0:
         print("[ERROR] --covr-max-events must be positive.")
         return False

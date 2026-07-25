@@ -3,7 +3,7 @@ set -euo pipefail
 
 PHASE="${1:-}"
 if [[ -z "${PHASE}" ]]; then
-  echo "usage: $0 {smoke|pilot|audit|manifest|baseline|speca|bandit} [extra main.py args...]" >&2
+  echo "usage: $0 {smoke|pilot|validate|audit|manifest|baseline|speca|template|bandit} [extra main.py args...]" >&2
   exit 2
 fi
 shift
@@ -27,6 +27,15 @@ elif [[ "${PHASE}" == "pilot" ]]; then
   SENTINEL_RATE="${SENTINEL_RATE:-0.25}"
   SAFETY_SAMPLE_RATE="${SAFETY_SAMPLE_RATE:-0.25}"
   BANDIT_EPSILON="${BANDIT_EPSILON:-0.2}"
+elif [[ "${PHASE}" == "validate" ]]; then
+  RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
+  OUTPUT_ROOT="${OUTPUT_ROOT:-${ROOT_DIR}/output/covr_template_validation/${RUN_ID}}"
+  SESSION_ID="${SESSION_ID:-covr-validation-${RUN_ID}-seed${SEED}}"
+  N_PROMPTS="${N_PROMPTS:-2048}"
+  BATCH_SIZE="${BATCH_SIZE:-8}"
+  SENTINEL_RATE="${SENTINEL_RATE:-1.0}"
+  SAFETY_SAMPLE_RATE="${SAFETY_SAMPLE_RATE:-0.1}"
+  BANDIT_EPSILON="${BANDIT_EPSILON:-0.5}"
 else
   OUTPUT_ROOT="${OUTPUT_ROOT:-${ROOT_DIR}/output/covr_template_experiment}"
   SESSION_ID="${SESSION_ID:-covr-template-seed42}"
@@ -42,6 +51,7 @@ MANDATORY_PREFIX="${MANDATORY_PREFIX:-3}"
 MAX_TAYLOR_GAP="${MAX_TAYLOR_GAP:-5}"
 SENTINEL_HORIZON="${SENTINEL_HORIZON:-5}"
 BANDIT_EPSILON="${BANDIT_EPSILON:-0.1}"
+DATASET_START_INDEX="${DATASET_START_INDEX:-0}"
 
 AUDIT_DIR="${OUTPUT_ROOT}/audit"
 AUDIT_FILE="${AUDIT_FILE:-${AUDIT_DIR}/covr/events_${SESSION_ID}.jsonl}"
@@ -55,6 +65,7 @@ COMMON_ARGS=(
   --seed "${SEED}"
   --num_steps "${NUM_STEPS}"
   --n_prompts "${N_PROMPTS}"
+  --dataset-start-index "${DATASET_START_INDEX}"
   --batch_size "${BATCH_SIZE}"
   --guidance_scale "${GUIDANCE_SCALE}"
   --metrics fid is latency flops speed
@@ -111,6 +122,34 @@ case "${PHASE}" in
     env "${PILOT_ENV[@]}" bash "$0" bandit "$@"
     echo "pilot complete: ${OUTPUT_ROOT}"
     ;;
+  validate)
+    VALIDATE_ENV=(
+      "OUTPUT_ROOT=${OUTPUT_ROOT}"
+      "SESSION_ID=${SESSION_ID}"
+      "SEED=${SEED}"
+      "N_PROMPTS=${N_PROMPTS}"
+      "BATCH_SIZE=${BATCH_SIZE}"
+      "NUM_STEPS=${NUM_STEPS}"
+      "GUIDANCE_SCALE=${GUIDANCE_SCALE}"
+      "TEMPLATE_COUNT=${TEMPLATE_COUNT}"
+      "MANDATORY_PREFIX=${MANDATORY_PREFIX}"
+      "MAX_TAYLOR_GAP=${MAX_TAYLOR_GAP}"
+      "SENTINEL_RATE=${SENTINEL_RATE}"
+      "SENTINEL_HORIZON=${SENTINEL_HORIZON}"
+      "SAFETY_SAMPLE_RATE=${SAFETY_SAMPLE_RATE}"
+      "BANDIT_EPSILON=${BANDIT_EPSILON}"
+    )
+    env "${VALIDATE_ENV[@]}" DATASET_START_INDEX=0 bash "$0" audit "$@"
+    env "${VALIDATE_ENV[@]}" DATASET_START_INDEX=0 bash "$0" manifest
+    env "${VALIDATE_ENV[@]}" DATASET_START_INDEX="${N_PROMPTS}" bash "$0" baseline "$@"
+    env "${VALIDATE_ENV[@]}" DATASET_START_INDEX="${N_PROMPTS}" bash "$0" speca "$@"
+    while IFS= read -r template_id; do
+      env "${VALIDATE_ENV[@]}" DATASET_START_INDEX="${N_PROMPTS}" \
+        TEMPLATE_ID="${template_id}" bash "$0" template "$@"
+    done < <(python -c 'import json, sys; print("\n".join(t["template_id"] for t in json.load(open(sys.argv[1]))["templates"]))' "${MANIFEST}")
+    env "${VALIDATE_ENV[@]}" DATASET_START_INDEX="${N_PROMPTS}" bash "$0" bandit "$@"
+    echo "validation complete: ${OUTPUT_ROOT}"
+    ;;
   audit)
     if [[ -e "${AUDIT_FILE}" && "${ALLOW_AUDIT_APPEND:-0}" != "1" ]]; then
       echo "audit file already exists: ${AUDIT_FILE}" >&2
@@ -144,6 +183,18 @@ case "${PHASE}" in
     python "${ROOT_DIR}/main.py" "${COMMON_ARGS[@]}" \
       --method speca \
       --output_dir "${OUTPUT_ROOT}/speca" \
+      "$@"
+    ;;
+  template)
+    if [[ -z "${TEMPLATE_ID:-}" ]]; then
+      echo "TEMPLATE_ID is required for the template phase" >&2
+      exit 2
+    fi
+    python "${ROOT_DIR}/main.py" "${COMMON_ARGS[@]}" \
+      --method speca \
+      --output_dir "${OUTPUT_ROOT}/templates/${TEMPLATE_ID}" \
+      --covr-template-manifest "${MANIFEST}" \
+      --covr-force-template-id "${TEMPLATE_ID}" \
       "$@"
     ;;
   bandit)

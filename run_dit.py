@@ -254,6 +254,105 @@ def _covr_full_rollout(transformer, scheduler, timesteps, start_idx: int,
     return branch_latents
 
 
+def _compute_generated_fid_is(metric: FIDISComputer) -> Dict[str, float]:
+    real_dir, gen_dir = metric.real_dir, metric.gen_dir
+    try:
+        metric.real_dir, metric.gen_dir = gen_dir, real_dir
+        return metric.compute()
+    finally:
+        metric.real_dir, metric.gen_dir = real_dir, gen_dir
+
+
+def _dataset_generation_window(dataset_start_index: int, target_samples: int,
+                               processed_samples: int,
+                               loaded_samples: int) -> Tuple[int, int]:
+    if dataset_start_index < 0 or target_samples <= 0 or processed_samples < 0:
+        raise ValueError("invalid deterministic dataset window")
+    if processed_samples >= target_samples:
+        raise ValueError("resume state has consumed the requested dataset slice")
+    if loaded_samples < dataset_start_index + target_samples:
+        raise ValueError("requested dataset slice exceeds the available dataset")
+    return dataset_start_index + processed_samples, target_samples - processed_samples
+
+
+def _covr_synchronize(device) -> None:
+    if torch.cuda.is_available() and torch.device(device).type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _covr_online_accounting(
+        online_wall_times: List[float], safety_wall_times: List[float],
+        n_images: int, safety_full_steps: int,
+        candidate_flops_T: Optional[float] = None,
+        vanilla_flops_T: Optional[float] = None,
+        full_step_flops: Optional[float] = None) -> Dict[str, float]:
+    if len(online_wall_times) != len(safety_wall_times):
+        raise ValueError("online and safety wall-time samples must align")
+    if not online_wall_times:
+        return {}
+
+    candidate_wall_times = [
+        max(0.0, online - safety)
+        for online, safety in zip(online_wall_times, safety_wall_times)
+    ]
+    online_total = float(sum(online_wall_times))
+    safety_total = float(sum(safety_wall_times))
+    candidate_total = float(sum(candidate_wall_times))
+    result = {
+        "wall_s_candidate_mean": float(np.mean(candidate_wall_times)),
+        "wall_s_candidate_std": float(np.std(candidate_wall_times)),
+        "wall_s_candidate_total": candidate_total,
+        "wall_s_safety_mean": float(np.mean(safety_wall_times)),
+        "wall_s_safety_total": safety_total,
+        "wall_s_online_mean": float(np.mean(online_wall_times)),
+        "wall_s_online_std": float(np.std(online_wall_times)),
+        "wall_s_online_total": online_total,
+        "speed_candidate_img_per_s": (
+            float(n_images / candidate_total) if candidate_total > 0 else 0.0),
+        "speed_online_img_per_s": (
+            float(n_images / online_total) if online_total > 0 else 0.0),
+        "safety_full_steps_mean_per_trajectory": (
+            float(safety_full_steps / len(online_wall_times))),
+    }
+
+    if (candidate_flops_T is not None and vanilla_flops_T is not None and
+            full_step_flops is not None):
+        safety_flops_T = (
+            safety_full_steps / len(online_wall_times) * full_step_flops / 1e12)
+        online_flops_T = candidate_flops_T + safety_flops_T
+        result.update({
+            "flops_candidate_T": float(candidate_flops_T),
+            "flops_safety_T": float(safety_flops_T),
+            "flops_online_T": float(online_flops_T),
+            "flops_reduction_candidate": (
+                1.0 - candidate_flops_T / vanilla_flops_T
+                if vanilla_flops_T > 0 else 0.0),
+            "flops_reduction_online": (
+                1.0 - online_flops_T / vanilla_flops_T
+                if vanilla_flops_T > 0 else 0.0),
+            "speedup_flops_candidate": (
+                vanilla_flops_T / candidate_flops_T
+                if candidate_flops_T > 0 else float("nan")),
+            "speedup_flops_online": (
+                vanilla_flops_T / online_flops_T
+                if online_flops_T > 0 else float("nan")),
+        })
+    return result
+
+
+def _load_forced_covr_template(path: str, template_id: str,
+                               version_key: str):
+    manifest = TemplateManifest.load(path)
+    if manifest.version_key != version_key:
+        raise ValueError(
+            "COVR template manifest version does not match the runtime: "
+            f"manifest={manifest.version_key}, runtime={version_key}")
+    for template in manifest.templates:
+        if template.template_id == template_id:
+            return manifest, template
+    raise ValueError(f"COVR template ID not found in manifest: {template_id}")
+
+
 def _covr_context(recorder, scheduler, timesteps, step_idx, timestep,
                   current):
     if current.activated_steps:
@@ -767,11 +866,21 @@ class DiTGenerator:
                     and _covr_hash_sample(
                         covr_bandit.session_id, covr_trajectory_id, step_idx,
                         covr_safety_sample_rate, "safety")):
+                if covr_feedback_sink is None:
+                    raise ValueError("COVR safety sampling requires a feedback sink")
                 context = _covr_context(
                     None, scheduler, timesteps, step_idx, t, current)
+                _covr_synchronize(self.device)
+                safety_start = time.perf_counter()
                 full_noise_pred = _covr_shadow_full(
                     transformer, latent_input, current_t,
                     class_labels, guidance_scale)
+                _covr_synchronize(self.device)
+                covr_feedback_sink["safety_wall_s"] = (
+                    covr_feedback_sink.get("safety_wall_s", 0.0)
+                    + time.perf_counter() - safety_start)
+                covr_feedback_sink["safety_full_steps"] = (
+                    covr_feedback_sink.get("safety_full_steps", 0) + 1)
                 if out_channels // 2 == in_channels:
                     full_noise_pred = full_noise_pred[:, :in_channels]
                 x_prev_approx, x_prev_full = _covr_scheduler_pair(
@@ -1046,6 +1155,7 @@ def run_c2i(args) -> Dict:
         OUTPUT_DIR, f"c2i_dit_{dataset_name}_{dir_suffix}")
     os.makedirs(output_dir, exist_ok=True)
 
+    dataset_start_index = int(getattr(args, "dataset_start_index", 0))
     covr_bandit_state_path = None
     covr_resume = None
     covr_resume_sample_offset = 0
@@ -1094,20 +1204,19 @@ def run_c2i(args) -> Dict:
         from dataset.imagenet import ImageNetDataset
         ds = ImageNetDataset(
             imagenet_dir=getattr(args, "imagenet_dir", IMAGENET_DIR),
-            n_images=args.n_prompts, seed=args.seed)
-        if covr_resume_sample_offset:
-            if covr_resume_sample_offset >= len(ds):
-                raise ValueError(
-                    "COVR resume state has consumed the available dataset prefix")
-            ds.items = ds.items[covr_resume_sample_offset:]
+            n_images=dataset_start_index + args.n_prompts, seed=args.seed)
+        generation_start_index, n = _dataset_generation_window(
+            dataset_start_index, int(args.n_prompts),
+            covr_resume_sample_offset, len(ds))
     elif dataset_name == "coco":
         from dataset.coco import COCO30KDataset
         ds = COCO30KDataset(
             coco_dir=getattr(args, "coco_dir", None) or args.coco_dir,
             n_images=args.n_prompts, seed=args.seed)
+        generation_start_index = 0
+        n = len(ds)
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
-    n = len(ds)
 
     # ===================================================================
     # 2. Load model
@@ -1354,14 +1463,19 @@ def run_c2i(args) -> Dict:
 
     covr_recorder = None
     covr_bandit = None
+    covr_forced_manifest = None
+    covr_forced_template = None
     covr_version = None
     covr_session_id = None
+    covr_safety_full_steps = 0
+    covr_safety_wall_s = 0.0
     covr_sentinel_full_steps = 0
     covr_sentinel_wall_s = 0.0
     covr_sentinel_count = 0
     covr_trajectory_offset = 0
-    if getattr(args, "covr_shadow", False) or getattr(
-            args, "covr_template_bandit", False):
+    if (getattr(args, "covr_shadow", False) or
+            getattr(args, "covr_template_bandit", False) or
+            getattr(args, "covr_force_template_id", None)):
         covr_session_id = (
             args.covr_session_id or
             (str(covr_resume["session_id"]) if covr_resume is not None else None) or
@@ -1392,6 +1506,17 @@ def run_c2i(args) -> Dict:
             )
             print(f"  COVR shadow recorder: {covr_recorder.event_path}")
 
+        if getattr(args, "covr_force_template_id", None):
+            covr_forced_manifest, covr_forced_template = (
+                _load_forced_covr_template(
+                    args.covr_template_manifest,
+                    args.covr_force_template_id,
+                    covr_version.key,
+                ))
+            print(
+                f"  COVR forced template: {covr_forced_template.template_id} "
+                f"({covr_forced_template.refresh_count} refreshes)")
+
         if getattr(args, "covr_template_bandit", False):
             manifest = TemplateManifest.load(args.covr_template_manifest)
             if manifest.version_key != covr_version.key:
@@ -1402,6 +1527,7 @@ def run_c2i(args) -> Dict:
                 epsilon=args.covr_bandit_epsilon, seed=args.seed,
                 run_identity={
                     "dataset": dataset_name,
+                    "dataset_start_index": dataset_start_index,
                     "seed": int(args.seed),
                     "batch_size": int(args.batch_size),
                     "safety_sample_rate": float(args.covr_safety_sample_rate),
@@ -1431,8 +1557,9 @@ def run_c2i(args) -> Dict:
     t_start = time.time()
 
     wall_times = []
+    covr_safety_wall_times = []
     all_results = []
-    global_idx = covr_resume_sample_offset
+    global_idx = generation_start_index
 
     for batch_start in tqdm(range(0, n, bs), desc=f"c2i/{dataset_name}", ncols=80):
         # ---- VFL mid-run reload: pull latest LoRA from training daemon ----
@@ -1451,9 +1578,10 @@ def run_c2i(args) -> Dict:
                           f"— keeping previous LoRA weights")
 
         batch_end = min(batch_start + bs, n)
-        batch_indices = list(range(batch_start, batch_end))
-        batch_absolute_indices = [
-            covr_resume_sample_offset + index for index in batch_indices]
+        batch_indices = list(range(
+            generation_start_index + batch_start,
+            generation_start_index + batch_end))
+        batch_absolute_indices = batch_indices
         actual_bs = len(batch_indices)
 
         # Collect prompts (class labels) + seeds
@@ -1497,6 +1625,8 @@ def run_c2i(args) -> Dict:
                 controller=compute_controller,
                 trajectory_id=trajectory_id,
                 refresh_mask=(
+                    covr_forced_template.refresh_mask
+                    if covr_forced_template is not None else
                     covr_bandit.active_template.refresh_mask
                     if covr_bandit is not None else None),
             )
@@ -1550,7 +1680,12 @@ def run_c2i(args) -> Dict:
                 covr_feedback_sink=covr_feedback_sink,
             )
         sentinel_wall_s = covr_feedback_sink.get("sentinel_wall_s", 0.0)
+        safety_wall_s = covr_feedback_sink.get("safety_wall_s", 0.0)
+        safety_full_steps = int(covr_feedback_sink.get("safety_full_steps", 0))
         wall_s = time.time() - t0 - sentinel_wall_s
+        covr_safety_wall_times.append(safety_wall_s)
+        covr_safety_wall_s += safety_wall_s
+        covr_safety_full_steps += safety_full_steps
         if sentinel_wall_s:
             covr_sentinel_wall_s += sentinel_wall_s
             covr_sentinel_full_steps += args.covr_sentinel_horizon
@@ -1567,15 +1702,21 @@ def run_c2i(args) -> Dict:
             if compute_controller is not None:
                 compute_controller.end_trajectory()
 
-        covr_feedback = None
-        if covr_bandit is not None:
-            if speca_cache_dic.full_count != covr_bandit.manifest.common_refresh_count:
+        fixed_manifest = (
+            covr_forced_manifest
+            if covr_forced_manifest is not None else
+            covr_bandit.manifest if covr_bandit is not None else None)
+        if fixed_manifest is not None:
+            if speca_cache_dic.full_count != fixed_manifest.common_refresh_count:
                 raise RuntimeError(
                     "fixed template full-step count violated the manifest")
             if speca_cache_dic.taylor_count != (
-                    args.num_steps - covr_bandit.manifest.common_refresh_count):
+                    args.num_steps - fixed_manifest.common_refresh_count):
                 raise RuntimeError(
                     "fixed template Taylor-step count violated the manifest")
+
+        covr_feedback = None
+        if covr_bandit is not None:
             assert covr_assignment is not None
             if covr_sentinel_selected and covr_sentinel_start_idx is None:
                 sentinel_start = time.time()
@@ -1616,7 +1757,7 @@ def run_c2i(args) -> Dict:
         # Save
         img_limit = getattr(args, "img_save_limit", 50)
         for b, idx in enumerate(batch_indices):
-            if global_idx < img_limit:
+            if global_idx - generation_start_index < img_limit:
                 # Extract class name from dataset prompt
                 cls_name = ds[idx][1].replace("a photo of a ", "").replace(" ", "_")
                 out_path = os.path.join(gen_dir, f"{global_idx:06d}_{cls_name}.png")
@@ -1741,10 +1882,13 @@ def run_c2i(args) -> Dict:
     # ===================================================================
     fid_is_results = {}
     if need_fid_is:
-        real_299_dir = ensure_real_299(ds, output_dir, n)
+        real_299_dir = ensure_real_299(
+            ds, output_dir, n, start_index=generation_start_index)
         metrics["fid_is"].real_dir = real_299_dir
-        fid_is_results = metrics["fid_is"].compute()
-        metrics["fid_is"].cleanup()  # remove temp generated_299, keep only generated/ + real_299/
+        try:
+            fid_is_results = _compute_generated_fid_is(metrics["fid_is"])
+        finally:
+            metrics["fid_is"].cleanup()
 
     # ===================================================================
     # 7. Aggregate
@@ -1766,6 +1910,18 @@ def run_c2i(args) -> Dict:
         agg.update(metrics["latency"].compute())
     if need_flops:
         agg.update(metrics["flops"].compute())
+
+    if covr_bandit is not None:
+        agg.update(_covr_online_accounting(
+            wall_times,
+            covr_safety_wall_times,
+            n,
+            covr_safety_full_steps,
+            candidate_flops_T=(agg.get("flops_accel_T") if need_flops else None),
+            vanilla_flops_T=(agg.get("flops_vanilla_T") if need_flops else None),
+            full_step_flops=(
+                metrics["flops"]._flops_full if need_flops else None),
+        ))
 
     if need_fid_is:
         agg.update(fid_is_results)
@@ -1842,19 +1998,37 @@ def run_c2i(args) -> Dict:
         bandit_summary = covr_bandit.summary()
         bandit_summary.update({
             "state_path": covr_bandit_state_path,
-            "dataset_start_index": covr_resume_sample_offset,
+            "dataset_start_index": dataset_start_index,
+            "resume_sample_offset": covr_resume_sample_offset,
+            "generation_start_index": generation_start_index,
             "target_samples": int(args.n_prompts),
             "generated_samples_this_run": n,
+            "safety_full_steps": covr_safety_full_steps,
+            "safety_wall_s": covr_safety_wall_s,
             "sentinel_count": covr_sentinel_count,
             "sentinel_horizon": args.covr_sentinel_horizon,
             "sentinel_full_steps": covr_sentinel_full_steps,
             "sentinel_wall_s": covr_sentinel_wall_s,
+            "candidate_flops_exclude_safety": True,
             "candidate_flops_exclude_sentinel": True,
+            "online_flops_include_safety": True,
+            "online_flops_exclude_sentinel": True,
+            "online_wall_exclude_sentinel": True,
         })
         agg["covr_template_bandit"] = bandit_summary
         print(
             f"  COVR template bandit: {bandit_summary['completed_trajectories']} "
             f"trajectories, sentinel_full_steps={covr_sentinel_full_steps}")
+
+    if covr_forced_template is not None:
+        agg["covr_forced_template"] = {
+            "template_id": covr_forced_template.template_id,
+            "manifest_hash": covr_forced_manifest.manifest_hash,
+            "refresh_count": covr_forced_template.refresh_count,
+            "modeled_full_block_equivalents": (
+                covr_forced_template.modeled_full_block_equivalents),
+            "probe_full_blocks": speca_totals["probe_full_blocks"],
+        }
 
     if "speed" in selected and all_results:
         unique_walls = list(dict.fromkeys(r["wall_s"] for r in all_results))
@@ -1865,6 +2039,9 @@ def run_c2i(args) -> Dict:
             "model": "dit",
             "task": "c2i",
             "dataset": dataset_name,
+            "dataset_start_index": dataset_start_index,
+            "resume_sample_offset": covr_resume_sample_offset,
+            "generation_start_index": generation_start_index,
             "method": args.method,
             "n_prompts": n,
             "batch_size": args.batch_size,
@@ -1880,6 +2057,9 @@ def run_c2i(args) -> Dict:
             "guidance_scale": args.guidance_scale,
             "covr_shadow": bool(covr_recorder is not None),
             "covr_template_bandit": bool(covr_bandit is not None),
+            "covr_force_template_id": (
+                covr_forced_template.template_id
+                if covr_forced_template is not None else None),
             "covr_session_id": covr_session_id,
             "covr_version_key": (
                 covr_version.key if covr_version is not None else None),

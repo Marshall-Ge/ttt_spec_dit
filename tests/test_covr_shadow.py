@@ -1,19 +1,29 @@
 import json
+from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
+from PIL import Image
 
+from accelerators.covr_bandit import RefreshTemplate, TemplateManifest
+from main import parse_args, validate_args
 from models.dit import DiTTransformer2D
 from run_dit import (
+    _compute_generated_fid_is,
     _covr_canonical_json,
     _covr_full_rollout,
+    _covr_online_accounting,
     _covr_resume_metadata,
     _covr_scheduler_alphas,
     _covr_scheduler_config_json,
     _covr_scheduler_pair,
     _covr_shadow_full,
+    _dataset_generation_window,
+    _load_forced_covr_template,
 )
+from utils import ensure_real_299
 
 
 class StatefulScheduler:
@@ -203,3 +213,145 @@ def test_resume_metadata_requires_per_assignment_sample_counts(tmp_path):
     }), encoding="utf-8")
     with pytest.raises(ValueError, match="predates sample-count tracking"):
         _covr_resume_metadata(str(path))
+
+
+def test_generated_fid_is_swaps_inputs_and_restores_them():
+    class Metric:
+        real_dir = "real"
+        gen_dir = "generated"
+
+        def compute(self):
+            assert self.real_dir == "generated"
+            assert self.gen_dir == "real"
+            return {"fid": 1.0, "is_mean": 2.0, "is_std": 3.0}
+
+    metric = Metric()
+    assert _compute_generated_fid_is(metric)["is_mean"] == 2.0
+    assert (metric.real_dir, metric.gen_dir) == ("real", "generated")
+
+
+def test_generated_fid_is_restores_inputs_after_error():
+    class Metric:
+        real_dir = "real"
+        gen_dir = "generated"
+
+        def compute(self):
+            raise RuntimeError("metric failed")
+
+    metric = Metric()
+    with pytest.raises(RuntimeError, match="metric failed"):
+        _compute_generated_fid_is(metric)
+    assert (metric.real_dir, metric.gen_dir) == ("real", "generated")
+
+
+def test_dataset_window_composes_base_offset_and_resume():
+    assert _dataset_generation_window(0, 10, 0, 10) == (0, 10)
+    assert _dataset_generation_window(2048, 2048, 128, 4096) == (2176, 1920)
+    with pytest.raises(ValueError, match="consumed"):
+        _dataset_generation_window(2048, 2048, 2048, 4096)
+
+
+def test_real_299_subset_uses_absolute_dataset_indices(tmp_path):
+    val_dir = tmp_path / "imagenet" / "val"
+    val_dir.mkdir(parents=True)
+    items = []
+    for index in range(4):
+        path = val_dir / f"source_{index}.png"
+        Image.new("RGB", (8, 8), color=(index, index, index)).save(path)
+        items.append((str(path), f"a photo of a class {index}", index))
+
+    class Dataset:
+        def __init__(self):
+            self.val_dir = str(val_dir)
+            self.items = items
+
+        def __len__(self):
+            return len(self.items)
+
+        def __getitem__(self, index):
+            return self.items[index]
+
+    subset = ensure_real_299(Dataset(), str(tmp_path / "run"), 2, start_index=2)
+    assert sorted(path.name for path in Path(subset).iterdir()) == [
+        "000002_class_2.png",
+        "000003_class_3.png",
+    ]
+
+
+def test_online_accounting_separates_candidate_and_safety_cost():
+    accounting = _covr_online_accounting(
+        [5.0, 7.0], [1.0, 2.0], n_images=8, safety_full_steps=6,
+        candidate_flops_T=3.0, vanilla_flops_T=12.0,
+        full_step_flops=0.5e12,
+    )
+    assert accounting["wall_s_candidate_total"] == pytest.approx(9.0)
+    assert accounting["wall_s_safety_total"] == pytest.approx(3.0)
+    assert accounting["speed_candidate_img_per_s"] == pytest.approx(8.0 / 9.0)
+    assert accounting["safety_full_steps_mean_per_trajectory"] == 3.0
+    assert accounting["flops_safety_T"] == pytest.approx(1.5)
+    assert accounting["flops_online_T"] == pytest.approx(4.5)
+    assert accounting["flops_reduction_online"] == pytest.approx(0.625)
+
+
+def test_forced_template_loader_validates_version_and_id(tmp_path):
+    manifest = TemplateManifest(
+        version_key="version-a",
+        num_steps=4,
+        num_layers=2,
+        mandatory_prefix=1,
+        max_taylor_gap=2,
+        baseline_template_id="prior",
+        templates=(
+            RefreshTemplate("prior", (True, False, True, False), 4),
+            RefreshTemplate("alternate", (True, True, False, False), 4),
+        ),
+    )
+    path = tmp_path / "manifest.json"
+    manifest.save(str(path))
+
+    loaded, template = _load_forced_covr_template(
+        str(path), "alternate", "version-a")
+    assert loaded.manifest_hash == manifest.manifest_hash
+    assert template.refresh_mask == (True, True, False, False)
+
+    with pytest.raises(ValueError, match="runtime"):
+        _load_forced_covr_template(str(path), "alternate", "version-b")
+    with pytest.raises(ValueError, match="not found"):
+        _load_forced_covr_template(str(path), "missing", "version-a")
+
+
+def _parse_main_args(monkeypatch, *extra):
+    monkeypatch.setattr(sys, "argv", [
+        "main.py",
+        "--model", "dit",
+        "--task", "c2i",
+        "--dataset", "imagenet",
+        "--method", "speca",
+        *extra,
+    ])
+    return parse_args()
+
+
+def test_cli_rejects_negative_dataset_start_index(monkeypatch):
+    args = _parse_main_args(monkeypatch, "--dataset-start-index", "-1")
+    assert validate_args(args) is False
+
+
+def test_cli_accepts_direct_forced_template(monkeypatch):
+    args = _parse_main_args(
+        monkeypatch,
+        "--dataset-start-index", "2048",
+        "--covr-template-manifest", "manifest.json",
+        "--covr-force-template-id", "template_01",
+    )
+    assert validate_args(args) is True
+
+
+def test_cli_rejects_forced_template_with_bandit(monkeypatch):
+    args = _parse_main_args(
+        monkeypatch,
+        "--covr-template-manifest", "manifest.json",
+        "--covr-force-template-id", "template_01",
+        "--covr-template-bandit",
+    )
+    assert validate_args(args) is False
