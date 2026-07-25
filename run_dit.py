@@ -604,6 +604,7 @@ class DiTGenerator:
                  covr_sentinel_start_idx: Optional[int] = None,
                  covr_sentinel_horizon: int = 0,
                  covr_feedback_sink: Optional[Dict[str, float]] = None,
+                 covr_sentinel_selected: bool = False,
                  ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Generate image(s).
 
@@ -662,6 +663,7 @@ class DiTGenerator:
             covr_sentinel_start_idx=covr_sentinel_start_idx,
             covr_sentinel_horizon=covr_sentinel_horizon,
             covr_feedback_sink=covr_feedback_sink,
+            covr_sentinel_selected=covr_sentinel_selected,
         )
 
         # Unchunk: cond half (index 0 — cond comes first)
@@ -693,6 +695,7 @@ class DiTGenerator:
                        covr_sentinel_start_idx: Optional[int] = None,
                        covr_sentinel_horizon: int = 0,
                        covr_feedback_sink: Optional[Dict[str, float]] = None,
+                       covr_sentinel_selected: bool = False,
                        ) -> torch.Tensor:
         """Single denoising loop with method dispatch.
 
@@ -821,6 +824,27 @@ class DiTGenerator:
             out_channels = int(getattr(transformer.config, "out_channels"))
             if out_channels // 2 == in_channels:
                 noise_pred = noise_pred[:, :in_channels]
+
+            # Terminal fidelity for bandit reward: compare template vs full
+            # forward at the LAST denoising step. Costs 1 extra forward pass
+            # per sentinel trajectory (vs 50 for full baseline comparison).
+            if (covr_sentinel_selected and covr_sentinel_start_idx is None
+                    and step_idx == len(timesteps) - 1
+                    and method == "speca" and current is not None
+                    and covr_feedback_sink is not None):
+                terminal_full = _covr_shadow_full(
+                    transformer, latent_input, current_t,
+                    class_labels, guidance_scale)
+                t_out = int(getattr(transformer.config, "out_channels"))
+                if t_out // 2 == in_channels:
+                    terminal_full = terminal_full[:, :in_channels]
+                x_prev_approx, x_prev_full = _covr_scheduler_pair(
+                    scheduler, noise_pred, terminal_full, t, latents)
+                covr_feedback_sink["terminal_fidelity_loss"] = float(
+                    F.mse_loss(
+                        x_prev_approx[:base_bs].float(),
+                        x_prev_full[:base_bs].float(),
+                    ).item())
 
             if (covr_recorder is not None and covr_recorder.enabled
                     and method == "speca" and current is not None
@@ -1678,6 +1702,7 @@ def run_c2i(args) -> Dict:
                     args.covr_sentinel_horizon
                     if covr_sentinel_start_idx is not None else 0),
                 covr_feedback_sink=covr_feedback_sink,
+                covr_sentinel_selected=covr_sentinel_selected,
             )
         sentinel_wall_s = covr_feedback_sink.get("sentinel_wall_s", 0.0)
         safety_wall_s = covr_feedback_sink.get("safety_wall_s", 0.0)
@@ -1719,23 +1744,30 @@ def run_c2i(args) -> Dict:
         if covr_bandit is not None:
             assert covr_assignment is not None
             if covr_sentinel_selected and covr_sentinel_start_idx is None:
-                sentinel_start = time.time()
-                full_latent, _ = generator.generate(
-                    batch_inputs, batch_seeds,
-                    guidance_scale=args.guidance_scale,
-                    method="baseline",
-                )
-                terminal_fidelity_loss = float(F.mse_loss(
-                    latent.float(), full_latent.float()).item())
-                covr_sentinel_full_steps += args.num_steps
-                covr_sentinel_wall_s += time.time() - sentinel_start
-                covr_sentinel_count += 1
+                # Terminal fidelity: prefer the cheap one-step computation
+                # from _denoise_loop (1 extra forward pass). Fall back to
+                # the expensive full-baseline comparison only if the in-loop
+                # computation did not fire (non-speca methods, not expected
+                # with bandit since it requires speca).
+                tf_loss = covr_feedback_sink.get("terminal_fidelity_loss")
+                if tf_loss is None:
+                    sentinel_start = time.time()
+                    full_latent, _ = generator.generate(
+                        batch_inputs, batch_seeds,
+                        guidance_scale=args.guidance_scale,
+                        method="baseline",
+                    )
+                    tf_loss = float(F.mse_loss(
+                        latent.float(), full_latent.float()).item())
+                    covr_sentinel_full_steps += args.num_steps
+                    covr_sentinel_wall_s += time.time() - sentinel_start
+                    covr_sentinel_count += 1
                 covr_feedback = TemplateFeedback(
                     trajectory_id=trajectory_id,
                     template_id=covr_assignment.template_id,
                     sentinel_propensity=args.covr_sentinel_rate,
                     horizon=args.num_steps,
-                    terminal_fidelity_loss=terminal_fidelity_loss,
+                    terminal_fidelity_loss=tf_loss,
                 )
             elif covr_sentinel_start_idx is not None:
                 if not {"h_step_numerator", "h_step_denominator"}.issubset(
