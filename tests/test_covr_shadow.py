@@ -10,6 +10,7 @@ from run_dit import (
     _covr_full_rollout,
     _covr_resume_metadata,
     _covr_scheduler_alphas,
+    _covr_scheduler_config_json,
     _covr_scheduler_pair,
     _covr_shadow_full,
 )
@@ -50,6 +51,21 @@ def test_covr_version_json_is_canonical_across_container_order():
     assert _covr_canonical_json(left) == _covr_canonical_json(right)
     assert json.loads(_covr_canonical_json(left))["_use_default_values"] == [
         "beta_end", "beta_start"]
+
+
+def test_scheduler_version_ignores_default_metadata_order():
+    left = {
+        "prediction_type": "epsilon",
+        "timestep_spacing": "leading",
+        "_use_default_values": ["steps_offset", "trained_betas"],
+    }
+    right = {
+        "_use_default_values": ["trained_betas", "steps_offset"],
+        "timestep_spacing": "leading",
+        "prediction_type": "epsilon",
+    }
+
+    assert _covr_scheduler_config_json(left) == _covr_scheduler_config_json(right)
 
 
 def test_scheduler_counterfactual_branches_share_pre_step_state():

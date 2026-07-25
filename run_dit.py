@@ -117,6 +117,14 @@ def _covr_canonical_json(value) -> str:
         normalize(value), sort_keys=True, separators=(",", ":"))
 
 
+def _covr_scheduler_config_json(config) -> str:
+    identity = {
+        key: value for key, value in dict(config).items()
+        if key != "_use_default_values"
+    }
+    return _covr_canonical_json(identity)
+
+
 def _covr_log_snr(scheduler, timestep) -> float:
     alphas_cumprod = getattr(scheduler, "alphas_cumprod", None)
     if alphas_cumprod is None:
@@ -1360,8 +1368,8 @@ def run_c2i(args) -> Dict:
             f"{time.strftime('%Y%m%d-%H%M%S')}-seed{args.seed}"
         )
         scheduler_instance = generator.scheduler
-        scheduler_config = _covr_canonical_json(
-            dict(getattr(scheduler_instance, "config", {})))
+        scheduler_config = _covr_scheduler_config_json(
+            getattr(scheduler_instance, "config", {}))
         speca_config = _covr_canonical_json(speca_init_kwargs)
         covr_version = COVRVersion(
             model="dit",
