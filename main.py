@@ -135,7 +135,7 @@ Examples:
     parser.add_argument("--covr-session-id", type=str, default=None,
                         help="Stable COVR session ID (default: timestamp + seed)")
     parser.add_argument("--covr-max-events", type=int, default=None,
-                        help="Maximum scalar COVR events to record")
+                        help="Maximum batch-step COVR audit contexts to record")
     parser.add_argument("--covr-base-model-version", type=str, default=None,
                         help="Base model version recorded in COVR event metadata")
     # ---- TTT (Test-Time Training plugin, DiT-only) ----

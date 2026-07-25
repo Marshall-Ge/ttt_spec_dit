@@ -10,7 +10,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from accelerators.covr import CounterfactualEvent
+from accelerators.covr import ActionAuditEvent, COVRAction, CounterfactualEvent
 
 
 @dataclass(frozen=True)
@@ -326,6 +326,498 @@ def run_all_gates(events: Sequence[CounterfactualEvent]) -> Dict[str, object]:
         "stopped_at": None if first_failure is None else first_failure.gate,
         "gates": [result.to_dict() for result in results],
     }
+
+
+def evaluate_action_audit_integrity(
+    events: Sequence[ActionAuditEvent],
+    ratio_epsilon: float = 1e-8,
+) -> GateResult:
+    if not events:
+        return GateResult(
+            "integrity",
+            "insufficient_data",
+            "integrity analysis requires at least one action audit",
+            {"events": 0},
+        )
+
+    contexts = set()
+    duplicate_contexts = 0
+    action_violations = 0
+    propensity_violations = 0
+    policy_violations = 0
+    budget_violations = 0
+    cardinality_violations = 0
+    finite_violations = 0
+    ratio_violations = 0
+    trajectory_label_violations = 0
+    trajectory_shape_violations = 0
+    sample_labels = 0
+    finite_values = 0
+    total_metric_values = 0
+    trajectory_labels = {}
+    trajectory_steps = {}
+    trajectory_costs = {}
+
+    for event in events:
+        context_key = (
+            event.session_id, event.trajectory_id, event.context.step_idx)
+        if context_key in contexts:
+            duplicate_contexts += 1
+        contexts.add(context_key)
+
+        trajectory_key = (event.session_id, event.trajectory_id)
+        labels = (event.sample_ids, event.class_ids)
+        previous_labels = trajectory_labels.setdefault(trajectory_key, labels)
+        if previous_labels != labels:
+            trajectory_label_violations += 1
+        previous_steps = trajectory_steps.setdefault(
+            trajectory_key, event.context.num_steps)
+        if previous_steps != event.context.num_steps:
+            trajectory_shape_violations += 1
+        trajectory_costs[trajectory_key] = (
+            trajectory_costs.get(trajectory_key, 0.0) + event.incremental_cost)
+
+        transition = event.one_step_transition
+        count = len(event.sample_ids)
+        sample_labels += count
+        if (
+            count == 0
+            or len(set(event.sample_ids)) != count
+            or len(event.class_ids) != count
+            or transition.sample_count != count
+        ):
+            cardinality_violations += 1
+
+        if (
+            event.committed_action is not COVRAction.ACCEPT
+            or event.audit_action is not COVRAction.REFRESH
+            or event.committed_action is event.audit_action
+        ):
+            action_violations += 1
+        if (
+            not 0 < event.committed_propensity <= 1
+            or not 0 < event.audit_propensity <= 1
+            or not math.isclose(event.committed_propensity, 1.0)
+            or not math.isclose(event.audit_propensity, 1.0)
+        ):
+            propensity_violations += 1
+        if event.policy != "shadow_static_speca":
+            policy_violations += 1
+        if (
+            not math.isfinite(event.incremental_cost)
+            or event.incremental_cost <= 0
+            or event.incremental_cost > 1.0
+        ):
+            budget_violations += 1
+
+        for numerator, denominator, ratio in zip(
+            transition.numerators,
+            transition.denominators,
+            transition.ratios,
+        ):
+            values = (
+                float(numerator), float(denominator), float(ratio))
+            total_metric_values += len(values)
+            finite_values += sum(
+                math.isfinite(value) and value >= 0 for value in values)
+            if not all(
+                    math.isfinite(value) and value >= 0 for value in values):
+                finite_violations += 1
+                continue
+            expected = numerator / max(denominator, ratio_epsilon)
+            if not math.isclose(
+                    ratio, expected, rel_tol=1e-5, abs_tol=1e-8):
+                ratio_violations += 1
+
+    for trajectory_key, cost in trajectory_costs.items():
+        if cost > trajectory_steps[trajectory_key] + 1e-8:
+            budget_violations += 1
+
+    failures = sum((
+        duplicate_contexts,
+        action_violations,
+        propensity_violations,
+        policy_violations,
+        budget_violations,
+        cardinality_violations,
+        finite_violations,
+        ratio_violations,
+        trajectory_label_violations,
+        trajectory_shape_violations,
+    ))
+    return GateResult(
+        "integrity",
+        "pass" if failures == 0 else "stop",
+        (
+            "action audit contexts and sample labels are internally consistent"
+            if failures == 0
+            else "action audit integrity violations were detected"
+        ),
+        {
+            "events": len(events),
+            "unique_contexts": len(contexts),
+            "trajectories": len(trajectory_labels),
+            "sample_labels": sample_labels,
+            "finite_rate": finite_values / max(total_metric_values, 1),
+            "duplicate_contexts": duplicate_contexts,
+            "action_violations": action_violations,
+            "propensity_violations": propensity_violations,
+            "policy_violations": policy_violations,
+            "budget_violations": budget_violations,
+            "cardinality_violations": cardinality_violations,
+            "finite_violations": finite_violations,
+            "ratio_reconstruction_violations": ratio_violations,
+            "trajectory_label_violations": trajectory_label_violations,
+            "trajectory_shape_violations": trajectory_shape_violations,
+        },
+    )
+
+
+def evaluate_denominator_tail(
+    events: Sequence[ActionAuditEvent],
+    bootstrap_samples: int = 1000,
+    seed: int = 0,
+    log_epsilon: float = 1e-12,
+) -> GateResult:
+    trajectories = {}
+    for event in events:
+        key = (event.session_id, event.trajectory_id)
+        trajectories.setdefault(key, []).append(event)
+
+    decomposition = []
+    skipped_nonterminal = 0
+    sample_set_mismatches = 0
+    paired_sample_labels = 0
+    terminal_steps = set()
+    previous_steps = set()
+    for trajectory_events in trajectories.values():
+        ordered = sorted(
+            trajectory_events, key=lambda event: event.context.step_idx)
+        if len(ordered) < 2:
+            continue
+        previous, terminal = ordered[-2], ordered[-1]
+        if terminal.context.step_idx != terminal.context.num_steps - 1:
+            skipped_nonterminal += 1
+            continue
+        if previous.sample_ids != terminal.sample_ids:
+            sample_set_mismatches += 1
+            continue
+
+        previous_transition = previous.one_step_transition
+        terminal_transition = terminal.one_step_transition
+        delta_log_numerator = []
+        delta_log_denominator = []
+        for index in range(len(terminal.sample_ids)):
+            delta_log_numerator.append(
+                math.log(terminal_transition.numerators[index] + log_epsilon)
+                - math.log(previous_transition.numerators[index] + log_epsilon))
+            delta_log_denominator.append(
+                math.log(terminal_transition.denominators[index] + log_epsilon)
+                - math.log(previous_transition.denominators[index] + log_epsilon))
+        mean_delta_numerator = float(np.mean(delta_log_numerator))
+        mean_delta_denominator = float(np.mean(delta_log_denominator))
+        decomposition.append((mean_delta_numerator, mean_delta_denominator))
+        paired_sample_labels += len(terminal.sample_ids)
+        terminal_steps.add(terminal.context.step_idx)
+        previous_steps.add(previous.context.step_idx)
+
+    if len(decomposition) < 2:
+        return GateResult(
+            "denominator_tail",
+            "insufficient_data",
+            "terminal decomposition requires at least two paired trajectories",
+            {
+                "paired_trajectories": len(decomposition),
+                "required_trajectories": 2,
+                "skipped_nonterminal": skipped_nonterminal,
+                "sample_set_mismatches": sample_set_mismatches,
+            },
+        )
+
+    values = np.asarray(decomposition, dtype=np.float64)
+    mean_delta_numerator = float(values[:, 0].mean())
+    mean_delta_denominator = float(values[:, 1].mean())
+    mean_delta_ratio = mean_delta_numerator - mean_delta_denominator
+    denominator_contribution = -mean_delta_denominator
+    denominator_share = (
+        denominator_contribution / mean_delta_ratio
+        if mean_delta_ratio > 0 else None)
+
+    rng = np.random.default_rng(seed)
+    bootstrap = np.empty((bootstrap_samples, 4), dtype=np.float64)
+    for index in range(bootstrap_samples):
+        sampled = values[rng.integers(0, len(values), len(values))]
+        delta_numerator = float(sampled[:, 0].mean())
+        delta_denominator = float(sampled[:, 1].mean())
+        delta_ratio = delta_numerator - delta_denominator
+        bootstrap[index] = (
+            delta_numerator,
+            delta_denominator,
+            delta_ratio,
+            -delta_denominator / delta_ratio if delta_ratio > 0 else np.nan,
+        )
+
+    confidence_intervals = {}
+    names = (
+        "delta_log_numerator",
+        "delta_log_denominator",
+        "delta_log_ratio",
+        "denominator_share",
+    )
+    for column, name in enumerate(names):
+        finite = bootstrap[:, column][np.isfinite(bootstrap[:, column])]
+        confidence_intervals[name] = (
+            [float(np.quantile(finite, 0.025)),
+             float(np.quantile(finite, 0.975))]
+            if len(finite) else None)
+
+    normalized_defect_prohibited = (
+        denominator_share is not None and denominator_share >= 0.5)
+    return GateResult(
+        "denominator_tail",
+        "stop" if normalized_defect_prohibited else "pass",
+        (
+            "denominator shrinkage explains at least half of the terminal ratio increase"
+            if normalized_defect_prohibited
+            else "denominator shrinkage does not dominate the terminal ratio change"
+        ),
+        {
+            "paired_trajectories": len(decomposition),
+            "paired_sample_labels": paired_sample_labels,
+            "terminal_step_indices": sorted(terminal_steps),
+            "previous_step_indices": sorted(previous_steps),
+            "skipped_nonterminal": skipped_nonterminal,
+            "sample_set_mismatches": sample_set_mismatches,
+            "delta_log_numerator": mean_delta_numerator,
+            "delta_log_denominator": mean_delta_denominator,
+            "delta_log_ratio": mean_delta_ratio,
+            "denominator_contribution": denominator_contribution,
+            "denominator_share": denominator_share,
+            "normalized_defect_primary_target_prohibited": (
+                normalized_defect_prohibited),
+            "trajectory_bootstrap_95_ci": confidence_intervals,
+            "log_epsilon": log_epsilon,
+        },
+    )
+
+
+def evaluate_action_aligned_timestep(
+    events: Sequence[ActionAuditEvent],
+    budget_fractions: Sequence[float] = (0.05, 0.1, 0.2, 0.3, 0.4),
+    ridge_alpha: float = 1e-6,
+) -> GateResult:
+    if len(events) < 4:
+        return GateResult(
+            "action_aligned_timestep",
+            "insufficient_data",
+            "timestep analysis requires at least four batch-step contexts",
+            {"contexts": len(events), "required_contexts": 4},
+        )
+
+    sessions = sorted({event.session_id for event in events})
+    if len(sessions) >= 2:
+        fold_unit = "session"
+        group_keys = [event.session_id for event in events]
+    else:
+        fold_unit = "trajectory"
+        group_keys = [
+            (event.session_id, event.trajectory_id) for event in events]
+    groups = list(dict.fromkeys(group_keys))
+    if len(groups) < 2:
+        return GateResult(
+            "action_aligned_timestep",
+            "insufficient_data",
+            "held-out analysis requires at least two isolated groups",
+            {
+                "contexts": len(events),
+                "fold_unit": fold_unit,
+                "groups": len(groups),
+                "required_groups": 2,
+            },
+        )
+
+    targets = np.asarray([
+        event.one_step_transition.mean_ratio for event in events
+    ], dtype=np.float64)
+    steps = np.asarray([
+        event.context.step_idx for event in events
+    ], dtype=np.int64)
+    log_snr = np.asarray([
+        event.context.log_snr for event in events
+    ], dtype=np.float64)
+    one_hot_predictions = np.full(len(events), np.nan, dtype=np.float64)
+    spline_predictions = np.full(len(events), np.nan, dtype=np.float64)
+    fold_sizes = []
+
+    group_array = np.asarray(group_keys, dtype=object)
+    for group in groups:
+        if fold_unit == "session":
+            test_mask = group_array == group
+        else:
+            test_mask = np.asarray([
+                key == group for key in group_keys], dtype=bool)
+        train_mask = ~test_mask
+        if not train_mask.any() or not test_mask.any():
+            continue
+
+        train_targets = targets[train_mask]
+        global_mean = float(train_targets.mean())
+        step_means = {
+            int(step): float(train_targets[steps[train_mask] == step].mean())
+            for step in np.unique(steps[train_mask])
+        }
+        one_hot_predictions[test_mask] = [
+            step_means.get(int(step), global_mean) for step in steps[test_mask]
+        ]
+
+        train_log_snr = log_snr[train_mask]
+        center = float(train_log_snr.mean())
+        scale = float(train_log_snr.std())
+        if scale < 1e-12:
+            scale = 1.0
+        train_scaled = (train_log_snr - center) / scale
+        test_scaled = (log_snr[test_mask] - center) / scale
+        knots = np.quantile(train_scaled, (0.25, 0.5, 0.75))
+        train_design = _cubic_spline_design(train_scaled, knots)
+        test_design = _cubic_spline_design(test_scaled, knots)
+        precision = (
+            train_design.T @ train_design
+            + ridge_alpha * np.eye(train_design.shape[1]))
+        coefficients = np.linalg.solve(
+            precision, train_design.T @ train_targets)
+        spline_predictions[test_mask] = test_design @ coefficients
+        fold_sizes.append({
+            "group": str(group),
+            "train_contexts": int(train_mask.sum()),
+            "test_contexts": int(test_mask.sum()),
+        })
+
+    valid = np.isfinite(one_hot_predictions) & np.isfinite(spline_predictions)
+    if not valid.all():
+        return GateResult(
+            "action_aligned_timestep",
+            "insufficient_data",
+            "one or more held-out groups could not be evaluated",
+            {
+                "contexts": len(events),
+                "valid_contexts": int(valid.sum()),
+                "fold_unit": fold_unit,
+                "groups": len(groups),
+            },
+        )
+
+    one_hot_metrics = _prediction_metrics(one_hot_predictions, targets)
+    spline_metrics = _prediction_metrics(spline_predictions, targets)
+    one_hot_metrics["spearman"] = _spearman(one_hot_predictions, targets)
+    spline_metrics["spearman"] = _spearman(spline_predictions, targets)
+    allocation = _trajectory_allocation_curves(
+        events,
+        targets,
+        one_hot_predictions,
+        spline_predictions,
+        budget_fractions,
+    )
+    return GateResult(
+        "action_aligned_timestep",
+        "pass",
+        "held-out timestep baselines were evaluated on isolated action contexts",
+        {
+            "contexts": len(events),
+            "fold_unit": fold_unit,
+            "groups": len(groups),
+            "folds": fold_sizes,
+            "one_hot_timestep": one_hot_metrics,
+            "cubic_truncated_power_spline_log_snr": spline_metrics,
+            "allocation": {
+                "oracle_kind": "noncausal_static_path_one_step",
+                "selection_unit": "batch_step_context_within_trajectory",
+                "curve": allocation,
+            },
+        },
+    )
+
+
+def run_phase0_analysis(
+    events: Sequence[ActionAuditEvent],
+) -> Dict[str, object]:
+    reports = [
+        evaluate_action_audit_integrity(events),
+        evaluate_denominator_tail(events),
+        evaluate_action_aligned_timestep(events),
+    ]
+    first_failure: Optional[GateResult] = next(
+        (report for report in reports if report.status != "pass"), None)
+    return {
+        "schema_version": 2,
+        "decision": "proceed" if first_failure is None else "stop",
+        "stopped_at": None if first_failure is None else first_failure.gate,
+        "reports": [report.to_dict() for report in reports],
+    }
+
+
+def _cubic_spline_design(
+    values: np.ndarray,
+    knots: np.ndarray,
+) -> np.ndarray:
+    columns = [
+        np.ones(len(values), dtype=np.float64),
+        values,
+        values ** 2,
+        values ** 3,
+    ]
+    columns.extend(np.maximum(values - knot, 0.0) ** 3 for knot in knots)
+    return np.column_stack(columns)
+
+
+def _trajectory_allocation_curves(
+    events: Sequence[ActionAuditEvent],
+    targets: np.ndarray,
+    one_hot_predictions: np.ndarray,
+    spline_predictions: np.ndarray,
+    budget_fractions: Sequence[float],
+) -> List[Dict[str, float]]:
+    trajectories = {}
+    for index, event in enumerate(events):
+        key = (event.session_id, event.trajectory_id)
+        trajectories.setdefault(key, []).append(index)
+
+    curves = []
+    for fraction in budget_fractions:
+        if not 0 < fraction <= 1:
+            raise ValueError("budget fractions must be in (0, 1]")
+        residuals = {
+            "oracle": [],
+            "one_hot_timestep": [],
+            "spline_log_snr": [],
+        }
+        for indices in trajectories.values():
+            trajectory_indices = np.asarray(indices, dtype=np.int64)
+            count = max(1, int(round(len(trajectory_indices) * fraction)))
+            trajectory_targets = targets[trajectory_indices]
+            scores = {
+                "oracle": trajectory_targets,
+                "one_hot_timestep": one_hot_predictions[trajectory_indices],
+                "spline_log_snr": spline_predictions[trajectory_indices],
+            }
+            for name, values in scores.items():
+                selected_local = np.argsort(
+                    values, kind="stable")[-count:]
+                selected = trajectory_indices[selected_local]
+                residual = (
+                    float(targets[trajectory_indices].sum())
+                    - float(targets[selected].sum())
+                ) / len(trajectory_indices)
+                residuals[name].append(max(residual, 0.0))
+        curves.append({
+            "budget_fraction": float(fraction),
+            "trajectories": len(trajectories),
+            "oracle_residual_defect": float(np.mean(residuals["oracle"])),
+            "one_hot_residual_defect": float(
+                np.mean(residuals["one_hot_timestep"])),
+            "spline_residual_defect": float(
+                np.mean(residuals["spline_log_snr"])),
+        })
+    return curves
 
 
 def _ranking_metrics(scores: np.ndarray, target: np.ndarray) -> Dict[str, float]:

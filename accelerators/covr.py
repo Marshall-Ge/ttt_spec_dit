@@ -18,6 +18,7 @@ import numpy as np
 
 
 SCHEMA_VERSION = 1
+AUDIT_SCHEMA_VERSION = 2
 FEATURE_NAMES = (
     "bias",
     "progress",
@@ -650,3 +651,324 @@ def _atomic_json_dump(path: Path, payload: Mapping[str, Any]) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+@dataclass(frozen=True)
+class ActionAuditContext:
+    step_idx: int
+    num_steps: int
+    timestep: float
+    log_snr: float
+    alpha_t: float
+    alpha_prev: float
+    latent_coefficient: float
+    model_output_coefficient: float
+    distance_since_refresh: int
+    previous_defect_mean: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.num_steps <= 0:
+            raise ValueError("num_steps must be positive")
+        if not 0 <= self.step_idx < self.num_steps:
+            raise ValueError("step_idx must be within the denoising trajectory")
+        if self.distance_since_refresh < 0:
+            raise ValueError("distance_since_refresh must be non-negative")
+        values = (
+            self.timestep,
+            self.log_snr,
+            self.alpha_t,
+            self.alpha_prev,
+            self.latent_coefficient,
+            self.model_output_coefficient,
+            self.previous_defect_mean,
+        )
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError("action audit context values must be finite")
+        if not 0 < self.alpha_t <= 1 or not 0 < self.alpha_prev <= 1:
+            raise ValueError("scheduler alpha values must be in (0, 1]")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "ActionAuditContext":
+        return cls(**dict(value))
+
+
+@dataclass(frozen=True)
+class TransitionDefectBatch:
+    numerators: Tuple[float, ...]
+    denominators: Tuple[float, ...]
+    ratios: Tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        size = len(self.numerators)
+        if size == 0 or len(self.denominators) != size or len(self.ratios) != size:
+            raise ValueError("transition metric arrays must have equal non-zero lengths")
+        for numerator, denominator, ratio in zip(
+                self.numerators, self.denominators, self.ratios):
+            values = (float(numerator), float(denominator), float(ratio))
+            if not all(math.isfinite(value) and value >= 0 for value in values):
+                raise ValueError("transition metrics must be finite and non-negative")
+            if denominator >= 1e-8 and not math.isclose(
+                    ratio, numerator / denominator, rel_tol=1e-5, abs_tol=1e-8):
+                raise ValueError("transition ratio is inconsistent with numerator/denominator")
+
+    @property
+    def sample_count(self) -> int:
+        return len(self.ratios)
+
+    @property
+    def mean_numerator(self) -> float:
+        return _mean(self.numerators)
+
+    @property
+    def mean_denominator(self) -> float:
+        return _mean(self.denominators)
+
+    @property
+    def mean_ratio(self) -> float:
+        return _mean(self.ratios)
+
+    @property
+    def cvar90_ratio(self) -> float:
+        values = np.asarray(self.ratios, dtype=np.float64)
+        threshold = float(np.quantile(values, 0.9))
+        return float(values[values >= threshold].mean())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "TransitionDefectBatch":
+        return cls(
+            numerators=tuple(float(item) for item in value["numerators"]),
+            denominators=tuple(float(item) for item in value["denominators"]),
+            ratios=tuple(float(item) for item in value["ratios"]),
+        )
+
+
+@dataclass(frozen=True)
+class ActionAuditEvent:
+    session_id: str
+    trajectory_id: int
+    sample_ids: Tuple[str, ...]
+    class_ids: Tuple[int, ...]
+    version_key: str
+    context: ActionAuditContext
+    committed_action: COVRAction
+    committed_propensity: float
+    audit_action: COVRAction
+    audit_propensity: float
+    policy: str
+    incremental_cost: float
+    one_step_transition: TransitionDefectBatch
+    local_probe_error: Optional[float] = None
+    h_step_transition: Optional[TransitionDefectBatch] = None
+    terminal_quality_gains: Optional[Tuple[float, ...]] = None
+    terminal_fidelity_gains: Optional[Tuple[float, ...]] = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        sample_count = len(self.sample_ids)
+        if sample_count == 0 or len(self.class_ids) != sample_count:
+            raise ValueError("sample_ids and class_ids must have equal non-zero lengths")
+        if self.one_step_transition.sample_count != sample_count:
+            raise ValueError("one-step metrics must match the event sample count")
+        if self.h_step_transition is not None \
+                and self.h_step_transition.sample_count != sample_count:
+            raise ValueError("H-step metrics must match the event sample count")
+        for gains in (self.terminal_quality_gains, self.terminal_fidelity_gains):
+            if gains is not None and len(gains) != sample_count:
+                raise ValueError("terminal gains must match the event sample count")
+            if gains is not None and not all(math.isfinite(float(item)) for item in gains):
+                raise ValueError("terminal gains must be finite")
+        for propensity in (self.committed_propensity, self.audit_propensity):
+            if not 0 < float(propensity) <= 1:
+                raise ValueError("propensities must be in (0, 1]")
+        if not math.isfinite(float(self.incremental_cost)) or self.incremental_cost < 0:
+            raise ValueError("incremental_cost must be finite and non-negative")
+        if self.local_probe_error is not None \
+                and not math.isfinite(float(self.local_probe_error)):
+            raise ValueError("local_probe_error must be finite")
+        _assert_scalar_tree(self.metadata)
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = asdict(self)
+        payload["schema_version"] = AUDIT_SCHEMA_VERSION
+        payload["event_type"] = "batch_step_audit"
+        payload["committed_action"] = self.committed_action.value
+        payload["audit_action"] = self.audit_action.value
+        return payload
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "ActionAuditEvent":
+        data = dict(value)
+        schema_version = data.pop("schema_version", None)
+        event_type = data.pop("event_type", None)
+        if schema_version != AUDIT_SCHEMA_VERSION or event_type != "batch_step_audit":
+            raise ValueError("unsupported action audit event schema")
+        data["sample_ids"] = tuple(str(item) for item in data["sample_ids"])
+        data["class_ids"] = tuple(int(item) for item in data["class_ids"])
+        data["context"] = ActionAuditContext.from_dict(data["context"])
+        data["committed_action"] = COVRAction(data["committed_action"])
+        data["audit_action"] = COVRAction(data["audit_action"])
+        data["one_step_transition"] = TransitionDefectBatch.from_dict(
+            data["one_step_transition"])
+        if data.get("h_step_transition") is not None:
+            data["h_step_transition"] = TransitionDefectBatch.from_dict(
+                data["h_step_transition"])
+        for key in ("terminal_quality_gains", "terminal_fidelity_gains"):
+            if data.get(key) is not None:
+                data[key] = tuple(float(item) for item in data[key])
+        return cls(**data)
+
+
+def transition_defect_batch(
+    x_prev_approx: Any,
+    x_prev_full: Any,
+    x_t: Any,
+    eps: float = 1e-8,
+) -> TransitionDefectBatch:
+    if not math.isfinite(float(eps)) or eps <= 0:
+        raise ValueError("eps must be finite and positive")
+    try:
+        import torch
+    except ImportError:
+        torch = None
+
+    tensor_inputs = (x_prev_approx, x_prev_full, x_t)
+    if torch is not None and any(torch.is_tensor(value) for value in tensor_inputs):
+        if not all(torch.is_tensor(value) for value in tensor_inputs):
+            raise TypeError("transition inputs must all be tensors or arrays")
+        shapes = tuple(value.shape for value in tensor_inputs)
+        if len(set(shapes)) != 1:
+            raise ValueError("transition inputs must have identical shapes")
+        approx = x_prev_approx.detach().float().reshape(x_prev_approx.shape[0], -1)
+        full = x_prev_full.detach().float().reshape(x_prev_full.shape[0], -1)
+        current = x_t.detach().float().reshape(x_t.shape[0], -1)
+        numerator = (approx - full).square().mean(dim=1).sqrt()
+        denominator = (full - current).square().mean(dim=1).sqrt()
+        ratio = numerator / denominator.clamp_min(eps)
+        return TransitionDefectBatch(
+            numerators=tuple(float(item) for item in numerator.cpu().tolist()),
+            denominators=tuple(float(item) for item in denominator.cpu().tolist()),
+            ratios=tuple(float(item) for item in ratio.cpu().tolist()),
+        )
+
+    approx = _as_batch_array(x_prev_approx)
+    full = _as_batch_array(x_prev_full)
+    current = _as_batch_array(x_t)
+    shapes = (approx.shape, full.shape, current.shape)
+    if len(set(shapes)) != 1:
+        raise ValueError("transition inputs must have identical shapes")
+    numerator = np.sqrt(np.square(approx - full).mean(axis=1))
+    denominator = np.sqrt(np.square(full - current).mean(axis=1))
+    ratio = numerator / np.maximum(denominator, eps)
+    return TransitionDefectBatch(
+        numerators=tuple(float(item) for item in numerator.tolist()),
+        denominators=tuple(float(item) for item in denominator.tolist()),
+        ratios=tuple(float(item) for item in ratio.tolist()),
+    )
+
+
+def ddim_epsilon_transition_coefficients(
+    alpha_t: float,
+    alpha_prev: float,
+) -> Tuple[float, float]:
+    alpha_t = float(alpha_t)
+    alpha_prev = float(alpha_prev)
+    if not 0 < alpha_t <= 1 or not 0 < alpha_prev <= 1:
+        raise ValueError("DDIM alpha values must be in (0, 1]")
+    latent_coefficient = math.sqrt(alpha_prev / alpha_t)
+    model_output_coefficient = (
+        math.sqrt(max(1.0 - alpha_prev, 0.0))
+        - latent_coefficient * math.sqrt(max(1.0 - alpha_t, 0.0))
+    )
+    return latent_coefficient, model_output_coefficient
+
+
+class ActionAuditRecorder:
+    def __init__(self, output_dir: str, session_id: str, version: COVRVersion,
+                 max_events: Optional[int] = None):
+        if max_events is not None and max_events <= 0:
+            raise ValueError("max_events must be positive")
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.session_id = session_id
+        self.version = version
+        self.max_events = max_events
+        self.event_path = self.output_dir / f"events_{session_id}.jsonl"
+        self.summary_path = self.output_dir / f"summary_{session_id}.json"
+        self._handle = self.event_path.open("a", encoding="utf-8")
+        self.count = 0
+        self.sample_count = 0
+        self.numerator_sum = 0.0
+        self.denominator_sum = 0.0
+        self.ratio_sum = 0.0
+        self.previous_defect = 0.0
+        self.closed = False
+
+    @property
+    def enabled(self) -> bool:
+        return not self.closed and (
+            self.max_events is None or self.count < self.max_events)
+
+    def record(self, event: ActionAuditEvent) -> bool:
+        if self.closed:
+            raise RuntimeError("recorder is closed")
+        if not self.enabled:
+            return False
+        if event.session_id != self.session_id:
+            raise ValueError("event session does not match recorder")
+        if event.version_key != self.version.key:
+            raise ValueError("event version does not match recorder")
+        self._handle.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
+        self._handle.flush()
+        transition = event.one_step_transition
+        self.count += 1
+        self.sample_count += transition.sample_count
+        self.numerator_sum += sum(transition.numerators)
+        self.denominator_sum += sum(transition.denominators)
+        self.ratio_sum += sum(transition.ratios)
+        self.previous_defect = transition.mean_ratio
+        return True
+
+    def summary(self) -> Dict[str, Any]:
+        denominator = max(self.sample_count, 1)
+        return {
+            "schema_version": AUDIT_SCHEMA_VERSION,
+            "event_type": "batch_step_audit",
+            "session_id": self.session_id,
+            "version": asdict(self.version),
+            "version_key": self.version.key,
+            "events": self.count,
+            "samples": self.sample_count,
+            "mean_numerator": self.numerator_sum / denominator,
+            "mean_denominator": self.denominator_sum / denominator,
+            "mean_one_step_defect": self.ratio_sum / denominator,
+            "event_path": str(self.event_path),
+        }
+
+    def close(self) -> Dict[str, Any]:
+        if not self.closed:
+            self._handle.close()
+            self.closed = True
+            _atomic_json_dump(self.summary_path, self.summary())
+        return self.summary()
+
+    def __enter__(self) -> "ActionAuditRecorder":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+
+def read_action_audits(paths: Iterable[str]) -> List[ActionAuditEvent]:
+    events: List[ActionAuditEvent] = []
+    for path in paths:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    events.append(ActionAuditEvent.from_dict(json.loads(line)))
+    return events

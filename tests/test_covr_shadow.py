@@ -4,7 +4,11 @@ import pytest
 import torch
 
 from models.dit import DiTTransformer2D
-from run_dit import _covr_scheduler_pair, _covr_shadow_full
+from run_dit import (
+    _covr_scheduler_alphas,
+    _covr_scheduler_pair,
+    _covr_shadow_full,
+)
 
 
 class StatefulScheduler:
@@ -59,6 +63,22 @@ def test_shadow_full_explicitly_bypasses_all_acceleration_state():
     assert kwargs["current"] is None
     assert kwargs["cache_dic"] is None
     assert kwargs["teacache_state"] is None
+
+
+def test_scheduler_alphas_use_actual_next_step_and_final_alpha():
+    scheduler = SimpleNamespace(
+        config=SimpleNamespace(prediction_type="epsilon"),
+        alphas_cumprod=torch.tensor([0.1, 0.2, 0.3, 0.4]),
+        final_alpha_cumprod=torch.tensor(0.9),
+    )
+    timesteps = torch.tensor([3, 1])
+    assert _covr_scheduler_alphas(
+        scheduler, timesteps, 0, torch.tensor(3)) == pytest.approx((0.4, 0.2))
+    assert _covr_scheduler_alphas(
+        scheduler, timesteps, 1, torch.tensor(1)) == pytest.approx((0.2, 0.9))
+    scheduler.config.prediction_type = "v_prediction"
+    with pytest.raises(ValueError, match="epsilon-prediction"):
+        _covr_scheduler_alphas(scheduler, timesteps, 1, torch.tensor(1))
 
 
 def test_cfg_wrapper_keeps_tensor_contract_and_records_disagreement():

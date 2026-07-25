@@ -1,15 +1,23 @@
 import numpy as np
+import pytest
 
 from accelerators.covr import (
+    ActionAuditContext,
+    ActionAuditEvent,
     COVRAction,
     COVRContext,
     CounterfactualEvent,
+    TransitionDefectBatch,
 )
 from experiments.covr_analysis import (
     evaluate_gate_a,
     evaluate_gate_b,
+    evaluate_action_aligned_timestep,
+    evaluate_action_audit_integrity,
+    evaluate_denominator_tail,
     evaluate_gate_c,
     run_all_gates,
+    run_phase0_analysis,
 )
 
 
@@ -87,3 +95,92 @@ def test_gate_order_stops_at_missing_terminal_labels():
     assert result["decision"] == "stop"
     assert result["stopped_at"] == "A"
     assert result["gates"][0]["status"] == "insufficient_data"
+
+
+def _audit_context(step_idx):
+    return ActionAuditContext(
+        step_idx=step_idx,
+        num_steps=2,
+        timestep=2 - step_idx,
+        log_snr=2.0 if step_idx == 0 else -2.0,
+        alpha_t=0.8,
+        alpha_prev=0.6,
+        latent_coefficient=0.866,
+        model_output_coefficient=-0.1,
+        distance_since_refresh=step_idx,
+    )
+
+
+def _audit_events(final_numerator=1.0, final_denominator=0.25,
+                  session_count=2):
+    events = []
+    for trajectory_id in range(2):
+        session_id = f"session-{trajectory_id % session_count}"
+        sample_ids = (f"sample-{trajectory_id}-0", f"sample-{trajectory_id}-1")
+        class_ids = (trajectory_id, trajectory_id + 10)
+        for step_idx, numerator, denominator in (
+            (0, 1.0, 1.0),
+            (1, final_numerator, final_denominator),
+        ):
+            transition = TransitionDefectBatch(
+                numerators=(numerator, numerator),
+                denominators=(denominator, denominator),
+                ratios=(numerator / denominator, numerator / denominator),
+            )
+            events.append(ActionAuditEvent(
+                session_id=session_id,
+                trajectory_id=trajectory_id,
+                sample_ids=sample_ids,
+                class_ids=class_ids,
+                version_key="version",
+                context=_audit_context(step_idx),
+                committed_action=COVRAction.ACCEPT,
+                committed_propensity=1.0,
+                audit_action=COVRAction.REFRESH,
+                audit_propensity=1.0,
+                policy="shadow_static_speca",
+                incremental_cost=1.0,
+                one_step_transition=transition,
+            ))
+    return events
+
+
+def test_integrity_rejects_duplicate_batch_context():
+    events = _audit_events()
+    result = evaluate_action_audit_integrity(events + [events[0]])
+    assert result.status == "stop"
+    assert result.metrics["duplicate_contexts"] == 1
+
+
+def test_denominator_tail_distinguishes_numerator_spike_and_collapse():
+    denominator = evaluate_denominator_tail(_audit_events(1.0, 0.25))
+    assert denominator.status == "stop"
+    assert denominator.metrics["delta_log_numerator"] == pytest.approx(0.0)
+    assert denominator.metrics["denominator_share"] == pytest.approx(1.0)
+    numerator = evaluate_denominator_tail(_audit_events(4.0, 1.0))
+    assert numerator.status == "pass"
+    assert numerator.metrics["delta_log_ratio"] == pytest.approx(np.log(4.0))
+    assert numerator.metrics["denominator_share"] == pytest.approx(0.0)
+
+
+def test_action_aligned_timestep_uses_session_held_out_folds_and_trajectory_curves():
+    result = evaluate_action_aligned_timestep(_audit_events())
+    assert result.status == "pass"
+    assert result.metrics["fold_unit"] == "session"
+    assert len(result.metrics["folds"]) == 2
+    curve = result.metrics["allocation"]["curve"]
+    assert curve[0]["oracle_residual_defect"] <= curve[0]["one_hot_residual_defect"]
+
+
+def test_action_aligned_timestep_uses_trajectory_folds_without_session_fallback():
+    result = evaluate_action_aligned_timestep(_audit_events(session_count=1))
+    assert result.status == "pass"
+    assert result.metrics["fold_unit"] == "trajectory"
+    assert result.metrics["groups"] == 2
+
+
+def test_phase0_stops_on_denominator_diagnostic():
+    result = run_phase0_analysis(_audit_events())
+    assert result["schema_version"] == 2
+    assert result["decision"] == "stop"
+    assert result["stopped_at"] == "denominator_tail"

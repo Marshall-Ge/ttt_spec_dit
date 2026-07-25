@@ -6,6 +6,9 @@ import torch
 
 from accelerators.covr import (
     FEATURE_NAMES,
+    ActionAuditContext,
+    ActionAuditEvent,
+    ActionAuditRecorder,
     BudgetLedger,
     COVRAction,
     COVRContext,
@@ -16,9 +19,12 @@ from accelerators.covr import (
     OnlineRidgeUCB,
     PrimalDualBudget,
     ShadowAuditRecorder,
+    TransitionDefectBatch,
     load_policy_state,
     normalized_transition_defect,
+    read_action_audits,
     save_policy_state,
+    transition_defect_batch,
     transition_defects,
 )
 
@@ -61,6 +67,75 @@ def test_transition_defect_is_per_sample_and_normalized():
     defects = transition_defects(approx, full, current)
     assert defects == pytest.approx((0.5, 0.5))
     assert normalized_transition_defect(approx, full, current) == pytest.approx(0.5)
+
+
+def _audit_context(step_idx):
+    return ActionAuditContext(
+        step_idx=step_idx,
+        num_steps=3,
+        timestep=3 - step_idx,
+        log_snr=float(step_idx),
+        alpha_t=0.8,
+        alpha_prev=0.6,
+        latent_coefficient=0.8660254,
+        model_output_coefficient=-0.1,
+        distance_since_refresh=step_idx,
+        previous_defect_mean=0.25,
+    )
+
+
+def _audit_event(recorder, step_idx, ratio):
+    transition = TransitionDefectBatch(
+        numerators=(ratio, ratio * 2.0),
+        denominators=(1.0, 2.0),
+        ratios=(ratio, ratio),
+    )
+    return ActionAuditEvent(
+        session_id=recorder.session_id,
+        trajectory_id=0,
+        sample_ids=("sample-0", "sample-1"),
+        class_ids=(3, 4),
+        version_key=recorder.version.key,
+        context=_audit_context(step_idx),
+        committed_action=COVRAction.ACCEPT,
+        committed_propensity=1.0,
+        audit_action=COVRAction.REFRESH,
+        audit_propensity=1.0,
+        policy="shadow_static_speca",
+        incremental_cost=1.0,
+        one_step_transition=transition,
+    )
+
+
+def test_transition_defect_batch_records_rms_components_and_validates_shapes():
+    current = torch.zeros(2, 1, 1, 2)
+    full = torch.tensor([[[[2.0, 0.0]]], [[[4.0, 0.0]]]])
+    approx = torch.tensor([[[[3.0, 0.0]]], [[[6.0, 0.0]]]])
+    transition = transition_defect_batch(approx, full, current)
+    assert transition.numerators == pytest.approx((2 ** -0.5, 2 ** 0.5))
+    assert transition.denominators == pytest.approx((2 ** 0.5, 2 ** 1.5))
+    assert transition.ratios == pytest.approx((0.5, 0.5))
+    with pytest.raises(ValueError, match="identical shapes"):
+        transition_defect_batch(approx[:1], full, current)
+
+
+def test_action_audit_round_trip_and_batch_mean_history(tmp_path):
+    recorder = ActionAuditRecorder(str(tmp_path), "session", _version(), max_events=2)
+    first = _audit_event(recorder, 0, 0.25)
+    second = _audit_event(recorder, 1, 0.5)
+    assert recorder.record(first)
+    assert recorder.previous_defect == pytest.approx(0.25)
+    assert recorder.record(second)
+    summary = recorder.close()
+    assert summary["schema_version"] == 2
+    assert summary["event_type"] == "batch_step_audit"
+    assert summary["events"] == 2
+    assert summary["samples"] == 4
+    assert summary["mean_one_step_defect"] == pytest.approx(0.375)
+    restored = read_action_audits([str(recorder.event_path)])
+    assert len(restored) == 2
+    assert restored[0].sample_ids == ("sample-0", "sample-1")
+    assert restored[1].context.previous_defect_mean == pytest.approx(0.25)
 
 
 def test_policy_records_propensity_and_conserves_budget():

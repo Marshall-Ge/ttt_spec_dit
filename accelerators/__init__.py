@@ -15,7 +15,11 @@ from .compute_controller import (
     VerificationResult,
 )
 from .covr import (
+    AUDIT_SCHEMA_VERSION,
     FEATURE_NAMES,
+    ActionAuditContext,
+    ActionAuditEvent,
+    ActionAuditRecorder,
     BudgetLedger,
     COVRAction,
     COVRContext,
@@ -26,11 +30,15 @@ from .covr import (
     OnlineRidgeUCB,
     PrimalDualBudget,
     ShadowAuditRecorder,
+    TransitionDefectBatch,
+    ddim_epsilon_transition_coefficients,
     load_policy_state,
     normalized_transition_defect,
+    read_action_audits,
     read_events,
     save_policy_state,
     summarize_taylor_cache,
+    transition_defect_batch,
     transition_defects,
 )
 from .speca import (
