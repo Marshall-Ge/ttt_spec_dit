@@ -20,7 +20,7 @@ import json
 import os
 import time
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -87,6 +87,34 @@ C2I_VALID_METRICS = {
 DIT_IMAGE_SIZE = 256
 DIT_LATENT_SIZE = 32
 DIT_NULL_CLASS = 1000
+
+
+def _covr_canonical_json(value) -> str:
+    def normalize(item):
+        if isinstance(item, Mapping):
+            return {
+                str(key): normalize(item[key])
+                for key in sorted(item, key=lambda key: str(key))
+            }
+        if isinstance(item, (list, tuple)):
+            return [normalize(entry) for entry in item]
+        if isinstance(item, (set, frozenset)):
+            entries = [normalize(entry) for entry in item]
+            return sorted(
+                entries,
+                key=lambda entry: json.dumps(
+                    entry, sort_keys=True, separators=(",", ":")),
+            )
+        if isinstance(item, np.generic):
+            return item.item()
+        if torch.is_tensor(item):
+            return item.detach().cpu().tolist()
+        if item is None or isinstance(item, (str, int, float, bool)):
+            return item
+        return str(item)
+
+    return json.dumps(
+        normalize(value), sort_keys=True, separators=(",", ":"))
 
 
 def _covr_log_snr(scheduler, timestep) -> float:
@@ -1332,10 +1360,9 @@ def run_c2i(args) -> Dict:
             f"{time.strftime('%Y%m%d-%H%M%S')}-seed{args.seed}"
         )
         scheduler_instance = generator.scheduler
-        scheduler_config = json.dumps(
-            dict(getattr(scheduler_instance, "config", {})),
-            sort_keys=True, default=str)
-        speca_config = json.dumps(speca_init_kwargs, sort_keys=True, default=str)
+        scheduler_config = _covr_canonical_json(
+            dict(getattr(scheduler_instance, "config", {})))
+        speca_config = _covr_canonical_json(speca_init_kwargs)
         covr_version = COVRVersion(
             model="dit",
             base_model_version=(
@@ -1361,7 +1388,7 @@ def run_c2i(args) -> Dict:
             manifest = TemplateManifest.load(args.covr_template_manifest)
             if manifest.version_key != covr_version.key:
                 raise ValueError(
-                    "COVR template manifest version does not match the runtime")
+                    f"COVR template manifest version does not match the runtime: manifest={manifest.version_key}, runtime={covr_version.key}")
             covr_bandit = ConservativeTemplateBandit(
                 manifest, session_id=covr_session_id,
                 epsilon=args.covr_bandit_epsilon, seed=args.seed,

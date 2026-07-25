@@ -6,6 +6,7 @@ import torch
 
 from models.dit import DiTTransformer2D
 from run_dit import (
+    _covr_canonical_json,
     _covr_full_rollout,
     _covr_resume_metadata,
     _covr_scheduler_alphas,
@@ -34,6 +35,21 @@ class RecordingTransformer:
     def __call__(self, hidden_states, timestep, **kwargs):
         self.calls.append(("plain", kwargs))
         return (hidden_states + 1,)
+
+
+def test_covr_version_json_is_canonical_across_container_order():
+    left = {
+        "_use_default_values": {"beta_end", "beta_start"},
+        "nested": {"second": 2, "first": torch.tensor([1, 2])},
+    }
+    right = {
+        "nested": {"first": torch.tensor([1, 2]), "second": 2},
+        "_use_default_values": {"beta_start", "beta_end"},
+    }
+
+    assert _covr_canonical_json(left) == _covr_canonical_json(right)
+    assert json.loads(_covr_canonical_json(left))["_use_default_values"] == [
+        "beta_end", "beta_start"]
 
 
 def test_scheduler_counterfactual_branches_share_pre_step_state():
