@@ -9,9 +9,11 @@ fi
 shift
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SEED="${SEED:-42}"
 if [[ "${PHASE}" == "smoke" ]]; then
-  OUTPUT_ROOT="${OUTPUT_ROOT:-${ROOT_DIR}/output/covr_template_smoke}"
-  SESSION_ID="${SESSION_ID:-covr-smoke-seed42}"
+  RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
+  OUTPUT_ROOT="${OUTPUT_ROOT:-${ROOT_DIR}/output/covr_template_smoke/${RUN_ID}}"
+  SESSION_ID="${SESSION_ID:-covr-smoke-${RUN_ID}-seed${SEED}}"
   N_PROMPTS="${N_PROMPTS:-64}"
   BATCH_SIZE="${BATCH_SIZE:-8}"
   SENTINEL_RATE="${SENTINEL_RATE:-1.0}"
@@ -24,7 +26,6 @@ else
   SENTINEL_RATE="${SENTINEL_RATE:-0.05}"
   SAFETY_SAMPLE_RATE="${SAFETY_SAMPLE_RATE:-0.1}"
 fi
-SEED="${SEED:-42}"
 NUM_STEPS="${NUM_STEPS:-50}"
 GUIDANCE_SCALE="${GUIDANCE_SCALE:-4.5}"
 TEMPLATE_COUNT="${TEMPLATE_COUNT:-4}"
@@ -68,7 +69,7 @@ case "${PHASE}" in
       "SAFETY_SAMPLE_RATE=${SAFETY_SAMPLE_RATE}"
       "BANDIT_EPSILON=${BANDIT_EPSILON}"
     )
-    if [[ -e "${AUDIT_FILE}" ]]; then
+    if [[ -e "${AUDIT_FILE}" && "${REUSE_AUDIT:-0}" == "1" ]]; then
       echo "reusing audit file: ${AUDIT_FILE}"
     else
       env "${SMOKE_ENV[@]}" bash "$0" audit "$@"
