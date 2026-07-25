@@ -3,7 +3,7 @@ set -euo pipefail
 
 PHASE="${1:-}"
 if [[ -z "${PHASE}" ]]; then
-  echo "usage: $0 {smoke|audit|manifest|baseline|speca|bandit} [extra main.py args...]" >&2
+  echo "usage: $0 {smoke|pilot|audit|manifest|baseline|speca|bandit} [extra main.py args...]" >&2
   exit 2
 fi
 shift
@@ -18,6 +18,15 @@ if [[ "${PHASE}" == "smoke" ]]; then
   BATCH_SIZE="${BATCH_SIZE:-8}"
   SENTINEL_RATE="${SENTINEL_RATE:-1.0}"
   SAFETY_SAMPLE_RATE="${SAFETY_SAMPLE_RATE:-1.0}"
+elif [[ "${PHASE}" == "pilot" ]]; then
+  RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
+  OUTPUT_ROOT="${OUTPUT_ROOT:-${ROOT_DIR}/output/covr_template_pilot/${RUN_ID}}"
+  SESSION_ID="${SESSION_ID:-covr-pilot-${RUN_ID}-seed${SEED}}"
+  N_PROMPTS="${N_PROMPTS:-2048}"
+  BATCH_SIZE="${BATCH_SIZE:-8}"
+  SENTINEL_RATE="${SENTINEL_RATE:-0.25}"
+  SAFETY_SAMPLE_RATE="${SAFETY_SAMPLE_RATE:-0.25}"
+  BANDIT_EPSILON="${BANDIT_EPSILON:-0.2}"
 else
   OUTPUT_ROOT="${OUTPUT_ROOT:-${ROOT_DIR}/output/covr_template_experiment}"
   SESSION_ID="${SESSION_ID:-covr-template-seed42}"
@@ -77,6 +86,30 @@ case "${PHASE}" in
     env "${SMOKE_ENV[@]}" bash "$0" manifest
     env "${SMOKE_ENV[@]}" bash "$0" bandit "$@"
     echo "smoke complete: ${OUTPUT_ROOT}"
+    ;;
+  pilot)
+    PILOT_ENV=(
+      "OUTPUT_ROOT=${OUTPUT_ROOT}"
+      "SESSION_ID=${SESSION_ID}"
+      "SEED=${SEED}"
+      "N_PROMPTS=${N_PROMPTS}"
+      "BATCH_SIZE=${BATCH_SIZE}"
+      "NUM_STEPS=${NUM_STEPS}"
+      "GUIDANCE_SCALE=${GUIDANCE_SCALE}"
+      "TEMPLATE_COUNT=${TEMPLATE_COUNT}"
+      "MANDATORY_PREFIX=${MANDATORY_PREFIX}"
+      "MAX_TAYLOR_GAP=${MAX_TAYLOR_GAP}"
+      "SENTINEL_RATE=${SENTINEL_RATE}"
+      "SENTINEL_HORIZON=${SENTINEL_HORIZON}"
+      "SAFETY_SAMPLE_RATE=${SAFETY_SAMPLE_RATE}"
+      "BANDIT_EPSILON=${BANDIT_EPSILON}"
+    )
+    env "${PILOT_ENV[@]}" bash "$0" audit "$@"
+    env "${PILOT_ENV[@]}" bash "$0" manifest
+    env "${PILOT_ENV[@]}" bash "$0" baseline "$@"
+    env "${PILOT_ENV[@]}" bash "$0" speca "$@"
+    env "${PILOT_ENV[@]}" bash "$0" bandit "$@"
+    echo "pilot complete: ${OUTPUT_ROOT}"
     ;;
   audit)
     if [[ -e "${AUDIT_FILE}" && "${ALLOW_AUDIT_APPEND:-0}" != "1" ]]; then

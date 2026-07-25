@@ -1879,10 +1879,10 @@ def run_c2i(args) -> Dict:
             "speca_error_metric": args.speca_error_metric if args.method == "speca" else None,
             "guidance_scale": args.guidance_scale,
             "covr_shadow": bool(covr_recorder is not None),
-            "covr_session_id": (
-                covr_recorder.session_id if covr_recorder is not None else None),
+            "covr_template_bandit": bool(covr_bandit is not None),
+            "covr_session_id": covr_session_id,
             "covr_version_key": (
-                covr_recorder.version.key if covr_recorder is not None else None),
+                covr_version.key if covr_version is not None else None),
             "ttt": args.ttt,
             "ttt_lr": args.ttt_lr if args.ttt else None,
             "ttt_micro_epochs": args.ttt_micro_epochs if args.ttt else None,
