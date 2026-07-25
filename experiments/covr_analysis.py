@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import asdict, dataclass
+from itertools import combinations
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -1021,30 +1022,24 @@ def build_template_manifest(
         if len(step_events) != len(group_events):
             raise ValueError("a trajectory contains duplicate timestep contexts")
         mask = tuple(step_idx not in step_events for step_idx in range(num_steps))
-        if not all(mask[:mandatory_prefix]):
-            raise ValueError("source trajectory does not contain the mandatory prefix")
-        if _template_longest_taylor_gap(mask) > max_taylor_gap:
-            raise ValueError("source trajectory exceeds max_taylor_gap")
         grouped_masks[group_key] = mask
         for step_idx, event in step_events.items():
             transition = event.one_step_transition
             observations.setdefault(step_idx, []).extend(zip(
                 transition.numerators, transition.denominators))
 
-    counts = {sum(mask) for mask in grouped_masks.values()}
-    target_refresh_count = (
-        int(refresh_count) if refresh_count is not None else
-        (next(iter(counts)) if len(counts) == 1 else -1)
-    )
-    if target_refresh_count <= 0:
-        raise ValueError("source trajectories must have one refresh cardinality")
-    source_masks = {
-        mask for mask in grouped_masks.values()
-        if _template_mask_is_valid(
-            mask, mandatory_prefix, max_taylor_gap, target_refresh_count)
-    }
-    if not source_masks:
-        raise ValueError("no complete source trajectory matches the target cardinality")
+    refresh_counts = [sum(mask) for mask in grouped_masks.values()]
+    if refresh_count is not None:
+        target_refresh_count = int(refresh_count)
+    else:
+        target_refresh_count = max(
+            set(refresh_counts),
+            key=lambda count: (refresh_counts.count(count), count),
+        )
+    if not 0 < target_refresh_count <= num_steps:
+        raise ValueError("refresh_count must be in [1, num_steps]")
+    if not 0 <= mandatory_prefix <= target_refresh_count:
+        raise ValueError("mandatory_prefix cannot exceed refresh_count")
 
     risk_by_step = {
         step_idx: float(np.mean([
@@ -1058,6 +1053,38 @@ def build_template_manifest(
     def allocation_score(mask: Tuple[bool, ...]) -> float:
         return float(sum(risk_by_step.get(step_idx, 0.0)
                          for step_idx, refresh in enumerate(mask) if refresh))
+
+    source_masks = set()
+    for mask in grouped_masks.values():
+        if sum(mask) != target_refresh_count:
+            continue
+        if _template_mask_is_valid(
+                mask, mandatory_prefix, max_taylor_gap, target_refresh_count):
+            source_masks.add(mask)
+            continue
+        missing_prefix = [
+            step_idx for step_idx in range(mandatory_prefix)
+            if not mask[step_idx]
+        ]
+        removable = [
+            step_idx for step_idx in range(mandatory_prefix, num_steps)
+            if mask[step_idx]
+        ]
+        for removed in combinations(removable, len(missing_prefix)):
+            candidate = list(mask)
+            for step_idx in missing_prefix:
+                candidate[step_idx] = True
+            for step_idx in removed:
+                candidate[step_idx] = False
+            candidate_tuple = tuple(candidate)
+            if _template_mask_is_valid(
+                    candidate_tuple, mandatory_prefix, max_taylor_gap,
+                    target_refresh_count):
+                source_masks.add(candidate_tuple)
+    if not source_masks:
+        raise ValueError(
+            "no source trajectory can satisfy the template constraints at "
+            "the target refresh cardinality")
 
     baseline_mask = max(source_masks, key=lambda mask: (allocation_score(mask), mask))
     candidate_masks = set(source_masks)

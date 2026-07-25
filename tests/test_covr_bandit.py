@@ -187,6 +187,19 @@ def test_manifest_builder_keeps_trajectory_groups_and_equal_costs():
                for prior in manifest.timestep_priors)
 
 
+def test_manifest_builder_repairs_missing_mandatory_prefix():
+    manifest = build_template_manifest(
+        _audit_events(), num_layers=2, template_count=3,
+        mandatory_prefix=3, max_taylor_gap=3,
+    )
+
+    assert manifest.common_refresh_count == 4
+    assert all(all(template.refresh_mask[:3])
+               for template in manifest.templates)
+    assert all(sum(template.refresh_mask) == 4
+               for template in manifest.templates)
+
+
 def test_state_tracks_samples_and_pins_run_identity(tmp_path):
     manifest = _manifest()
     identity = {"dataset": "imagenet", "seed": 42, "batch_size": 2}

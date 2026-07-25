@@ -68,7 +68,11 @@ case "${PHASE}" in
       "SAFETY_SAMPLE_RATE=${SAFETY_SAMPLE_RATE}"
       "BANDIT_EPSILON=${BANDIT_EPSILON}"
     )
-    env "${SMOKE_ENV[@]}" bash "$0" audit "$@"
+    if [[ -e "${AUDIT_FILE}" ]]; then
+      echo "reusing audit file: ${AUDIT_FILE}"
+    else
+      env "${SMOKE_ENV[@]}" bash "$0" audit "$@"
+    fi
     env "${SMOKE_ENV[@]}" bash "$0" manifest
     env "${SMOKE_ENV[@]}" bash "$0" bandit "$@"
     echo "smoke complete: ${OUTPUT_ROOT}"
