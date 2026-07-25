@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -5,6 +6,8 @@ import torch
 
 from models.dit import DiTTransformer2D
 from run_dit import (
+    _covr_full_rollout,
+    _covr_resume_metadata,
     _covr_scheduler_alphas,
     _covr_scheduler_pair,
     _covr_shadow_full,
@@ -113,3 +116,58 @@ def test_cfg_wrapper_keeps_tensor_contract_and_records_disagreement():
     assert output[:, 0, 0, 0].tolist() == pytest.approx([5.0, 6.0, 5.0, 6.0])
     assert transformer.last_cfg_disagreement == pytest.approx(
         (torch.tensor([2.0, 2.0]).norm() / torch.tensor([1.0, 2.0]).norm()).item())
+
+
+def test_full_rollout_uses_isolated_scheduler_for_exact_horizon():
+    class RolloutScheduler:
+        def __init__(self):
+            self.calls = 0
+
+        def scale_model_input(self, sample, timestep):
+            return sample
+
+        def step(self, model_output, timestep, sample, return_dict=False):
+            self.calls += 1
+            return (sample - model_output,)
+
+    class ConstantTransformer:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, hidden_states, timestep, **kwargs):
+            self.calls += 1
+            return (torch.ones_like(hidden_states),)
+
+    scheduler = RolloutScheduler()
+    transformer = ConstantTransformer()
+    result = _covr_full_rollout(
+        transformer, scheduler, torch.tensor([3, 2, 1]),
+        start_idx=0, horizon=2, latents=torch.ones(1, 1),
+        class_labels=torch.tensor([1]), guidance_scale=1.0,
+        in_channels=1,
+    )
+
+    assert result.item() == pytest.approx(-1.0)
+    assert transformer.calls == 2
+    assert scheduler.calls == 0
+
+
+def test_resume_metadata_requires_per_assignment_sample_counts(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "session_id": "session",
+        "run_identity": {"dataset": "imagenet"},
+        "assignments": [{"sample_count": 2}, {"sample_count": 1}],
+    }), encoding="utf-8")
+    assert _covr_resume_metadata(str(path)) == {
+        "session_id": "session",
+        "processed_samples": 3,
+        "run_identity": {"dataset": "imagenet"},
+    }
+
+    path.write_text(json.dumps({
+        "session_id": "session",
+        "assignments": [{"trajectory_id": 0}],
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="predates sample-count tracking"):
+        _covr_resume_metadata(str(path))

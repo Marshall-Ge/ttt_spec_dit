@@ -6,11 +6,16 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import asdict, dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
 from accelerators.covr import ActionAuditEvent, COVRAction, CounterfactualEvent
+from accelerators.covr_bandit import (
+    RefreshTemplate,
+    TemplateManifest,
+    TimestepSafetyPrior,
+)
 
 
 @dataclass(frozen=True)
@@ -937,3 +942,215 @@ def _prediction_metrics(predictions: np.ndarray,
     actual_top = set(np.argsort(targets)[-count:].tolist())
     recall = len(predicted_top & actual_top) / len(actual_top)
     return {"mse": mse, "top_risk_recall": float(recall)}
+
+
+def _template_longest_taylor_gap(mask: Sequence[bool]) -> int:
+    longest = 0
+    gap = 0
+    for refresh in mask:
+        if refresh:
+            gap = 0
+        else:
+            gap += 1
+            longest = max(longest, gap)
+    return longest
+
+
+def _template_mask_is_valid(mask: Sequence[bool], mandatory_prefix: int,
+                            max_taylor_gap: int, refresh_count: int) -> bool:
+    return (
+        len(mask) > 0
+        and sum(mask) == refresh_count
+        and all(mask[:mandatory_prefix])
+        and _template_longest_taylor_gap(mask) <= max_taylor_gap
+    )
+
+
+def build_template_manifest(
+    events: Sequence[ActionAuditEvent],
+    num_layers: int,
+    template_count: int = 4,
+    mandatory_prefix: int = 3,
+    max_taylor_gap: int = 5,
+    refresh_count: Optional[int] = None,
+    version_key: Optional[str] = None,
+    training_sessions: Optional[Sequence[str]] = None,
+    safety_numerator_ucb_limit: float = 1.0,
+    safety_denominator_lcb_floor: float = 1e-8,
+) -> TemplateManifest:
+    """Build a fixed template set without splitting trajectories into rows.
+
+    The source events are static-SpecA Taylor contexts. Their complement is the
+    observed full-refresh mask. The one-hot timestep prior is fitted only from
+    raw transition numerators and denominators; no normalized ratio enters the
+    allocation score.
+    """
+    if not events:
+        raise ValueError("template construction requires action-audit events")
+    if num_layers <= 0 or template_count <= 0:
+        raise ValueError("num_layers and template_count must be positive")
+    if training_sessions is not None:
+        allowed_sessions = set(training_sessions)
+        events = [event for event in events if event.session_id in allowed_sessions]
+        if not events:
+            raise ValueError("training_sessions removed all action-audit events")
+
+    groups: Dict[Tuple[str, int], List[ActionAuditEvent]] = {}
+    for event in events:
+        if event.committed_action is not COVRAction.ACCEPT:
+            raise ValueError("template sources must be unchanged accept trajectories")
+        if event.audit_action is not COVRAction.REFRESH:
+            raise ValueError("template sources must contain paired refresh labels")
+        groups.setdefault((event.session_id, event.trajectory_id), []).append(event)
+
+    first = events[0]
+    num_steps = first.context.num_steps
+    event_version = first.version_key
+    if version_key is not None and version_key != event_version:
+        raise ValueError("requested version_key does not match action audits")
+    for event in events:
+        if event.context.num_steps != num_steps:
+            raise ValueError("mixed num_steps cannot form one template manifest")
+        if event.version_key != event_version:
+            raise ValueError("mixed COVR versions cannot form one template manifest")
+
+    grouped_masks: Dict[Tuple[str, int], Tuple[bool, ...]] = {}
+    observations: Dict[int, List[Tuple[float, float]]] = {}
+    for group_key, group_events in groups.items():
+        step_events = {event.context.step_idx: event for event in group_events}
+        if len(step_events) != len(group_events):
+            raise ValueError("a trajectory contains duplicate timestep contexts")
+        mask = tuple(step_idx not in step_events for step_idx in range(num_steps))
+        if not all(mask[:mandatory_prefix]):
+            raise ValueError("source trajectory does not contain the mandatory prefix")
+        if _template_longest_taylor_gap(mask) > max_taylor_gap:
+            raise ValueError("source trajectory exceeds max_taylor_gap")
+        grouped_masks[group_key] = mask
+        for step_idx, event in step_events.items():
+            transition = event.one_step_transition
+            observations.setdefault(step_idx, []).extend(zip(
+                transition.numerators, transition.denominators))
+
+    counts = {sum(mask) for mask in grouped_masks.values()}
+    target_refresh_count = (
+        int(refresh_count) if refresh_count is not None else
+        (next(iter(counts)) if len(counts) == 1 else -1)
+    )
+    if target_refresh_count <= 0:
+        raise ValueError("source trajectories must have one refresh cardinality")
+    source_masks = {
+        mask for mask in grouped_masks.values()
+        if _template_mask_is_valid(
+            mask, mandatory_prefix, max_taylor_gap, target_refresh_count)
+    }
+    if not source_masks:
+        raise ValueError("no complete source trajectory matches the target cardinality")
+
+    risk_by_step = {
+        step_idx: float(np.mean([
+            math.log(max(numerator, 1e-12))
+            for numerator, _ in values
+        ]))
+        for step_idx, values in observations.items()
+        if values
+    }
+
+    def allocation_score(mask: Tuple[bool, ...]) -> float:
+        return float(sum(risk_by_step.get(step_idx, 0.0)
+                         for step_idx, refresh in enumerate(mask) if refresh))
+
+    baseline_mask = max(source_masks, key=lambda mask: (allocation_score(mask), mask))
+    candidate_masks = set(source_masks)
+    refresh_indices = [
+        step_idx for step_idx, refresh in enumerate(baseline_mask)
+        if refresh and step_idx >= mandatory_prefix
+    ]
+    taylor_indices = [
+        step_idx for step_idx, refresh in enumerate(baseline_mask) if not refresh
+    ]
+    for refresh_idx in refresh_indices:
+        for taylor_idx in taylor_indices:
+            candidate = list(baseline_mask)
+            candidate[refresh_idx] = False
+            candidate[taylor_idx] = True
+            candidate_tuple = tuple(candidate)
+            if _template_mask_is_valid(
+                    candidate_tuple, mandatory_prefix, max_taylor_gap,
+                    target_refresh_count):
+                candidate_masks.add(candidate_tuple)
+
+    ordered_masks = [baseline_mask]
+    remaining = sorted(
+        candidate_masks - {baseline_mask},
+        key=lambda mask: (allocation_score(mask), mask),
+        reverse=True,
+    )
+    while remaining and len(ordered_masks) < template_count:
+        selected = max(
+            remaining,
+            key=lambda mask: (
+                min(sum(left != right for left, right in zip(mask, chosen))
+                    for chosen in ordered_masks),
+                allocation_score(mask),
+                mask,
+            ),
+        )
+        ordered_masks.append(selected)
+        remaining.remove(selected)
+
+    priors = []
+    for step_idx in sorted(observations):
+        values = observations[step_idx]
+        numerator_logs = np.asarray([
+            math.log(max(numerator, 1e-12))
+            for numerator, _ in values
+        ], dtype=np.float64)
+        denominator_logs = np.asarray([
+            math.log(max(denominator, 1e-12))
+            for _, denominator in values
+        ], dtype=np.float64)
+        priors.append(TimestepSafetyPrior(
+            step_idx=step_idx,
+            log_numerator_mean=float(numerator_logs.mean()),
+            log_numerator_std=float(numerator_logs.std(ddof=1))
+            if len(numerator_logs) > 1 else 0.0,
+            log_denominator_mean=float(denominator_logs.mean()),
+            log_denominator_std=float(denominator_logs.std(ddof=1))
+            if len(denominator_logs) > 1 else 0.0,
+            sample_count=len(values),
+        ))
+
+    templates = []
+    for index, mask in enumerate(ordered_masks):
+        template_id = "timestep_prior" if index == 0 else f"template_{index:02d}"
+        templates.append(RefreshTemplate(
+            template_id=template_id,
+            refresh_mask=mask,
+            modeled_full_block_equivalents=target_refresh_count * num_layers,
+            source=("timestep_one_hot" if index == 0 else "trajectory_mask_or_swap"),
+        ))
+
+    return TemplateManifest(
+        version_key=event_version,
+        num_steps=num_steps,
+        num_layers=num_layers,
+        mandatory_prefix=mandatory_prefix,
+        max_taylor_gap=max_taylor_gap,
+        baseline_template_id="timestep_prior",
+        templates=tuple(templates),
+        timestep_priors=tuple(priors),
+        safety_numerator_ucb_limit=safety_numerator_ucb_limit,
+        safety_denominator_lcb_floor=safety_denominator_lcb_floor,
+        source_groups=tuple(
+            f"{session_id}:{trajectory_id}"
+            for session_id, trajectory_id in sorted(grouped_masks)
+        ),
+    )
+
+
+def prequential_template_groups(
+    events: Sequence[ActionAuditEvent],
+) -> List[Tuple[str, int]]:
+    """Return unique trajectory groups in stable session/trajectory order."""
+    groups = {(event.session_id, event.trajectory_id) for event in events}
+    return sorted(groups, key=lambda value: (value[0], value[1]))

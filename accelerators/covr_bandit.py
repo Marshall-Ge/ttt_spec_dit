@@ -1,0 +1,719 @@
+# -*- coding: utf-8 -*-
+"""Equal-FLOPs trajectory template selection for SpecA."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import tempfile
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+
+import numpy as np
+
+
+BANDIT_SCHEMA_VERSION = 1
+_LOG_EPSILON = 1e-12
+
+
+def _atomic_json_write(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=str(path.parent),
+        prefix=f".{path.name}.", suffix=".tmp", delete=False,
+    )
+    try:
+        with handle:
+            json.dump(payload, handle, sort_keys=True, indent=2)
+            handle.write("\n")
+        os.replace(handle.name, path)
+    except Exception:
+        try:
+            os.unlink(handle.name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+@dataclass(frozen=True)
+class TimestepSafetyPrior:
+    step_idx: int
+    log_numerator_mean: float
+    log_numerator_std: float
+    log_denominator_mean: float
+    log_denominator_std: float
+    sample_count: int
+
+    def __post_init__(self) -> None:
+        values = (
+            self.log_numerator_mean,
+            self.log_numerator_std,
+            self.log_denominator_mean,
+            self.log_denominator_std,
+        )
+        if self.step_idx < 0:
+            raise ValueError("safety-prior step_idx must be non-negative")
+        if self.sample_count <= 0:
+            raise ValueError("safety-prior sample_count must be positive")
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("safety-prior moments must be finite")
+        if self.log_numerator_std < 0 or self.log_denominator_std < 0:
+            raise ValueError("safety-prior standard deviations must be non-negative")
+
+
+@dataclass(frozen=True)
+class RefreshTemplate:
+    template_id: str
+    refresh_mask: Tuple[bool, ...]
+    modeled_full_block_equivalents: int
+    source: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.template_id:
+            raise ValueError("template_id must be non-empty")
+        if not self.refresh_mask:
+            raise ValueError("refresh_mask must be non-empty")
+        if any(type(value) is not bool for value in self.refresh_mask):
+            raise ValueError("refresh_mask values must be booleans")
+        if self.modeled_full_block_equivalents <= 0:
+            raise ValueError("modeled FLOPs must be positive")
+
+    @property
+    def refresh_count(self) -> int:
+        return sum(self.refresh_mask)
+
+    @property
+    def mask_hash(self) -> str:
+        encoded = "".join("1" if value else "0" for value in self.refresh_mask)
+        return hashlib.sha256(encoded.encode("ascii")).hexdigest()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "template_id": self.template_id,
+            "refresh_mask": list(self.refresh_mask),
+            "modeled_full_block_equivalents": self.modeled_full_block_equivalents,
+            "source": self.source,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "RefreshTemplate":
+        return cls(
+            template_id=str(value["template_id"]),
+            refresh_mask=tuple(value["refresh_mask"]),
+            modeled_full_block_equivalents=int(
+                value["modeled_full_block_equivalents"]),
+            source=str(value.get("source", "")),
+        )
+
+
+@dataclass(frozen=True)
+class TemplateManifest:
+    version_key: str
+    num_steps: int
+    num_layers: int
+    mandatory_prefix: int
+    max_taylor_gap: int
+    baseline_template_id: str
+    templates: Tuple[RefreshTemplate, ...]
+    timestep_priors: Tuple[TimestepSafetyPrior, ...] = ()
+    safety_numerator_ucb_limit: float = 1.0
+    safety_denominator_lcb_floor: float = 1e-8
+    schema_version: int = BANDIT_SCHEMA_VERSION
+    source_groups: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.schema_version != BANDIT_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported template schema version: {self.schema_version}")
+        if not self.version_key:
+            raise ValueError("version_key must be non-empty")
+        if self.num_steps <= 0 or self.num_layers <= 0:
+            raise ValueError("num_steps and num_layers must be positive")
+        if not 1 <= self.mandatory_prefix <= self.num_steps:
+            raise ValueError("mandatory_prefix must be within the trajectory")
+        if self.max_taylor_gap <= 0:
+            raise ValueError("max_taylor_gap must be positive")
+        if not self.templates:
+            raise ValueError("manifest must contain at least one template")
+        if not math.isfinite(self.safety_denominator_lcb_floor):
+            raise ValueError("denominator safety floor must be finite")
+        if self.safety_denominator_lcb_floor < 0:
+            raise ValueError("denominator safety floor must be non-negative")
+        if (not math.isfinite(self.safety_numerator_ucb_limit)
+                or self.safety_numerator_ucb_limit < 0):
+            raise ValueError("numerator safety limit must be finite and non-negative")
+
+        ids = [template.template_id for template in self.templates]
+        hashes = [template.mask_hash for template in self.templates]
+        if len(set(ids)) != len(ids):
+            raise ValueError("template IDs must be unique")
+        if len(set(hashes)) != len(hashes):
+            raise ValueError("template masks must be unique")
+        if self.baseline_template_id not in ids:
+            raise ValueError("baseline template is missing")
+
+        refresh_counts = {template.refresh_count for template in self.templates}
+        modeled_costs = {
+            template.modeled_full_block_equivalents
+            for template in self.templates
+        }
+        if len(refresh_counts) != 1 or len(modeled_costs) != 1:
+            raise ValueError("all templates must have exactly equal FLOPs")
+
+        expected_cost = next(iter(refresh_counts)) * self.num_layers
+        if modeled_costs != {expected_cost}:
+            raise ValueError(
+                "modeled block FLOPs must equal refresh_count * num_layers")
+
+        for template in self.templates:
+            if len(template.refresh_mask) != self.num_steps:
+                raise ValueError("template mask length must match num_steps")
+            if not all(template.refresh_mask[:self.mandatory_prefix]):
+                raise ValueError("template omits a mandatory prefix refresh")
+            longest_gap = 0
+            gap = 0
+            for refresh in template.refresh_mask:
+                if refresh:
+                    gap = 0
+                else:
+                    gap += 1
+                    longest_gap = max(longest_gap, gap)
+            if longest_gap > self.max_taylor_gap:
+                raise ValueError("template exceeds max_taylor_gap")
+
+        prior_steps = [prior.step_idx for prior in self.timestep_priors]
+        if len(set(prior_steps)) != len(prior_steps):
+            raise ValueError("timestep safety priors must have unique steps")
+        if any(step >= self.num_steps for step in prior_steps):
+            raise ValueError("timestep safety prior is outside the trajectory")
+
+    @property
+    def common_refresh_count(self) -> int:
+        return self.templates[0].refresh_count
+
+    @property
+    def common_full_block_equivalents(self) -> int:
+        return self.templates[0].modeled_full_block_equivalents
+
+    @property
+    def manifest_hash(self) -> str:
+        payload = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @property
+    def template_map(self) -> Dict[str, RefreshTemplate]:
+        return {template.template_id: template for template in self.templates}
+
+    @property
+    def prior_map(self) -> Dict[int, TimestepSafetyPrior]:
+        return {prior.step_idx: prior for prior in self.timestep_priors}
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "version_key": self.version_key,
+            "num_steps": self.num_steps,
+            "num_layers": self.num_layers,
+            "mandatory_prefix": self.mandatory_prefix,
+            "max_taylor_gap": self.max_taylor_gap,
+            "baseline_template_id": self.baseline_template_id,
+            "templates": [template.to_dict() for template in self.templates],
+            "timestep_priors": [asdict(prior) for prior in self.timestep_priors],
+            "safety_numerator_ucb_limit": self.safety_numerator_ucb_limit,
+            "safety_denominator_lcb_floor": self.safety_denominator_lcb_floor,
+            "source_groups": list(self.source_groups),
+        }
+
+    def save(self, path: str) -> None:
+        _atomic_json_write(Path(path), self.to_dict())
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "TemplateManifest":
+        return cls(
+            schema_version=int(value.get("schema_version", 0)),
+            version_key=str(value["version_key"]),
+            num_steps=int(value["num_steps"]),
+            num_layers=int(value["num_layers"]),
+            mandatory_prefix=int(value["mandatory_prefix"]),
+            max_taylor_gap=int(value["max_taylor_gap"]),
+            baseline_template_id=str(value["baseline_template_id"]),
+            templates=tuple(
+                RefreshTemplate.from_dict(template)
+                for template in value["templates"]
+            ),
+            timestep_priors=tuple(
+                TimestepSafetyPrior(**prior)
+                for prior in value.get("timestep_priors", [])
+            ),
+            safety_numerator_ucb_limit=float(
+                value.get("safety_numerator_ucb_limit", 1.0)),
+            safety_denominator_lcb_floor=float(
+                value.get("safety_denominator_lcb_floor", 1e-8)),
+            source_groups=tuple(str(group) for group in value.get("source_groups", [])),
+        )
+
+    @classmethod
+    def load(cls, path: str) -> "TemplateManifest":
+        with open(path, "r", encoding="utf-8") as handle:
+            return cls.from_dict(json.load(handle))
+
+
+@dataclass(frozen=True)
+class TemplateAssignment:
+    session_id: str
+    trajectory_id: int
+    prequential_index: int
+    template_id: str
+    propensity: float
+    manifest_hash: str
+    sample_count: int = 0
+
+    def __post_init__(self) -> None:
+        if self.trajectory_id < 0 or self.prequential_index < 0:
+            raise ValueError("trajectory indices must be non-negative")
+        if not 0 < self.propensity <= 1:
+            raise ValueError("assignment propensity must be in (0, 1]")
+        if self.sample_count < 0:
+            raise ValueError("assignment sample_count must be non-negative")
+
+
+@dataclass(frozen=True)
+class TemplateFeedback:
+    trajectory_id: int
+    template_id: str
+    sentinel_propensity: float
+    horizon: int
+    h_step_numerator: Optional[float] = None
+    h_step_denominator: Optional[float] = None
+    terminal_fidelity_loss: Optional[float] = None
+    terminal_quality_loss: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.trajectory_id < 0 or self.horizon <= 0:
+            raise ValueError("feedback indices must be positive")
+        if not 0 < self.sentinel_propensity <= 1:
+            raise ValueError("sentinel propensity must be in (0, 1]")
+        values = (
+            self.h_step_numerator,
+            self.h_step_denominator,
+            self.terminal_fidelity_loss,
+            self.terminal_quality_loss,
+        )
+        if all(value is None for value in values):
+            raise ValueError("feedback must contain a delayed sentinel label")
+        if any(value is not None and (not math.isfinite(value) or value < 0)
+               for value in values):
+            raise ValueError("sentinel labels must be finite and non-negative")
+        if (self.h_step_numerator is None) != (self.h_step_denominator is None):
+            raise ValueError("H-step numerator and denominator must be paired")
+
+    @property
+    def bandit_loss(self) -> float:
+        if self.terminal_quality_loss is not None:
+            return self.terminal_quality_loss
+        if self.terminal_fidelity_loss is not None:
+            return self.terminal_fidelity_loss
+        assert self.h_step_numerator is not None
+        return self.h_step_numerator
+
+
+@dataclass
+class _RunningLogMoments:
+    count: int = 0
+    mean: float = 0.0
+    m2: float = 0.0
+
+    def update(self, value: float) -> None:
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("safety observations must be finite and non-negative")
+        logged = math.log(max(value, _LOG_EPSILON))
+        self.count += 1
+        delta = logged - self.mean
+        self.mean += delta / self.count
+        self.m2 += delta * (logged - self.mean)
+
+    @property
+    def std(self) -> float:
+        if self.count < 2:
+            return 0.0
+        return math.sqrt(max(self.m2 / (self.count - 1), 0.0))
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {"count": self.count, "mean": self.mean, "m2": self.m2}
+
+    @classmethod
+    def from_state_dict(cls, value: Mapping[str, Any]) -> "_RunningLogMoments":
+        result = cls(
+            count=int(value["count"]),
+            mean=float(value["mean"]),
+            m2=float(value["m2"]),
+        )
+        if result.count < 0 or result.m2 < 0:
+            raise ValueError("invalid persisted moments")
+        return result
+
+
+@dataclass
+class _SafetyMoments:
+    numerator: _RunningLogMoments = field(default_factory=_RunningLogMoments)
+    denominator: _RunningLogMoments = field(default_factory=_RunningLogMoments)
+
+    def update(self, numerator: float, denominator: float) -> None:
+        self.numerator.update(numerator)
+        self.denominator.update(denominator)
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "numerator": self.numerator.state_dict(),
+            "denominator": self.denominator.state_dict(),
+        }
+
+    @classmethod
+    def from_state_dict(cls, value: Mapping[str, Any]) -> "_SafetyMoments":
+        return cls(
+            numerator=_RunningLogMoments.from_state_dict(value["numerator"]),
+            denominator=_RunningLogMoments.from_state_dict(value["denominator"]),
+        )
+
+
+class TimestepSafetyTable:
+    def __init__(self, manifest: TemplateManifest, confidence_z: float = 2.0,
+                 min_template_samples: int = 2):
+        if confidence_z < 0 or min_template_samples <= 0:
+            raise ValueError("invalid safety-table configuration")
+        self.manifest = manifest
+        self.confidence_z = float(confidence_z)
+        self.min_template_samples = int(min_template_samples)
+        self._by_template_step: Dict[Tuple[str, int], _SafetyMoments] = {}
+        self._by_step: Dict[int, _SafetyMoments] = {}
+
+    def observe(self, template_id: str, step_idx: int,
+                numerator: float, denominator: float) -> None:
+        if template_id not in self.manifest.template_map:
+            raise ValueError("unknown template ID")
+        if not 0 <= step_idx < self.manifest.num_steps:
+            raise ValueError("safety observation step is outside the trajectory")
+        self._by_template_step.setdefault(
+            (template_id, step_idx), _SafetyMoments()).update(
+                numerator, denominator)
+        self._by_step.setdefault(step_idx, _SafetyMoments()).update(
+            numerator, denominator)
+
+    def _moments(self, template_id: str, step_idx: int) -> Tuple[float, float, float, float, int]:
+        exact = self._by_template_step.get((template_id, step_idx))
+        if exact is not None and exact.numerator.count >= self.min_template_samples:
+            return (
+                exact.numerator.mean, exact.numerator.std,
+                exact.denominator.mean, exact.denominator.std,
+                exact.numerator.count,
+            )
+        pooled = self._by_step.get(step_idx)
+        if pooled is not None and pooled.numerator.count >= self.min_template_samples:
+            return (
+                pooled.numerator.mean, pooled.numerator.std,
+                pooled.denominator.mean, pooled.denominator.std,
+                pooled.numerator.count,
+            )
+        prior = self.manifest.prior_map.get(step_idx)
+        if prior is None:
+            return math.inf, 0.0, -math.inf, 0.0, 1
+        return (
+            prior.log_numerator_mean, prior.log_numerator_std,
+            prior.log_denominator_mean, prior.log_denominator_std,
+            prior.sample_count,
+        )
+
+    def bounds(self, template_id: str, step_idx: int) -> Tuple[float, float]:
+        num_mean, num_std, den_mean, den_std, count = self._moments(
+            template_id, step_idx)
+        if not math.isfinite(num_mean) or not math.isfinite(den_mean):
+            return math.inf, 0.0
+        scale = self.confidence_z / math.sqrt(max(count, 1))
+        numerator_ucb = math.exp(num_mean + scale * num_std)
+        denominator_lcb = math.exp(den_mean - scale * den_std)
+        return numerator_ucb, denominator_lcb
+
+    def is_safe(self, template: RefreshTemplate) -> bool:
+        for step_idx, refresh in enumerate(template.refresh_mask):
+            if refresh:
+                continue
+            numerator_ucb, denominator_lcb = self.bounds(
+                template.template_id, step_idx)
+            if numerator_ucb > self.manifest.safety_numerator_ucb_limit:
+                return False
+            if denominator_lcb < self.manifest.safety_denominator_lcb_floor:
+                return False
+        return True
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "by_template_step": {
+                f"{template_id}:{step_idx}": moments.state_dict()
+                for (template_id, step_idx), moments in self._by_template_step.items()
+            },
+            "by_step": {
+                str(step_idx): moments.state_dict()
+                for step_idx, moments in self._by_step.items()
+            },
+        }
+
+    def load_state_dict(self, value: Mapping[str, Any]) -> None:
+        self._by_template_step = {}
+        for key, moments in value.get("by_template_step", {}).items():
+            template_id, step_text = key.rsplit(":", 1)
+            if template_id not in self.manifest.template_map:
+                raise ValueError("persisted safety state references an unknown template")
+            self._by_template_step[(template_id, int(step_text))] = (
+                _SafetyMoments.from_state_dict(moments))
+        self._by_step = {
+            int(step): _SafetyMoments.from_state_dict(moments)
+            for step, moments in value.get("by_step", {}).items()
+        }
+
+
+@dataclass
+class _ArmLossStats:
+    count: int
+    mean: float
+    m2: float = 0.0
+
+    def update(self, loss: float) -> None:
+        logged = math.log1p(loss)
+        self.count += 1
+        delta = logged - self.mean
+        self.mean += delta / self.count
+        self.m2 += delta * (logged - self.mean)
+
+    def state_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_state_dict(cls, value: Mapping[str, Any]) -> "_ArmLossStats":
+        result = cls(
+            count=int(value["count"]), mean=float(value["mean"]),
+            m2=float(value.get("m2", 0.0)),
+        )
+        if result.count <= 0 or result.m2 < 0 or not math.isfinite(result.mean):
+            raise ValueError("invalid persisted arm statistics")
+        return result
+
+
+class ConservativeTemplateBandit:
+    def __init__(self, manifest: TemplateManifest, session_id: str,
+                 epsilon: float = 0.1, seed: int = 0,
+                 baseline_prior_count: int = 8,
+                 alternative_prior_penalty: float = 0.25,
+                 run_identity: Optional[Mapping[str, Any]] = None):
+        if not session_id:
+            raise ValueError("session_id must be non-empty")
+        if not 0 <= epsilon <= 1:
+            raise ValueError("epsilon must be in [0, 1]")
+        if baseline_prior_count <= 0 or alternative_prior_penalty < 0:
+            raise ValueError("invalid bandit prior configuration")
+        self.manifest = manifest
+        self.session_id = session_id
+        self.epsilon = float(epsilon)
+        self.seed = int(seed)
+        self.run_identity = dict(run_identity or {})
+        self.safety = TimestepSafetyTable(manifest)
+        self._rng = np.random.default_rng(seed)
+        self._arm_stats = {
+            template.template_id: _ArmLossStats(
+                count=(baseline_prior_count
+                       if template.template_id == manifest.baseline_template_id
+                       else 1),
+                mean=(0.0
+                      if template.template_id == manifest.baseline_template_id
+                      else alternative_prior_penalty),
+            )
+            for template in manifest.templates
+        }
+        self._active: Optional[TemplateAssignment] = None
+        self._pending_safety: list[Tuple[int, float, float]] = []
+        self._completed_trajectories: set[int] = set()
+        self.assignments: list[TemplateAssignment] = []
+        self.feedback: list[TemplateFeedback] = []
+
+    def _eligible_templates(self) -> list[RefreshTemplate]:
+        baseline_id = self.manifest.baseline_template_id
+        return [
+            template for template in self.manifest.templates
+            if template.template_id == baseline_id or self.safety.is_safe(template)
+        ]
+
+    def begin_trajectory(self, trajectory_id: int,
+                         sample_count: int = 0) -> TemplateAssignment:
+        if self._active is not None:
+            raise RuntimeError("the previous trajectory is still active")
+        if trajectory_id in self._completed_trajectories:
+            raise ValueError("trajectory has already completed")
+        if trajectory_id < 0:
+            raise ValueError("trajectory_id must be non-negative")
+        if sample_count < 0:
+            raise ValueError("sample_count must be non-negative")
+
+        eligible = self._eligible_templates()
+        greedy = min(
+            eligible,
+            key=lambda template: (
+                self._arm_stats[template.template_id].mean,
+                template.template_id != self.manifest.baseline_template_id,
+                template.template_id,
+            ),
+        )
+        probabilities = np.full(len(eligible), self.epsilon / len(eligible))
+        greedy_index = eligible.index(greedy)
+        probabilities[greedy_index] += 1.0 - self.epsilon
+        selected_index = int(self._rng.choice(len(eligible), p=probabilities))
+        selected = eligible[selected_index]
+        assignment = TemplateAssignment(
+            session_id=self.session_id,
+            trajectory_id=trajectory_id,
+            prequential_index=len(self._completed_trajectories),
+            template_id=selected.template_id,
+            propensity=float(probabilities[selected_index]),
+            manifest_hash=self.manifest.manifest_hash,
+            sample_count=int(sample_count),
+        )
+        self._active = assignment
+        self._pending_safety = []
+        self.assignments.append(assignment)
+        return assignment
+
+    def observe_one_step(self, trajectory_id: int, step_idx: int,
+                         numerators: Sequence[float],
+                         denominators: Sequence[float]) -> None:
+        if self._active is None or self._active.trajectory_id != trajectory_id:
+            raise RuntimeError("one-step observation does not match the active trajectory")
+        if len(numerators) == 0 or len(numerators) != len(denominators):
+            raise ValueError("one-step labels must have equal non-zero cardinality")
+        numerator = float(np.mean(np.asarray(numerators, dtype=np.float64)))
+        denominator = float(np.mean(np.asarray(denominators, dtype=np.float64)))
+        if not math.isfinite(numerator) or not math.isfinite(denominator):
+            raise ValueError("one-step labels must be finite")
+        self._pending_safety.append((int(step_idx), numerator, denominator))
+
+    def end_trajectory(self, trajectory_id: int,
+                       feedback: Optional[TemplateFeedback] = None) -> None:
+        if self._active is None or self._active.trajectory_id != trajectory_id:
+            raise RuntimeError("trajectory close does not match the active assignment")
+        if feedback is not None:
+            if feedback.trajectory_id != trajectory_id:
+                raise ValueError("feedback trajectory does not match assignment")
+            if feedback.template_id != self._active.template_id:
+                raise ValueError("feedback template does not match assignment")
+
+        for step_idx, numerator, denominator in self._pending_safety:
+            self.safety.observe(
+                self._active.template_id, step_idx, numerator, denominator)
+        if feedback is not None:
+            self._arm_stats[self._active.template_id].update(feedback.bandit_loss)
+            self.feedback.append(feedback)
+
+        self._completed_trajectories.add(trajectory_id)
+        self._active = None
+        self._pending_safety = []
+
+    @property
+    def active_template(self) -> RefreshTemplate:
+        if self._active is None:
+            raise RuntimeError("no trajectory is active")
+        return self.manifest.template_map[self._active.template_id]
+
+    def summary(self) -> Dict[str, Any]:
+        assignment_counts = {
+            template.template_id: sum(
+                assignment.template_id == template.template_id
+                for assignment in self.assignments)
+            for template in self.manifest.templates
+        }
+        return {
+            "session_id": self.session_id,
+            "manifest_hash": self.manifest.manifest_hash,
+            "common_refresh_count": self.manifest.common_refresh_count,
+            "common_full_block_equivalents": (
+                self.manifest.common_full_block_equivalents),
+            "assignments": len(self.assignments),
+            "processed_samples": sum(
+                assignment.sample_count for assignment in self.assignments),
+            "completed_trajectories": len(self._completed_trajectories),
+            "delayed_feedback": len(self.feedback),
+            "assignment_counts": assignment_counts,
+            "arm_log1p_loss_mean": {
+                template_id: stats.mean
+                for template_id, stats in self._arm_stats.items()
+            },
+        }
+
+    def state_dict(self) -> Dict[str, Any]:
+        if self._active is not None:
+            raise RuntimeError("cannot persist bandit state during an active trajectory")
+        return {
+            "schema_version": BANDIT_SCHEMA_VERSION,
+            "session_id": self.session_id,
+            "version_key": self.manifest.version_key,
+            "manifest_hash": self.manifest.manifest_hash,
+            "epsilon": self.epsilon,
+            "seed": self.seed,
+            "run_identity": self.run_identity,
+            "rng_state": self._rng.bit_generator.state,
+            "arm_stats": {
+                template_id: stats.state_dict()
+                for template_id, stats in self._arm_stats.items()
+            },
+            "safety": self.safety.state_dict(),
+            "completed_trajectories": sorted(self._completed_trajectories),
+            "assignments": [asdict(assignment) for assignment in self.assignments],
+            "feedback": [asdict(item) for item in self.feedback],
+        }
+
+    def save_state(self, path: str) -> None:
+        _atomic_json_write(Path(path), self.state_dict())
+
+    def load_state(self, path: str) -> None:
+        if self._active is not None:
+            raise RuntimeError("cannot load state during an active trajectory")
+        with open(path, "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+        identity = (
+            int(value.get("schema_version", 0)),
+            str(value.get("session_id", "")),
+            str(value.get("version_key", "")),
+            str(value.get("manifest_hash", "")),
+        )
+        expected = (
+            BANDIT_SCHEMA_VERSION,
+            self.session_id,
+            self.manifest.version_key,
+            self.manifest.manifest_hash,
+        )
+        if identity != expected:
+            raise ValueError("bandit state identity does not match this session")
+        if not math.isclose(float(value["epsilon"]), self.epsilon):
+            raise ValueError("persisted epsilon does not match runtime configuration")
+        if dict(value.get("run_identity", {})) != self.run_identity:
+            raise ValueError("bandit state run identity does not match runtime configuration")
+
+        arm_stats = {
+            template_id: _ArmLossStats.from_state_dict(stats)
+            for template_id, stats in value["arm_stats"].items()
+        }
+        if set(arm_stats) != set(self.manifest.template_map):
+            raise ValueError("persisted arm set does not match the manifest")
+        self._arm_stats = arm_stats
+        self.safety.load_state_dict(value.get("safety", {}))
+        self._completed_trajectories = {
+            int(item) for item in value.get("completed_trajectories", [])
+        }
+        self.assignments = [
+            TemplateAssignment(**assignment)
+            for assignment in value.get("assignments", [])
+        ]
+        self.feedback = [
+            TemplateFeedback(**feedback)
+            for feedback in value.get("feedback", [])
+        ]
+        self._rng.bit_generator.state = value["rng_state"]

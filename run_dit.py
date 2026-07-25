@@ -15,6 +15,7 @@ Sampling methods (controlled by ``args.method``):
 """
 
 import copy
+import hashlib
 import json
 import os
 import time
@@ -59,6 +60,11 @@ from accelerators.covr import (
     ddim_epsilon_transition_coefficients,
     transition_defect_batch,
 )
+from accelerators.covr_bandit import (
+    ConservativeTemplateBandit,
+    TemplateFeedback,
+    TemplateManifest,
+)
 from models.ttt_plugin import (
     SessionAdaLNModulator, ttt_state_init, ttt_reset_for_image,
     ttt_train_step, ttt_record_skip, ttt_session_stats,
@@ -97,6 +103,46 @@ def _covr_scalar(value) -> float:
     if torch.is_tensor(value):
         return float(value.detach().float().item())
     return float(value)
+
+
+def _covr_hash_sample(session_id: str, trajectory_id: int,
+                      step_idx: int, rate: float, purpose: str) -> bool:
+    if rate <= 0.0:
+        return False
+    if rate >= 1.0:
+        return True
+    payload = f"{purpose}:{session_id}:{trajectory_id}:{step_idx}".encode("utf-8")
+    value = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+    return value / float(1 << 64) < rate
+
+
+def _covr_hash_index(session_id: str, trajectory_id: int,
+                     purpose: str, size: int) -> int:
+    if size <= 0:
+        raise ValueError("hash index size must be positive")
+    payload = f"{purpose}:{session_id}:{trajectory_id}".encode("utf-8")
+    value = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+    return value % size
+
+
+def _covr_resume_metadata(path: Optional[str]) -> Optional[Dict[str, object]]:
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    assignments = payload.get("assignments", [])
+    if any("sample_count" not in assignment for assignment in assignments):
+        raise ValueError(
+            "COVR bandit state predates sample-count tracking; start a new "
+            "state or provide a separately managed dataset shard")
+    sample_counts = [int(assignment["sample_count"]) for assignment in assignments]
+    if any(count <= 0 for count in sample_counts):
+        raise ValueError("COVR bandit state contains invalid sample counts")
+    return {
+        "session_id": str(payload.get("session_id", "")),
+        "processed_samples": sum(sample_counts),
+        "run_identity": dict(payload.get("run_identity", {})),
+    }
 
 
 def _covr_scheduler_alphas(scheduler, timesteps, step_idx: int, timestep):
@@ -151,6 +197,27 @@ def _covr_shadow_full(transformer, latent_input, timestep, class_labels,
     )[0]
 
 
+def _covr_full_rollout(transformer, scheduler, timesteps, start_idx: int,
+                       horizon: int, latents, class_labels, guidance_scale,
+                       in_channels: int):
+    if horizon <= 0 or start_idx < 0 or start_idx + horizon > len(timesteps):
+        raise ValueError("invalid COVR sentinel rollout interval")
+    branch_scheduler = copy.deepcopy(scheduler)
+    branch_latents = latents.detach().clone()
+    for branch_idx in range(start_idx, start_idx + horizon):
+        timestep = timesteps[branch_idx]
+        timestep_batch = timestep.expand(branch_latents.shape[0]).to(torch.int64)
+        latent_input = branch_scheduler.scale_model_input(
+            branch_latents, timestep)
+        noise_pred = _covr_shadow_full(
+            transformer, latent_input, timestep_batch, class_labels,
+            guidance_scale)
+        noise_pred = noise_pred[:, :in_channels]
+        branch_latents = branch_scheduler.step(
+            noise_pred, timestep, branch_latents, return_dict=False)[0]
+    return branch_latents
+
+
 def _covr_context(recorder, scheduler, timesteps, step_idx, timestep,
                   current):
     if current.activated_steps:
@@ -171,7 +238,8 @@ def _covr_context(recorder, scheduler, timesteps, step_idx, timestep,
         latent_coefficient=latent_coefficient,
         model_output_coefficient=model_output_coefficient,
         distance_since_refresh=distance,
-        previous_defect_mean=recorder.previous_defect,
+        previous_defect_mean=(
+            recorder.previous_defect if recorder is not None else 0.0),
     )
 
 
@@ -396,6 +464,11 @@ class DiTGenerator:
                  covr_recorder: Optional[ActionAuditRecorder] = None,
                  covr_trajectory_id: int = 0,
                  covr_sample_ids: Optional[List[str]] = None,
+                 covr_bandit: Optional[ConservativeTemplateBandit] = None,
+                 covr_safety_sample_rate: float = 0.0,
+                 covr_sentinel_start_idx: Optional[int] = None,
+                 covr_sentinel_horizon: int = 0,
+                 covr_feedback_sink: Optional[Dict[str, float]] = None,
                  ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Generate image(s).
 
@@ -449,6 +522,11 @@ class DiTGenerator:
             covr_recorder=covr_recorder,
             covr_trajectory_id=covr_trajectory_id,
             covr_sample_ids=covr_sample_ids,
+            covr_bandit=covr_bandit,
+            covr_safety_sample_rate=covr_safety_sample_rate,
+            covr_sentinel_start_idx=covr_sentinel_start_idx,
+            covr_sentinel_horizon=covr_sentinel_horizon,
+            covr_feedback_sink=covr_feedback_sink,
         )
 
         # Unchunk: cond half (index 0 — cond comes first)
@@ -475,6 +553,11 @@ class DiTGenerator:
                        covr_recorder: Optional[ActionAuditRecorder] = None,
                        covr_trajectory_id: int = 0,
                        covr_sample_ids: Optional[List[str]] = None,
+                       covr_bandit: Optional[ConservativeTemplateBandit] = None,
+                       covr_safety_sample_rate: float = 0.0,
+                       covr_sentinel_start_idx: Optional[int] = None,
+                       covr_sentinel_horizon: int = 0,
+                       covr_feedback_sink: Optional[Dict[str, float]] = None,
                        ) -> torch.Tensor:
         """Single denoising loop with method dispatch.
 
@@ -490,6 +573,11 @@ class DiTGenerator:
                 f"{covr_trajectory_id}:{index}" for index in range(base_bs)]
         if len(covr_sample_ids) != base_bs:
             raise ValueError("COVR sample IDs must match the unguided batch size")
+        if covr_sentinel_start_idx is not None:
+            if covr_feedback_sink is None or covr_sentinel_horizon <= 0:
+                raise ValueError("H-step sentinel requires a feedback sink and horizon")
+        sentinel_start_latent = None
+        sentinel_reference_latent = None
 
         # Init latents
         if isinstance(seed, list):
@@ -515,6 +603,10 @@ class DiTGenerator:
             latents = torch.cat([latents, latents], dim=0)
 
         timesteps = scheduler.timesteps
+        if covr_sentinel_start_idx is not None and (
+                covr_sentinel_start_idx < 0 or
+                covr_sentinel_start_idx + covr_sentinel_horizon > len(timesteps)):
+            raise ValueError("H-step sentinel exceeds the denoising trajectory")
         for step_idx, t in enumerate(timesteps):
             # VFL: track current step + real timestep for event recording hooks
             set_vfl_step_info(step_idx, len(timesteps), timestep_actual=int(t))
@@ -529,6 +621,16 @@ class DiTGenerator:
             )
             if _t_emb is not None:
                 set_lora_t_emb(_t_emb)
+            if covr_sentinel_start_idx == step_idx:
+                assert covr_feedback_sink is not None
+                sentinel_start_latent = latents.detach().clone()
+                sentinel_start = time.time()
+                sentinel_reference_latent = _covr_full_rollout(
+                    transformer, scheduler, timesteps, step_idx,
+                    covr_sentinel_horizon, latents, class_labels,
+                    guidance_scale, transformer.config.in_channels)
+                covr_feedback_sink["sentinel_wall_s"] = (
+                    time.time() - sentinel_start)
             latent_input = scheduler.scale_model_input(latents, t)
             # --------------- method dispatch ---------------
             if method == "teacache":
@@ -623,6 +725,30 @@ class DiTGenerator:
                 )
                 covr_recorder.record(event)
 
+            if (covr_bandit is not None and method == "speca"
+                    and current is not None and cache_dic is not None
+                    and current.type == "Taylor"
+                    and _covr_hash_sample(
+                        covr_bandit.session_id, covr_trajectory_id, step_idx,
+                        covr_safety_sample_rate, "safety")):
+                context = _covr_context(
+                    None, scheduler, timesteps, step_idx, t, current)
+                full_noise_pred = _covr_shadow_full(
+                    transformer, latent_input, current_t,
+                    class_labels, guidance_scale)
+                if out_channels // 2 == in_channels:
+                    full_noise_pred = full_noise_pred[:, :in_channels]
+                x_prev_approx, x_prev_full = _covr_scheduler_pair(
+                    scheduler, noise_pred, full_noise_pred, t, latents)
+                transition = transition_defect_batch(
+                    x_prev_approx[:base_bs],
+                    x_prev_full[:base_bs],
+                    latents[:base_bs],
+                )
+                covr_bandit.observe_one_step(
+                    covr_trajectory_id, step_idx,
+                    transition.numerators, transition.denominators)
+
             # ---- VFL: anchor sample collection (low frequency) ----
             if step_idx % 5 == 0:
                 _vfl_buf = get_vfl_buffer()
@@ -636,6 +762,15 @@ class DiTGenerator:
                     )
 
             latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            if (sentinel_reference_latent is not None and
+                    covr_sentinel_start_idx is not None and
+                    step_idx == covr_sentinel_start_idx + covr_sentinel_horizon - 1):
+                assert covr_feedback_sink is not None
+                h_step = transition_defect_batch(
+                    latents[:base_bs], sentinel_reference_latent[:base_bs],
+                    sentinel_start_latent[:base_bs])
+                covr_feedback_sink["h_step_numerator"] = h_step.mean_numerator
+                covr_feedback_sink["h_step_denominator"] = h_step.mean_denominator
 
         # Clear the LoRA t_emb cache so the next image starts clean.
         clear_lora_t_emb()
@@ -875,6 +1010,21 @@ def run_c2i(args) -> Dict:
         OUTPUT_DIR, f"c2i_dit_{dataset_name}_{dir_suffix}")
     os.makedirs(output_dir, exist_ok=True)
 
+    covr_bandit_state_path = None
+    covr_resume = None
+    covr_resume_sample_offset = 0
+    if getattr(args, "covr_template_bandit", False):
+        covr_bandit_state_path = args.covr_bandit_state or os.path.join(
+            output_dir, "covr", "template_bandit_state.json")
+        covr_resume = _covr_resume_metadata(args.covr_bandit_state)
+        if covr_resume is not None:
+            covr_resume_sample_offset = int(covr_resume["processed_samples"])
+            requested_session = getattr(args, "covr_session_id", None)
+            if (requested_session is not None and
+                    requested_session != covr_resume["session_id"]):
+                raise ValueError(
+                    "--covr-session-id does not match the persisted bandit state")
+
     # Seeds
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -909,6 +1059,11 @@ def run_c2i(args) -> Dict:
         ds = ImageNetDataset(
             imagenet_dir=getattr(args, "imagenet_dir", IMAGENET_DIR),
             n_images=args.n_prompts, seed=args.seed)
+        if covr_resume_sample_offset:
+            if covr_resume_sample_offset >= len(ds):
+                raise ValueError(
+                    "COVR resume state has consumed the available dataset prefix")
+            ds.items = ds.items[covr_resume_sample_offset:]
     elif dataset_name == "coco":
         from dataset.coco import COCO30KDataset
         ds = COCO30KDataset(
@@ -1162,9 +1317,20 @@ def run_c2i(args) -> Dict:
         print("  Baseline (full DDIM, no acceleration)")
 
     covr_recorder = None
-    if getattr(args, "covr_shadow", False):
-        covr_session_id = args.covr_session_id or (
-            f"{time.strftime('%Y%m%d-%H%M%S')}-seed{args.seed}")
+    covr_bandit = None
+    covr_version = None
+    covr_session_id = None
+    covr_sentinel_full_steps = 0
+    covr_sentinel_wall_s = 0.0
+    covr_sentinel_count = 0
+    covr_trajectory_offset = 0
+    if getattr(args, "covr_shadow", False) or getattr(
+            args, "covr_template_bandit", False):
+        covr_session_id = (
+            args.covr_session_id or
+            (str(covr_resume["session_id"]) if covr_resume is not None else None) or
+            f"{time.strftime('%Y%m%d-%H%M%S')}-seed{args.seed}"
+        )
         scheduler_instance = generator.scheduler
         scheduler_config = json.dumps(
             dict(getattr(scheduler_instance, "config", {})),
@@ -1181,13 +1347,41 @@ def run_c2i(args) -> Dict:
             speca_config=speca_config,
         )
         covr_output_dir = args.covr_output_dir or os.path.join(output_dir, "covr")
-        covr_recorder = ActionAuditRecorder(
-            output_dir=covr_output_dir,
-            session_id=covr_session_id,
-            version=covr_version,
-            max_events=args.covr_max_events,
-        )
-        print(f"  COVR shadow recorder: {covr_recorder.event_path}")
+
+        if getattr(args, "covr_shadow", False):
+            covr_recorder = ActionAuditRecorder(
+                output_dir=covr_output_dir,
+                session_id=covr_session_id,
+                version=covr_version,
+                max_events=args.covr_max_events,
+            )
+            print(f"  COVR shadow recorder: {covr_recorder.event_path}")
+
+        if getattr(args, "covr_template_bandit", False):
+            manifest = TemplateManifest.load(args.covr_template_manifest)
+            if manifest.version_key != covr_version.key:
+                raise ValueError(
+                    "COVR template manifest version does not match the runtime")
+            covr_bandit = ConservativeTemplateBandit(
+                manifest, session_id=covr_session_id,
+                epsilon=args.covr_bandit_epsilon, seed=args.seed,
+                run_identity={
+                    "dataset": dataset_name,
+                    "seed": int(args.seed),
+                    "batch_size": int(args.batch_size),
+                    "safety_sample_rate": float(args.covr_safety_sample_rate),
+                    "sentinel_rate": float(args.covr_sentinel_rate),
+                    "sentinel_horizon": int(args.covr_sentinel_horizon),
+                },
+            )
+            if covr_resume is not None:
+                covr_bandit.load_state(covr_bandit_state_path)
+                covr_trajectory_offset = len(covr_bandit.assignments)
+                if covr_bandit.summary()["processed_samples"] != covr_resume_sample_offset:
+                    raise ValueError("COVR resume sample count changed while loading state")
+            print(f"  COVR template bandit: {args.covr_template_manifest} "
+                  f"({len(manifest.templates)} templates, "
+                  f"{manifest.common_refresh_count} refreshes)")
 
     # ===================================================================
     # 5. Generate images
@@ -1203,7 +1397,7 @@ def run_c2i(args) -> Dict:
 
     wall_times = []
     all_results = []
-    global_idx = 0
+    global_idx = covr_resume_sample_offset
 
     for batch_start in tqdm(range(0, n, bs), desc=f"c2i/{dataset_name}", ncols=80):
         # ---- VFL mid-run reload: pull latest LoRA from training daemon ----
@@ -1223,11 +1417,13 @@ def run_c2i(args) -> Dict:
 
         batch_end = min(batch_start + bs, n)
         batch_indices = list(range(batch_start, batch_end))
+        batch_absolute_indices = [
+            covr_resume_sample_offset + index for index in batch_indices]
         actual_bs = len(batch_indices)
 
         # Collect prompts (class labels) + seeds
         batch_inputs, batch_seeds = [], []
-        for idx in batch_indices:
+        for idx, absolute_idx in zip(batch_indices, batch_absolute_indices):
             data = ds[idx]
             gen_input = data[2] if len(data) > 2 else data[1]
             # DiT needs integer class labels
@@ -1236,10 +1432,26 @@ def run_c2i(args) -> Dict:
             else:
                 gen_input = data[1]  # text prompt for PixArt; DiT can't handle text
             batch_inputs.append(gen_input)
-            batch_seeds.append(100000 + idx)
+            batch_seeds.append(100000 + absolute_idx)
 
         # Reset accelerator state
-        trajectory_id = batch_start // bs
+        trajectory_id = covr_trajectory_offset + batch_start // bs
+        covr_assignment = None
+        covr_sentinel_selected = False
+        covr_sentinel_start_idx = None
+        if covr_bandit is not None:
+            covr_sentinel_selected = _covr_hash_sample(
+                covr_bandit.session_id, trajectory_id, -1,
+                args.covr_sentinel_rate, "delayed_sentinel")
+            if (covr_sentinel_selected and
+                    0 < args.covr_sentinel_horizon < args.num_steps):
+                max_start = args.num_steps - args.covr_sentinel_horizon
+                min_start = min(covr_bandit.manifest.mandatory_prefix, max_start)
+                covr_sentinel_start_idx = min_start + _covr_hash_index(
+                    covr_bandit.session_id, trajectory_id, "sentinel_start",
+                    max_start - min_start + 1)
+            covr_assignment = covr_bandit.begin_trajectory(
+                trajectory_id, sample_count=actual_bs)
         if args.method == "teacache" and teacache_state is not None:
             teacache_reset(teacache_state)
         if args.ttt and ttt_state is not None:
@@ -1249,6 +1461,9 @@ def run_c2i(args) -> Dict:
                 **speca_init_kwargs,
                 controller=compute_controller,
                 trajectory_id=trajectory_id,
+                refresh_mask=(
+                    covr_bandit.active_template.refresh_mask
+                    if covr_bandit is not None else None),
             )
             if compute_controller is not None:
                 compute_controller.begin_trajectory(trajectory_id)
@@ -1264,6 +1479,7 @@ def run_c2i(args) -> Dict:
             set_vfl_sample_id(batch_start)
 
         # Generate
+        covr_feedback_sink = {}
         t0 = time.time()
         if args.ttt:
             latent, img = generator.generate_ttt(
@@ -1283,9 +1499,27 @@ def run_c2i(args) -> Dict:
                 ddim_steps=ddim_steps,
                 covr_recorder=covr_recorder,
                 covr_trajectory_id=trajectory_id,
-                covr_sample_ids=[str(index) for index in batch_indices],
+                covr_sample_ids=[
+                    (f"{covr_session_id}:{trajectory_id}:{index}"
+                     if covr_bandit is not None else str(index))
+                    for index in batch_absolute_indices
+                ],
+                covr_bandit=covr_bandit,
+                covr_safety_sample_rate=(
+                    args.covr_safety_sample_rate
+                    if covr_bandit is not None else 0.0),
+                covr_sentinel_start_idx=covr_sentinel_start_idx,
+                covr_sentinel_horizon=(
+                    args.covr_sentinel_horizon
+                    if covr_sentinel_start_idx is not None else 0),
+                covr_feedback_sink=covr_feedback_sink,
             )
-        wall_s = time.time() - t0
+        sentinel_wall_s = covr_feedback_sink.get("sentinel_wall_s", 0.0)
+        wall_s = time.time() - t0 - sentinel_wall_s
+        if sentinel_wall_s:
+            covr_sentinel_wall_s += sentinel_wall_s
+            covr_sentinel_full_steps += args.covr_sentinel_horizon
+            covr_sentinel_count += 1
 
         if speca_cache_dic is not None:
             speca_totals["full_steps"] += speca_cache_dic.full_count
@@ -1297,6 +1531,50 @@ def run_c2i(args) -> Dict:
                 speca_cache_dic.recompute_full_blocks)
             if compute_controller is not None:
                 compute_controller.end_trajectory()
+
+        covr_feedback = None
+        if covr_bandit is not None:
+            if speca_cache_dic.full_count != covr_bandit.manifest.common_refresh_count:
+                raise RuntimeError(
+                    "fixed template full-step count violated the manifest")
+            if speca_cache_dic.taylor_count != (
+                    args.num_steps - covr_bandit.manifest.common_refresh_count):
+                raise RuntimeError(
+                    "fixed template Taylor-step count violated the manifest")
+            assert covr_assignment is not None
+            if covr_sentinel_selected and covr_sentinel_start_idx is None:
+                sentinel_start = time.time()
+                full_latent, _ = generator.generate(
+                    batch_inputs, batch_seeds,
+                    guidance_scale=args.guidance_scale,
+                    method="baseline",
+                )
+                terminal_fidelity_loss = float(F.mse_loss(
+                    latent.float(), full_latent.float()).item())
+                covr_sentinel_full_steps += args.num_steps
+                covr_sentinel_wall_s += time.time() - sentinel_start
+                covr_sentinel_count += 1
+                covr_feedback = TemplateFeedback(
+                    trajectory_id=trajectory_id,
+                    template_id=covr_assignment.template_id,
+                    sentinel_propensity=args.covr_sentinel_rate,
+                    horizon=args.num_steps,
+                    terminal_fidelity_loss=terminal_fidelity_loss,
+                )
+            elif covr_sentinel_start_idx is not None:
+                if not {"h_step_numerator", "h_step_denominator"}.issubset(
+                        covr_feedback_sink):
+                    raise RuntimeError("H-step sentinel did not produce feedback")
+                covr_feedback = TemplateFeedback(
+                    trajectory_id=trajectory_id,
+                    template_id=covr_assignment.template_id,
+                    sentinel_propensity=args.covr_sentinel_rate,
+                    horizon=args.covr_sentinel_horizon,
+                    h_step_numerator=covr_feedback_sink["h_step_numerator"],
+                    h_step_denominator=covr_feedback_sink["h_step_denominator"],
+                )
+            covr_bandit.end_trajectory(trajectory_id, covr_feedback)
+
         wall_times.append(wall_s)
         per_img_s = wall_s / actual_bs
 
@@ -1371,14 +1649,23 @@ def run_c2i(args) -> Dict:
             else:
                 metrics["flops"].add_vanilla_steps(args.num_steps)
 
-        for idx in batch_indices:
+        for idx, absolute_idx in zip(batch_indices, batch_absolute_indices):
             data = ds[idx]
             all_results.append({
-                "idx": idx,
+                "idx": absolute_idx,
                 "prompt": str(data[1])[:120],
                 "wall_s": wall_s,
                 "images": 1,
+                **({
+                    "covr_template_id": covr_assignment.template_id,
+                    "covr_template_propensity": covr_assignment.propensity,
+                    "covr_sentinel": covr_sentinel_selected,
+                    "covr_sentinel_start_idx": covr_sentinel_start_idx,
+                } if covr_assignment is not None else {}),
             })
+        if covr_bandit is not None:
+            assert covr_bandit_state_path is not None
+            covr_bandit.save_state(covr_bandit_state_path)
 
         # Phase 2: 推理循环内不再调用任何训练方法。后台线程独立轮询
         # buffer, 在数据足够时自行触发训练。这里只做 event / anchor
@@ -1513,6 +1800,26 @@ def run_c2i(args) -> Dict:
         print(
             f"  COVR action audits: {covr_summary['events']} batch-step contexts, "
             f"{covr_summary['samples']} sample labels")
+
+    if covr_bandit is not None:
+        assert covr_bandit_state_path is not None
+        covr_bandit.save_state(covr_bandit_state_path)
+        bandit_summary = covr_bandit.summary()
+        bandit_summary.update({
+            "state_path": covr_bandit_state_path,
+            "dataset_start_index": covr_resume_sample_offset,
+            "target_samples": int(args.n_prompts),
+            "generated_samples_this_run": n,
+            "sentinel_count": covr_sentinel_count,
+            "sentinel_horizon": args.covr_sentinel_horizon,
+            "sentinel_full_steps": covr_sentinel_full_steps,
+            "sentinel_wall_s": covr_sentinel_wall_s,
+            "candidate_flops_exclude_sentinel": True,
+        })
+        agg["covr_template_bandit"] = bandit_summary
+        print(
+            f"  COVR template bandit: {bandit_summary['completed_trajectories']} "
+            f"trajectories, sentinel_full_steps={covr_sentinel_full_steps}")
 
     if "speed" in selected and all_results:
         unique_walls = list(dict.fromkeys(r["wall_s"] for r in all_results))

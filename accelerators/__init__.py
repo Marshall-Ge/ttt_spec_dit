@@ -41,6 +41,16 @@ from .covr import (
     transition_defect_batch,
     transition_defects,
 )
+from .covr_bandit import (
+    BANDIT_SCHEMA_VERSION,
+    ConservativeTemplateBandit,
+    RefreshTemplate,
+    TemplateAssignment,
+    TemplateFeedback,
+    TemplateManifest,
+    TimestepSafetyPrior,
+    TimestepSafetyTable,
+)
 from .speca import (
     SpecACache,
     SpecAState,

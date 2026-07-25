@@ -65,7 +65,8 @@ class SpecAState:
                  controller: Optional[ComputeController] = None,
                  trajectory_id: int = 0,
                  suffix_recompute_blocks: int = 0,
-                 suffix_recompute_budget: int = 0):
+                 suffix_recompute_budget: int = 0,
+                 refresh_mask: Optional[Tuple[bool, ...]] = None):
         # Written by the denoising loop.
         self.step: int = 0
 
@@ -83,6 +84,19 @@ class SpecAState:
         self.num_steps: int = num_steps
         self.controller = controller
         self.trajectory_id: int = trajectory_id
+        self.refresh_mask = (
+            tuple(refresh_mask) if refresh_mask is not None else None)
+        if self.refresh_mask is not None:
+            if len(self.refresh_mask) != num_steps:
+                raise ValueError("refresh_mask length must match num_steps")
+            if any(type(value) is not bool for value in self.refresh_mask):
+                raise ValueError("refresh_mask values must be booleans")
+            if not self.refresh_mask[0]:
+                raise ValueError("refresh_mask must refresh the first step")
+            if controller is not None:
+                raise ValueError("refresh_mask cannot use a compute controller")
+            if suffix_recompute_blocks or suffix_recompute_budget:
+                raise ValueError("refresh_mask cannot use suffix recompute")
         self.activated_steps: List[int] = [num_steps - 1]  # descending order
         if suffix_recompute_blocks < 0 or suffix_recompute_budget < 0:
             raise ValueError("suffix recompute settings must be non-negative")
@@ -376,6 +390,7 @@ def speca_init(
     trajectory_id: int = 0,
     suffix_recompute_blocks: int = 0,
     suffix_recompute_budget: int = 0,
+    refresh_mask: Optional[Tuple[bool, ...]] = None,
 ) -> Tuple[SpecACache, SpecAState]:
     """Allocate the SpecA cache and current-state objects.
 
@@ -407,6 +422,7 @@ def speca_init(
         trajectory_id=trajectory_id,
         suffix_recompute_blocks=suffix_recompute_blocks,
         suffix_recompute_budget=suffix_recompute_budget,
+        refresh_mask=refresh_mask,
     )
     return cache_dic, current
 
@@ -480,6 +496,28 @@ def speca_cal_type(cache_dic: SpecACache, current: SpecAState,
     min_taylor_steps = cache_dic.min_taylor_steps
     max_taylor_steps = cache_dic.max_taylor_steps
     current.decision_threshold = None
+
+    if current.refresh_mask is not None:
+        step_idx = current.num_steps - 1 - current.step
+        if not 0 <= step_idx < current.num_steps:
+            raise ValueError("SpecA step is outside the refresh mask")
+        cache_dic.check = False
+        current.last_layer_error = None
+        if current.refresh_mask[step_idx]:
+            current.type = 'full'
+            cache_dic.taylor_step_counter = 0
+            cache_dic.full_count += 1
+        else:
+            current.type = 'Taylor'
+            cache_dic.taylor_step_counter += 1
+        current.last_type = current.type
+        if current.type == 'full':
+            cache_dic.cache_counter = 0
+            current.activated_steps.append(current.step)
+        else:
+            cache_dic.taylor_count += 1
+            cache_dic.cache_counter += 1
+        return
 
     if current.last_type == 'full':
         # a full step just happened → next step is Taylor (at least try)

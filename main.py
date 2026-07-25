@@ -138,6 +138,21 @@ Examples:
                         help="Maximum batch-step COVR audit contexts to record")
     parser.add_argument("--covr-base-model-version", type=str, default=None,
                         help="Base model version recorded in COVR event metadata")
+    parser.add_argument("--covr-template-bandit", action="store_true", default=False,
+                        help="Select one equal-FLOPs refresh template per SpecA trajectory")
+    parser.add_argument("--covr-template-manifest", type=str, default=None,
+                        help="Equal-FLOPs COVR template manifest")
+    parser.add_argument("--covr-bandit-state", type=str, default=None,
+                        help="Explicit COVR template-bandit state to resume/save")
+    parser.add_argument("--covr-bandit-epsilon", type=float, default=0.1,
+                        help="Template-bandit exploration probability")
+    parser.add_argument("--covr-safety-sample-rate", type=float, default=0.1,
+                        help="Action-independent one-step safety audit rate")
+    parser.add_argument("--covr-sentinel-rate", type=float, default=0.05,
+                        help="Action-independent delayed full-reference sentinel rate")
+    parser.add_argument("--covr-sentinel-horizon", type=int, default=0,
+                        help="Delayed sentinel horizon in denoising steps; 0 uses "
+                             "a terminal full-reference rollout")
     # ---- TTT (Test-Time Training plugin, DiT-only) ----
     parser.add_argument("--ttt", action="store_true", default=False,
                         help="Enable online TTT plugin on top of TeaCache "
@@ -286,6 +301,33 @@ def validate_args(args):
         if args.vfl:
             print("[ERROR] --covr-shadow cannot be combined with VFL; Gate data "
                   "must use an unchanged backbone and static SpecA policy.")
+            return False
+
+    if args.covr_template_bandit:
+        if args.model != "dit" or args.method != "speca":
+            print("[ERROR] --covr-template-bandit requires --model dit --method speca.")
+            return False
+        if not args.covr_template_manifest:
+            print("[ERROR] --covr-template-manifest is required with "
+                  "--covr-template-bandit.")
+            return False
+        if args.covr_shadow or args.vfl:
+            print("[ERROR] --covr-template-bandit cannot be combined with "
+                  "COVR shadow or VFL.")
+            return False
+        if args.compute_controller != "none" or suffix_blocks or suffix_budget:
+            print("[ERROR] --covr-template-bandit cannot use a compute controller "
+                  "or suffix recompute.")
+            return False
+        for name in ("covr_bandit_epsilon", "covr_safety_sample_rate",
+                     "covr_sentinel_rate"):
+            value = float(getattr(args, name))
+            if not 0.0 <= value <= 1.0:
+                print(f"[ERROR] --{name.replace('_', '-')} must be in [0, 1].")
+                return False
+        if args.covr_sentinel_horizon < 0 or args.covr_sentinel_horizon > args.num_steps:
+            print("[ERROR] --covr-sentinel-horizon must be between 0 and "
+                  "--num-steps.")
             return False
     if args.covr_max_events is not None and args.covr_max_events <= 0:
         print("[ERROR] --covr-max-events must be positive.")
