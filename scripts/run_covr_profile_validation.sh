@@ -111,8 +111,8 @@ log "tail -f ${MAIN_LOG}"
 
 failed=0
 for index in "${!PIDS[@]}"; do
-  local name="${PHASE_NAMES[index]}"
-  local pid="${PIDS[index]}"
+  name="${PHASE_NAMES[index]}"
+  pid="${PIDS[index]}"
   if wait "${pid}"; then
     log "${name} ✓ complete"
   else
