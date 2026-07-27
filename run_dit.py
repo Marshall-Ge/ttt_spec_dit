@@ -344,6 +344,11 @@ class _GenerationProfiler:
         self._synchronized = True
         return elapsed
 
+    def reset(self) -> None:
+        self._gpu_intervals.clear()
+        self._cpu_seconds.clear()
+        self._synchronized = not self._use_cuda
+
     def seconds(self, stage: str) -> float:
         if self._use_cuda and not self._synchronized:
             raise RuntimeError("GPU timings require one batch-boundary synchronize")
@@ -2032,6 +2037,7 @@ def run_c2i(args) -> Dict:
         for stage, seconds in generation_profile.items():
             profile_stage_totals[stage] += seconds
             profile_stage_counts[stage] += 1
+        covr_profiler.reset()
 
         if speca_cache_dic is not None:
             speca_totals["full_steps"] += speca_cache_dic.full_count
