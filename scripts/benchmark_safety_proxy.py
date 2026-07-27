@@ -264,8 +264,12 @@ def main():
              transformer.config.sample_size // 8),
             generator=torch.Generator(device=device).manual_seed(
                 seeds[0]), device=device, dtype=compute_dtype)
-        # CFG doubling
+        # CFG doubling: [cond, uncond] for latents and [cond, null] for labels
         latents = torch.cat([latents, latents], dim=0)
+        null_class = transformer.config.num_embeds_ada_norm
+        null_labels = torch.full((actual_bs,), null_class,
+                                 device=device, dtype=torch.long)
+        class_labels = torch.cat([class_labels, null_labels], dim=0)
 
         # SpecA init (adaptive)
         cache_dic, current = speca_init(
