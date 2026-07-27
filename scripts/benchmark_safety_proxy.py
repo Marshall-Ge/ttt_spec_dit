@@ -161,7 +161,7 @@ def _collect_defect_pairs(
 
         # candidate (run through SpecA with Taylor)
         candidate_noise = transformer.forward_with_cfg(
-            latent_input, t_tensor,
+            latent_input, t_batch,
             current=current, cache_dic=cache_dic,
             class_labels=class_labels, cfg_scale=guidance_scale,
         )
