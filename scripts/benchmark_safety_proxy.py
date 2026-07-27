@@ -231,8 +231,7 @@ def main():
 
     # Dataset
     ds = ImageNetDataset(
-        IMAGENET_DIR, split="val", num_samples=args.n_prompts,
-        seed=args.seed, use_class_id_mapping=True)
+        IMAGENET_DIR, n_images=args.n_prompts, seed=args.seed)
 
     # Scheduler
     from diffusers import DDIMScheduler
