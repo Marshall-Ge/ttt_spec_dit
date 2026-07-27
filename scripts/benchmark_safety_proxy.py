@@ -223,7 +223,8 @@ def main():
     # Load model
     print("Loading DiT...")
     transformer = DiTTransformer2D.from_pretrained(
-        DIT_REPO, subfolder="transformer", torch_dtype=compute_dtype)
+        DIT_REPO, subfolder="transformer")
+    transformer = transformer.to(device=device, dtype=compute_dtype)
     transformer = transformer.to(device)
     transformer.eval()
     for param in transformer.parameters():
