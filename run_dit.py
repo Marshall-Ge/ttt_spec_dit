@@ -2044,16 +2044,12 @@ def run_c2i(args) -> Dict:
             if compute_controller is not None:
                 compute_controller.end_trajectory()
 
-        fixed_manifest = (
-            covr_forced_manifest
-            if covr_forced_manifest is not None else
-            covr_bandit.manifest if covr_bandit is not None else None)
-        if fixed_manifest is not None and speca_cache_dic is not None:
-            if speca_cache_dic.full_count != fixed_manifest.common_refresh_count:
+        if covr_forced_manifest is not None and speca_cache_dic is not None:
+            if speca_cache_dic.full_count != covr_forced_manifest.common_refresh_count:
                 raise RuntimeError(
                     "fixed template full-step count violated the manifest")
             if speca_cache_dic.taylor_count != (
-                    args.num_steps - fixed_manifest.common_refresh_count):
+                    args.num_steps - covr_forced_manifest.common_refresh_count):
                 raise RuntimeError(
                     "fixed template Taylor-step count violated the manifest")
 
