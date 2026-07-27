@@ -19,8 +19,9 @@ import hashlib
 import json
 import os
 import time
+from collections import defaultdict
 from types import SimpleNamespace
-from typing import Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -34,7 +35,7 @@ from config import (
     DEFAULT_REL_L1_THRESH, DEFAULT_NUM_STEPS,
     DDIM_FLOP_MATCHED_STEPS, load_coefficients,
 )
-from utils import CudaTimer, decode_latent, save_image, pil_to_tensor, ensure_real_299, get_vfl_checkpoint_dir, prune_checkpoints
+from utils import decode_latent, save_image, pil_to_tensor, ensure_real_299, get_vfl_checkpoint_dir, prune_checkpoints
 
 from models.dit import (
     DiTTransformer2D, set_vfl_step_info, get_vfl_buffer, set_vfl_sample_id,
@@ -51,6 +52,7 @@ from accelerators.teacache import (
     teacache_stats, compute_modulated_input_dit,
 )
 from accelerators.speca import SpecACache, SpecAState, speca_init
+from accelerators.strategy_dispatch import apply_strategy
 from accelerators.covr import (
     ActionAuditContext,
     ActionAuditEvent,
@@ -61,7 +63,9 @@ from accelerators.covr import (
     transition_defect_batch,
 )
 from accelerators.covr_bandit import (
+    AccelerationStrategy,
     ConservativeTemplateBandit,
+    StrategyManifest,
     TemplateFeedback,
     TemplateManifest,
 )
@@ -123,6 +127,16 @@ def _covr_scheduler_config_json(config) -> str:
         if key != "_use_default_values"
     }
     return _covr_canonical_json(identity)
+
+
+def _cache_scheduler_timestep_values(scheduler) -> None:
+    timesteps = scheduler.timesteps
+    if torch.is_tensor(timesteps):
+        values = timesteps.detach().to("cpu").tolist()
+    else:
+        values = timesteps
+    setattr(scheduler, "_host_timestep_values", tuple(
+        int(timestep) for timestep in values))
 
 
 def _covr_log_snr(scheduler, timestep) -> float:
@@ -218,6 +232,15 @@ def _covr_scheduler_pair(scheduler, noise_approx, noise_full, timestep, latents)
     return x_prev_approx, x_prev_full
 
 
+def _covr_transition_components(x_prev_approx, x_prev_full, x_t):
+    approx = x_prev_approx.detach().float().flatten(1)
+    full = x_prev_full.detach().float().flatten(1)
+    current = x_t.detach().float().flatten(1)
+    numerator = (approx - full).square().mean(dim=1).sqrt()
+    denominator = (full - current).square().mean(dim=1).sqrt()
+    return numerator, denominator
+
+
 def _covr_shadow_full(transformer, latent_input, timestep, class_labels,
                       guidance_scale):
     if guidance_scale > 1.0:
@@ -275,9 +298,63 @@ def _dataset_generation_window(dataset_start_index: int, target_samples: int,
     return dataset_start_index + processed_samples, target_samples - processed_samples
 
 
-def _covr_synchronize(device) -> None:
-    if torch.cuda.is_available() and torch.device(device).type == "cuda":
-        torch.cuda.synchronize(device)
+class _GenerationProfiler:
+    def __init__(self, device, detailed: bool = False):
+        self.device = torch.device(device)
+        self.detailed = detailed
+        self._use_cuda = (
+            self.device.type == "cuda" and torch.cuda.is_available())
+        self._gpu_intervals = defaultdict(list)
+        self._cpu_seconds = defaultdict(float)
+        self._synchronized = not self._use_cuda
+
+    def start_gpu(self, stage: str, required: bool = False):
+        if not (required or self.detailed):
+            return None
+        if self._use_cuda:
+            start = torch.cuda.Event(enable_timing=True)
+            start.record()
+            return stage, start, None
+        return stage, None, time.perf_counter()
+
+    def stop_gpu(self, token, stage: Optional[str] = None) -> None:
+        if token is None:
+            return
+        initial_stage, start_event, start_time = token
+        stage = stage or initial_stage
+        if self._use_cuda:
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record()
+            self._gpu_intervals[stage].append((start_event, end_event))
+            self._synchronized = False
+        else:
+            self._cpu_seconds[stage] += time.perf_counter() - start_time
+
+    def add_cpu(self, stage: str, seconds: float) -> None:
+        self._cpu_seconds[stage] += float(seconds)
+
+    def synchronize(self) -> float:
+        if not self._use_cuda or self._synchronized:
+            return 0.0
+        start = time.perf_counter()
+        torch.cuda.synchronize(self.device)
+        elapsed = time.perf_counter() - start
+        self._cpu_seconds["cuda_sync_wait"] += elapsed
+        self._cpu_seconds["cuda_sync_calls"] += 1.0
+        self._synchronized = True
+        return elapsed
+
+    def seconds(self, stage: str) -> float:
+        if self._use_cuda and not self._synchronized:
+            raise RuntimeError("GPU timings require one batch-boundary synchronize")
+        total = self._cpu_seconds.get(stage, 0.0)
+        for start, end in self._gpu_intervals.get(stage, ()):
+            total += start.elapsed_time(end) / 1000.0
+        return float(total)
+
+    def summary(self) -> Dict[str, float]:
+        stages = set(self._cpu_seconds) | set(self._gpu_intervals)
+        return {stage: self.seconds(stage) for stage in sorted(stages)}
 
 
 def _covr_online_accounting(
@@ -285,18 +362,31 @@ def _covr_online_accounting(
         n_images: int, safety_full_steps: int,
         candidate_flops_T: Optional[float] = None,
         vanilla_flops_T: Optional[float] = None,
-        full_step_flops: Optional[float] = None) -> Dict[str, float]:
-    if len(online_wall_times) != len(safety_wall_times):
-        raise ValueError("online and safety wall-time samples must align")
+        full_step_flops: Optional[float] = None,
+        terminal_wall_times: Optional[List[float]] = None,
+        terminal_full_steps: int = 0,
+        control_wall_times: Optional[List[float]] = None) -> Dict[str, float]:
+    if terminal_wall_times is None:
+        terminal_wall_times = [0.0] * len(online_wall_times)
+    if control_wall_times is None:
+        control_wall_times = [0.0] * len(online_wall_times)
+    if (len(online_wall_times) != len(safety_wall_times) or
+            len(online_wall_times) != len(terminal_wall_times) or
+            len(online_wall_times) != len(control_wall_times)):
+        raise ValueError("online and feedback wall-time samples must align")
     if not online_wall_times:
         return {}
 
     candidate_wall_times = [
-        max(0.0, online - safety)
-        for online, safety in zip(online_wall_times, safety_wall_times)
+        max(0.0, online - safety - terminal - control)
+        for online, safety, terminal, control in zip(
+            online_wall_times, safety_wall_times, terminal_wall_times,
+            control_wall_times)
     ]
     online_total = float(sum(online_wall_times))
     safety_total = float(sum(safety_wall_times))
+    terminal_total = float(sum(terminal_wall_times))
+    control_total = float(sum(control_wall_times))
     candidate_total = float(sum(candidate_wall_times))
     result = {
         "wall_s_candidate_mean": float(np.mean(candidate_wall_times)),
@@ -304,6 +394,10 @@ def _covr_online_accounting(
         "wall_s_candidate_total": candidate_total,
         "wall_s_safety_mean": float(np.mean(safety_wall_times)),
         "wall_s_safety_total": safety_total,
+        "wall_s_terminal_mean": float(np.mean(terminal_wall_times)),
+        "wall_s_terminal_total": terminal_total,
+        "wall_s_control_mean": float(np.mean(control_wall_times)),
+        "wall_s_control_total": control_total,
         "wall_s_online_mean": float(np.mean(online_wall_times)),
         "wall_s_online_std": float(np.std(online_wall_times)),
         "wall_s_online_total": online_total,
@@ -313,16 +407,21 @@ def _covr_online_accounting(
             float(n_images / online_total) if online_total > 0 else 0.0),
         "safety_full_steps_mean_per_trajectory": (
             float(safety_full_steps / len(online_wall_times))),
+        "terminal_full_steps_mean_per_trajectory": (
+            float(terminal_full_steps / len(online_wall_times))),
     }
 
     if (candidate_flops_T is not None and vanilla_flops_T is not None and
             full_step_flops is not None):
         safety_flops_T = (
             safety_full_steps / len(online_wall_times) * full_step_flops / 1e12)
-        online_flops_T = candidate_flops_T + safety_flops_T
+        terminal_flops_T = (
+            terminal_full_steps / len(online_wall_times) * full_step_flops / 1e12)
+        online_flops_T = candidate_flops_T + safety_flops_T + terminal_flops_T
         result.update({
             "flops_candidate_T": float(candidate_flops_T),
             "flops_safety_T": float(safety_flops_T),
+            "flops_terminal_T": float(terminal_flops_T),
             "flops_online_T": float(online_flops_T),
             "flops_reduction_candidate": (
                 1.0 - candidate_flops_T / vanilla_flops_T
@@ -532,6 +631,7 @@ class DiTGenerator:
                 clip_sample=False,
             )
             sched.set_timesteps(self.num_steps, device=self.device)
+            _cache_scheduler_timestep_values(sched)
             self._scheduler = sched
             return
         cfg = DDIMScheduler.load_config(
@@ -603,8 +703,9 @@ class DiTGenerator:
                  covr_safety_sample_rate: float = 0.0,
                  covr_sentinel_start_idx: Optional[int] = None,
                  covr_sentinel_horizon: int = 0,
-                 covr_feedback_sink: Optional[Dict[str, float]] = None,
+                 covr_feedback_sink: Optional[Dict[str, Any]] = None,
                  covr_sentinel_selected: bool = False,
+                 covr_profiler: Optional[_GenerationProfiler] = None,
                  ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Generate image(s).
 
@@ -644,12 +745,16 @@ class DiTGenerator:
         if method == "ddim" and ddim_steps is not None:
             sched = DDIMScheduler.from_config(self._scheduler.config)
             sched.set_timesteps(ddim_steps, device=self.device)
+            _cache_scheduler_timestep_values(sched)
             num_steps = ddim_steps
         else:
             sched = self._scheduler
             num_steps = self.num_steps
 
         # Run denoising loop
+        denoise_token = (
+            covr_profiler.start_gpu("denoise_loop")
+            if covr_profiler is not None else None)
         latent = self._denoise_loop(
             class_labels, seeds, guidance_scale,
             sched, method=method,
@@ -664,14 +769,22 @@ class DiTGenerator:
             covr_sentinel_horizon=covr_sentinel_horizon,
             covr_feedback_sink=covr_feedback_sink,
             covr_sentinel_selected=covr_sentinel_selected,
+            covr_profiler=covr_profiler,
         )
+        if covr_profiler is not None:
+            covr_profiler.stop_gpu(denoise_token)
 
         # Unchunk: cond half (index 0 — cond comes first)
         if guidance_scale > 1.0:
             latent = latent.chunk(2, dim=0)[0]
 
+        decode_token = (
+            covr_profiler.start_gpu("vae_decode")
+            if covr_profiler is not None else None)
         scaling_factor = getattr(self.vae.config, "scaling_factor", 0.18215)
         image = decode_latent(self.vae, latent, scaling_factor, self._dtype)
+        if covr_profiler is not None:
+            covr_profiler.stop_gpu(decode_token)
         return latent, image
 
     # ------------------------------------------------------------------
@@ -694,8 +807,9 @@ class DiTGenerator:
                        covr_safety_sample_rate: float = 0.0,
                        covr_sentinel_start_idx: Optional[int] = None,
                        covr_sentinel_horizon: int = 0,
-                       covr_feedback_sink: Optional[Dict[str, float]] = None,
+                       covr_feedback_sink: Optional[Dict[str, Any]] = None,
                        covr_sentinel_selected: bool = False,
+                       covr_profiler: Optional[_GenerationProfiler] = None,
                        ) -> torch.Tensor:
         """Single denoising loop with method dispatch.
 
@@ -741,13 +855,19 @@ class DiTGenerator:
             latents = torch.cat([latents, latents], dim=0)
 
         timesteps = scheduler.timesteps
+        timestep_values = getattr(scheduler, "_host_timestep_values", None)
+        if timestep_values is None:
+            _cache_scheduler_timestep_values(scheduler)
+            timestep_values = getattr(scheduler, "_host_timestep_values")
         if covr_sentinel_start_idx is not None and (
                 covr_sentinel_start_idx < 0 or
                 covr_sentinel_start_idx + covr_sentinel_horizon > len(timesteps)):
             raise ValueError("H-step sentinel exceeds the denoising trajectory")
-        for step_idx, t in enumerate(timesteps):
+        for step_idx, (t, timestep_value) in enumerate(
+                zip(timesteps, timestep_values)):
             # VFL: track current step + real timestep for event recording hooks
-            set_vfl_step_info(step_idx, len(timesteps), timestep_actual=int(t))
+            set_vfl_step_info(
+                step_idx, len(timesteps), timestep_actual=int(timestep_value))
             # Time-conditioned LoRA: cache t_emb once per step so the 168
             # LoRALinear forwards (28 blocks × 6 Linears) inside the upcoming
             # transformer call all read the same value without recomputing.
@@ -762,13 +882,19 @@ class DiTGenerator:
             if covr_sentinel_start_idx == step_idx:
                 assert covr_feedback_sink is not None
                 sentinel_start_latent = latents.detach().clone()
-                sentinel_start = time.time()
+                sentinel_token = (
+                    covr_profiler.start_gpu(
+                        "delayed_sentinel_shadow_full", required=True)
+                    if covr_profiler is not None else None)
                 sentinel_reference_latent = _covr_full_rollout(
                     transformer, scheduler, timesteps, step_idx,
                     covr_sentinel_horizon, latents, class_labels,
                     guidance_scale, transformer.config.in_channels)
-                covr_feedback_sink["sentinel_wall_s"] = (
-                    time.time() - sentinel_start)
+                if covr_profiler is not None:
+                    covr_profiler.stop_gpu(sentinel_token)
+                covr_feedback_sink["terminal_full_steps"] = (
+                    covr_feedback_sink.get("terminal_full_steps", 0)
+                    + covr_sentinel_horizon)
             latent_input = scheduler.scale_model_input(latents, t)
             # --------------- method dispatch ---------------
             if method == "teacache":
@@ -792,6 +918,9 @@ class DiTGenerator:
                 # SpecA: state threaded through model
                 if current is not None:
                     current.step = len(timesteps) - 1 - step_idx
+                speca_token = (
+                    covr_profiler.start_gpu("speca_forward")
+                    if covr_profiler is not None else None)
                 if guidance_scale > 1.0:
                     noise_pred = transformer.forward_with_cfg(
                         latent_input, current_t,
@@ -804,6 +933,11 @@ class DiTGenerator:
                         current=current, cache_dic=cache_dic,
                         class_labels=class_labels, return_dict=False,
                     )[0]
+                if covr_profiler is not None:
+                    speca_stage = (
+                        "speca_full" if current is not None and
+                        current.type == "full" else "speca_taylor")
+                    covr_profiler.stop_gpu(speca_token, speca_stage)
 
             else:
                 # baseline / ddim: vanilla forward (no cache state)
@@ -832,6 +966,10 @@ class DiTGenerator:
                     and step_idx == len(timesteps) - 1
                     and method == "speca" and current is not None
                     and covr_feedback_sink is not None):
+                terminal_token = (
+                    covr_profiler.start_gpu(
+                        "terminal_fidelity_shadow_full", required=True)
+                    if covr_profiler is not None else None)
                 terminal_full = _covr_shadow_full(
                     transformer, latent_input, current_t,
                     class_labels, guidance_scale)
@@ -840,17 +978,21 @@ class DiTGenerator:
                     terminal_full = terminal_full[:, :in_channels]
                 x_prev_approx, x_prev_full = _covr_scheduler_pair(
                     scheduler, noise_pred, terminal_full, t, latents)
-                covr_feedback_sink["terminal_fidelity_loss"] = float(
-                    F.mse_loss(
-                        x_prev_approx[:base_bs].float(),
-                        x_prev_full[:base_bs].float(),
-                    ).item())
+                covr_feedback_sink["terminal_fidelity_loss_tensor"] = F.mse_loss(
+                    x_prev_approx[:base_bs].float(),
+                    x_prev_full[:base_bs].float(),
+                )
+                covr_feedback_sink["terminal_full_steps"] = (
+                    covr_feedback_sink.get("terminal_full_steps", 0) + 1)
+                if covr_profiler is not None:
+                    covr_profiler.stop_gpu(terminal_token)
 
             if (covr_recorder is not None and covr_recorder.enabled
                     and method == "speca" and current is not None
                     and cache_dic is not None and current.type == "Taylor"):
                 context = _covr_context(
-                    covr_recorder, scheduler, timesteps, step_idx, t, current)
+                    covr_recorder, scheduler, timesteps, step_idx,
+                    timestep_value, current)
                 full_noise_pred = _covr_shadow_full(
                     transformer, latent_input, current_t,
                     class_labels, guidance_scale)
@@ -892,31 +1034,25 @@ class DiTGenerator:
                         covr_safety_sample_rate, "safety")):
                 if covr_feedback_sink is None:
                     raise ValueError("COVR safety sampling requires a feedback sink")
-                context = _covr_context(
-                    None, scheduler, timesteps, step_idx, t, current)
-                _covr_synchronize(self.device)
-                safety_start = time.perf_counter()
+                safety_token = (
+                    covr_profiler.start_gpu("safety_shadow_full", required=True)
+                    if covr_profiler is not None else None)
                 full_noise_pred = _covr_shadow_full(
                     transformer, latent_input, current_t,
                     class_labels, guidance_scale)
-                _covr_synchronize(self.device)
-                covr_feedback_sink["safety_wall_s"] = (
-                    covr_feedback_sink.get("safety_wall_s", 0.0)
-                    + time.perf_counter() - safety_start)
                 covr_feedback_sink["safety_full_steps"] = (
                     covr_feedback_sink.get("safety_full_steps", 0) + 1)
                 if out_channels // 2 == in_channels:
                     full_noise_pred = full_noise_pred[:, :in_channels]
                 x_prev_approx, x_prev_full = _covr_scheduler_pair(
                     scheduler, noise_pred, full_noise_pred, t, latents)
-                transition = transition_defect_batch(
-                    x_prev_approx[:base_bs],
-                    x_prev_full[:base_bs],
-                    latents[:base_bs],
-                )
-                covr_bandit.observe_one_step(
-                    covr_trajectory_id, step_idx,
-                    transition.numerators, transition.denominators)
+                numerator, denominator = _covr_transition_components(
+                    x_prev_approx[:base_bs], x_prev_full[:base_bs],
+                    latents[:base_bs])
+                covr_feedback_sink.setdefault("pending_safety", []).append((
+                    step_idx, torch.stack((numerator, denominator))))
+                if covr_profiler is not None:
+                    covr_profiler.stop_gpu(safety_token)
 
             # ---- VFL: anchor sample collection (low frequency) ----
             if step_idx % 5 == 0:
@@ -935,11 +1071,18 @@ class DiTGenerator:
                     covr_sentinel_start_idx is not None and
                     step_idx == covr_sentinel_start_idx + covr_sentinel_horizon - 1):
                 assert covr_feedback_sink is not None
-                h_step = transition_defect_batch(
+                assert sentinel_start_latent is not None
+                h_step_token = (
+                    covr_profiler.start_gpu(
+                        "delayed_sentinel_feedback", required=True)
+                    if covr_profiler is not None else None)
+                numerator, denominator = _covr_transition_components(
                     latents[:base_bs], sentinel_reference_latent[:base_bs],
                     sentinel_start_latent[:base_bs])
-                covr_feedback_sink["h_step_numerator"] = h_step.mean_numerator
-                covr_feedback_sink["h_step_denominator"] = h_step.mean_denominator
+                covr_feedback_sink["h_step_components_tensor"] = torch.stack((
+                    numerator.mean(), denominator.mean()))
+                if covr_profiler is not None:
+                    covr_profiler.stop_gpu(h_step_token)
 
         # Clear the LoRA t_emb cache so the next image starts clean.
         clear_lora_t_emb()
@@ -1489,17 +1632,25 @@ def run_c2i(args) -> Dict:
     covr_bandit = None
     covr_forced_manifest = None
     covr_forced_template = None
+    covr_forced_strategy = None
+    covr_forced_manifest_strategy = None
     covr_version = None
     covr_session_id = None
     covr_safety_full_steps = 0
     covr_safety_wall_s = 0.0
     covr_sentinel_full_steps = 0
-    covr_sentinel_wall_s = 0.0
+    covr_terminal_wall_s = 0.0
     covr_sentinel_count = 0
     covr_trajectory_offset = 0
-    if (getattr(args, "covr_shadow", False) or
-            getattr(args, "covr_template_bandit", False) or
-            getattr(args, "covr_force_template_id", None)):
+    _covr_has_any_covr = (
+        getattr(args, "covr_shadow", False)
+        or getattr(args, "covr_template_bandit", False)
+        or getattr(args, "covr_force_template_id", None)
+        or getattr(args, "covr_strategy_bandit", False)
+        or getattr(args, "covr_strategy_manifest", None) is not None
+        or getattr(args, "covr_force_strategy_id", None) is not None
+    )
+    if _covr_has_any_covr:
         covr_session_id = (
             args.covr_session_id or
             (str(covr_resume["session_id"]) if covr_resume is not None else None) or
@@ -1568,6 +1719,59 @@ def run_c2i(args) -> Dict:
                   f"({len(manifest.templates)} templates, "
                   f"{manifest.common_refresh_count} refreshes)")
 
+        # --covr-force-strategy-id: load a StrategyManifest and extract one arm.
+        if getattr(args, "covr_force_strategy_id", None):
+            strat_path = (args.covr_strategy_manifest
+                          if args.covr_strategy_manifest
+                          else args.covr_template_manifest)
+            if not strat_path:
+                raise ValueError(
+                    "--covr-force-strategy-id requires --covr-strategy-manifest")
+            strat_manifest = StrategyManifest.load(strat_path)
+            strategy = strat_manifest.strategy_map.get(
+                args.covr_force_strategy_id)
+            if strategy is None:
+                raise ValueError(
+                    f"forced strategy {args.covr_force_strategy_id} "
+                    f"not found in the manifest")
+            covr_forced_manifest_strategy = strat_manifest
+            covr_forced_strategy = strategy
+            print(
+                f"  COVR forced strategy: {strategy.strategy_id} "
+                f"(method={strategy.method})")
+
+        # --covr-strategy-bandit: method-agnostic bandit from StrategyManifest.
+        if getattr(args, "covr_strategy_bandit", False):
+            strat_path = (args.covr_strategy_manifest
+                          if args.covr_strategy_manifest
+                          else args.covr_template_manifest)
+            if not strat_path:
+                raise ValueError(
+                    "--covr-strategy-bandit requires --covr-strategy-manifest")
+            strat_manifest = StrategyManifest.load(strat_path)
+            covr_bandit = ConservativeTemplateBandit.from_strategies(
+                strat_manifest, session_id=covr_session_id,
+                epsilon=args.covr_bandit_epsilon, seed=args.seed,
+                run_identity={
+                    "dataset": dataset_name,
+                    "dataset_start_index": dataset_start_index,
+                    "seed": int(args.seed),
+                    "batch_size": int(args.batch_size),
+                    "safety_sample_rate": float(args.covr_safety_sample_rate),
+                    "sentinel_rate": float(args.covr_sentinel_rate),
+                    "sentinel_horizon": int(args.covr_sentinel_horizon),
+                },
+            )
+            if covr_resume is not None:
+                if covr_bandit_state_path and os.path.exists(covr_bandit_state_path):
+                    covr_bandit.load_state(covr_bandit_state_path)
+                    covr_trajectory_offset = len(covr_bandit.assignments)
+                    if covr_bandit.summary()["processed_samples"] != covr_resume_sample_offset:
+                        raise ValueError(
+                            "COVR resume sample count changed while loading state")
+            print(f"  COVR strategy bandit: {strat_path} "
+                  f"({len(strat_manifest.strategies)} strategies)")
+
     # ===================================================================
     # 5. Generate images
     # ===================================================================
@@ -1582,6 +1786,10 @@ def run_c2i(args) -> Dict:
 
     wall_times = []
     covr_safety_wall_times = []
+    covr_terminal_wall_times = []
+    covr_control_wall_times = []
+    profile_stage_totals = defaultdict(float)
+    profile_stage_counts = defaultdict(int)
     all_results = []
     global_idx = generation_start_index
 
@@ -1607,6 +1815,10 @@ def run_c2i(args) -> Dict:
             generation_start_index + batch_end))
         batch_absolute_indices = batch_indices
         actual_bs = len(batch_indices)
+        covr_profiler = _GenerationProfiler(
+            generator.device,
+            detailed=bool(getattr(args, "covr_profile_stages", False)),
+        )
 
         # Collect prompts (class labels) + seeds
         batch_inputs, batch_seeds = [], []
@@ -1626,6 +1838,7 @@ def run_c2i(args) -> Dict:
         covr_assignment = None
         covr_sentinel_selected = False
         covr_sentinel_start_idx = None
+        strategy_select_start = time.perf_counter()
         if covr_bandit is not None:
             covr_sentinel_selected = _covr_hash_sample(
                 covr_bandit.session_id, trajectory_id, -1,
@@ -1639,23 +1852,67 @@ def run_c2i(args) -> Dict:
                     max_start - min_start + 1)
             covr_assignment = covr_bandit.begin_trajectory(
                 trajectory_id, sample_count=actual_bs)
+        covr_profiler.add_cpu(
+            "strategy_selection", time.perf_counter() - strategy_select_start)
+
+        reset_start = time.perf_counter()
         if args.method == "teacache" and teacache_state is not None:
             teacache_reset(teacache_state)
         if args.ttt and ttt_state is not None:
             ttt_reset_for_image(ttt_state)
-        if speca_init_kwargs is not None:
+        reset_stage = (
+            "speca_state_reset"
+            if args.method == "speca" else "accelerator_state_reset")
+        covr_profiler.add_cpu(
+            reset_stage, time.perf_counter() - reset_start)
+
+        strategy_init_start = time.perf_counter()
+        # Strategy dispatch: configure the accelerator from the
+        # bandit/forced-template selection when one is active.
+        _using_strategy = covr_bandit is not None or covr_forced_strategy is not None
+        if _using_strategy:
+            strategy = (
+                covr_forced_strategy
+                if covr_forced_strategy is not None
+                else covr_bandit.active_strategy
+            )
+            if strategy.method == "speca":
+                dispatch_result = apply_strategy(
+                    strategy,
+                    speca_init_kwargs={
+                        **speca_init_kwargs,
+                        "controller": compute_controller,
+                        "trajectory_id": trajectory_id,
+                    },
+                )
+                speca_cache_dic = dispatch_result["cache_dic"]
+                speca_current = dispatch_result["current"]
+                if compute_controller is not None:
+                    compute_controller.begin_trajectory(trajectory_id)
+            elif strategy.method == "teacache":
+                dispatch_result = apply_strategy(
+                    strategy,
+                    teacache_init_kwargs={
+                        "num_steps": args.num_steps,
+                        "coefficients": _load_dit_coefficients(args.coef_path)
+                        if args.coef_path else _load_dit_coefficients(),
+                    },
+                )
+                teacache_state = dispatch_result["teacache_state"]
+        elif speca_init_kwargs is not None:
+            # No bandit, direct SpecA config (no refresh_mask = auto-decay)
             speca_cache_dic, speca_current = speca_init(
                 **speca_init_kwargs,
                 controller=compute_controller,
                 trajectory_id=trajectory_id,
-                refresh_mask=(
-                    covr_forced_template.refresh_mask
-                    if covr_forced_template is not None else
-                    covr_bandit.active_template.refresh_mask
-                    if covr_bandit is not None else None),
             )
             if compute_controller is not None:
                 compute_controller.begin_trajectory(trajectory_id)
+        covr_profiler.add_cpu(
+            "strategy_initialization", time.perf_counter() - strategy_init_start)
+        if (speca_current is not None and
+                getattr(args, "covr_profile_stages", False)):
+            speca_current.profiler = covr_profiler
 
         # VFL (Phase 2): tag this batch's denoising trajectory with a unique
         # sample_id so curvature loss can group events from the same image.
@@ -1669,7 +1926,8 @@ def run_c2i(args) -> Dict:
 
         # Generate
         covr_feedback_sink = {}
-        t0 = time.time()
+        generation_token = covr_profiler.start_gpu(
+            "generation_online", required=True)
         if args.ttt:
             latent, img = generator.generate_ttt(
                 batch_inputs, batch_seeds,
@@ -1703,18 +1961,77 @@ def run_c2i(args) -> Dict:
                     if covr_sentinel_start_idx is not None else 0),
                 covr_feedback_sink=covr_feedback_sink,
                 covr_sentinel_selected=covr_sentinel_selected,
+                covr_profiler=covr_profiler,
             )
-        sentinel_wall_s = covr_feedback_sink.get("sentinel_wall_s", 0.0)
-        safety_wall_s = covr_feedback_sink.get("safety_wall_s", 0.0)
+
+        pending_safety = covr_feedback_sink.pop("pending_safety", ())
+        if pending_safety:
+            covr_feedback_sink["pending_safety_steps"] = tuple(
+                step_idx for step_idx, _ in pending_safety)
+            covr_feedback_sink["pending_safety_values"] = torch.stack(
+                [values for _, values in pending_safety])
+        covr_profiler.stop_gpu(generation_token)
+        covr_profiler.synchronize()
+        generation_profile = covr_profiler.summary()
+
+        feedback_start = time.perf_counter()
+        pending_values = covr_feedback_sink.pop("pending_safety_values", None)
+        pending_steps = covr_feedback_sink.pop("pending_safety_steps", ())
+        if pending_values is not None:
+            assert covr_bandit is not None
+            safety_values = pending_values.detach().to("cpu").tolist()
+            for step_idx, (numerators, denominators) in zip(
+                    pending_steps, safety_values):
+                covr_bandit.observe_one_step(
+                    trajectory_id, step_idx, numerators, denominators)
+        h_step_components = covr_feedback_sink.pop(
+            "h_step_components_tensor", None)
+        if h_step_components is not None:
+            h_step_numerator, h_step_denominator = (
+                h_step_components.detach().to("cpu").tolist())
+            covr_feedback_sink["h_step_numerator"] = float(
+                h_step_numerator)
+            covr_feedback_sink["h_step_denominator"] = float(
+                h_step_denominator)
+        terminal_loss = covr_feedback_sink.pop(
+            "terminal_fidelity_loss_tensor", None)
+        if terminal_loss is not None:
+            covr_feedback_sink["terminal_fidelity_loss"] = float(
+                terminal_loss.detach().to("cpu"))
+        feedback_materialize_s = time.perf_counter() - feedback_start
+        covr_profiler.add_cpu(
+            "feedback_materialization", feedback_materialize_s)
+        generation_profile["feedback_materialization"] = feedback_materialize_s
+
+        sentinel_wall_s = (
+            generation_profile.get("delayed_sentinel_shadow_full", 0.0)
+            + generation_profile.get("delayed_sentinel_feedback", 0.0))
+        safety_wall_s = generation_profile.get("safety_shadow_full", 0.0)
+        terminal_wall_s = (
+            sentinel_wall_s
+            + generation_profile.get("terminal_fidelity_shadow_full", 0.0))
         safety_full_steps = int(covr_feedback_sink.get("safety_full_steps", 0))
-        wall_s = time.time() - t0 - sentinel_wall_s
+        terminal_full_steps = int(
+            covr_feedback_sink.get("terminal_full_steps", 0))
+        control_wall_s = sum(
+            generation_profile.get(stage, 0.0)
+            for stage in (
+                "strategy_selection", "accelerator_state_reset",
+                "speca_state_reset", "strategy_initialization",
+                "feedback_materialization"))
+        wall_s = generation_profile["generation_online"] + control_wall_s
         covr_safety_wall_times.append(safety_wall_s)
+        covr_terminal_wall_times.append(terminal_wall_s)
+        covr_control_wall_times.append(control_wall_s)
         covr_safety_wall_s += safety_wall_s
         covr_safety_full_steps += safety_full_steps
-        if sentinel_wall_s:
-            covr_sentinel_wall_s += sentinel_wall_s
-            covr_sentinel_full_steps += args.covr_sentinel_horizon
+        covr_terminal_wall_s += terminal_wall_s
+        covr_sentinel_full_steps += terminal_full_steps
+        if terminal_full_steps:
             covr_sentinel_count += 1
+        for stage, seconds in generation_profile.items():
+            profile_stage_totals[stage] += seconds
+            profile_stage_counts[stage] += 1
 
         if speca_cache_dic is not None:
             speca_totals["full_steps"] += speca_cache_dic.full_count
@@ -1731,7 +2048,7 @@ def run_c2i(args) -> Dict:
             covr_forced_manifest
             if covr_forced_manifest is not None else
             covr_bandit.manifest if covr_bandit is not None else None)
-        if fixed_manifest is not None:
+        if fixed_manifest is not None and speca_cache_dic is not None:
             if speca_cache_dic.full_count != fixed_manifest.common_refresh_count:
                 raise RuntimeError(
                     "fixed template full-step count violated the manifest")
@@ -1745,23 +2062,40 @@ def run_c2i(args) -> Dict:
             assert covr_assignment is not None
             if covr_sentinel_selected and covr_sentinel_start_idx is None:
                 # Terminal fidelity: prefer the cheap one-step computation
-                # from _denoise_loop (1 extra forward pass). Fall back to
-                # the expensive full-baseline comparison only if the in-loop
-                # computation did not fire (non-speca methods, not expected
-                # with bandit since it requires speca).
+                # from _denoise_loop (1 extra forward pass, SpecA-only).
+                # Fall back to full-baseline comparison for non-SpecA
+                # methods (TeaCache bandit, etc.).
                 tf_loss = covr_feedback_sink.get("terminal_fidelity_loss")
                 if tf_loss is None:
-                    sentinel_start = time.time()
+                    fallback_profiler = _GenerationProfiler(
+                        generator.device,
+                        detailed=bool(getattr(
+                            args, "covr_profile_stages", False)),
+                    )
+                    fallback_token = fallback_profiler.start_gpu(
+                        "terminal_fallback_full", required=True)
                     full_latent, _ = generator.generate(
                         batch_inputs, batch_seeds,
                         guidance_scale=args.guidance_scale,
                         method="baseline",
+                        covr_profiler=fallback_profiler,
                     )
-                    tf_loss = float(F.mse_loss(
-                        latent.float(), full_latent.float()).item())
+                    tf_loss_tensor = F.mse_loss(
+                        latent.float(), full_latent.float())
+                    fallback_profiler.stop_gpu(fallback_token)
+                    fallback_profiler.synchronize()
+                    fallback_profile = fallback_profiler.summary()
+                    tf_loss = float(tf_loss_tensor.detach().to("cpu"))
+                    fallback_wall_s = fallback_profile[
+                        "terminal_fallback_full"]
+                    wall_s += fallback_wall_s
+                    covr_terminal_wall_times[-1] += fallback_wall_s
                     covr_sentinel_full_steps += args.num_steps
-                    covr_sentinel_wall_s += time.time() - sentinel_start
+                    covr_terminal_wall_s += fallback_wall_s
                     covr_sentinel_count += 1
+                    for stage, seconds in fallback_profile.items():
+                        profile_stage_totals[stage] += seconds
+                        profile_stage_counts[stage] += 1
                 covr_feedback = TemplateFeedback(
                     trajectory_id=trajectory_id,
                     template_id=covr_assignment.template_id,
@@ -1781,12 +2115,27 @@ def run_c2i(args) -> Dict:
                     h_step_numerator=covr_feedback_sink["h_step_numerator"],
                     h_step_denominator=covr_feedback_sink["h_step_denominator"],
                 )
+            update_start = time.perf_counter()
             covr_bandit.end_trajectory(trajectory_id, covr_feedback)
+            update_s = time.perf_counter() - update_start
+            assert covr_bandit_state_path is not None
+            persist_start = time.perf_counter()
+            covr_bandit.save_state(covr_bandit_state_path)
+            persist_s = time.perf_counter() - persist_start
+            control_s = update_s + persist_s
+            wall_s += control_s
+            covr_control_wall_times[-1] += control_s
+            profile_stage_totals["bandit_update"] += update_s
+            profile_stage_counts["bandit_update"] += 1
+            profile_stage_totals["bandit_state_persist"] += persist_s
+            profile_stage_counts["bandit_state_persist"] += 1
 
         wall_times.append(wall_s)
         per_img_s = wall_s / actual_bs
 
-        # Save
+        # Save and metric ingestion are excluded from generation img/s but
+        # reported separately by the stage profiler.
+        postprocess_start = time.perf_counter()
         img_limit = getattr(args, "img_save_limit", 50)
         for b, idx in enumerate(batch_indices):
             if global_idx - generation_start_index < img_limit:
@@ -1871,9 +2220,9 @@ def run_c2i(args) -> Dict:
                     "covr_sentinel_start_idx": covr_sentinel_start_idx,
                 } if covr_assignment is not None else {}),
             })
-        if covr_bandit is not None:
-            assert covr_bandit_state_path is not None
-            covr_bandit.save_state(covr_bandit_state_path)
+        profile_stage_totals["image_save_metrics"] += (
+            time.perf_counter() - postprocess_start)
+        profile_stage_counts["image_save_metrics"] += 1
 
         # Phase 2: 推理循环内不再调用任何训练方法。后台线程独立轮询
         # buffer, 在数据足够时自行触发训练。这里只做 event / anchor
@@ -1953,7 +2302,31 @@ def run_c2i(args) -> Dict:
             vanilla_flops_T=(agg.get("flops_vanilla_T") if need_flops else None),
             full_step_flops=(
                 metrics["flops"]._flops_full if need_flops else None),
+            terminal_wall_times=covr_terminal_wall_times,
+            terminal_full_steps=covr_sentinel_full_steps,
+            control_wall_times=covr_control_wall_times,
         ))
+
+    if getattr(args, "covr_profile_stages", False):
+        timing_totals = {
+            stage: float(seconds)
+            for stage, seconds in profile_stage_totals.items()
+            if stage != "cuda_sync_calls"
+        }
+        agg["generation_profile"] = {
+            "stage_total_s": timing_totals,
+            "stage_mean_per_batch_s": {
+                stage: float(seconds / max(1, len(wall_times)))
+                for stage, seconds in timing_totals.items()
+            },
+            "stage_observed_batches": {
+                stage: int(profile_stage_counts[stage])
+                for stage in timing_totals
+            },
+            "cuda_sync_calls": int(profile_stage_totals.get(
+                "cuda_sync_calls", 0.0)),
+            "batches": len(wall_times),
+        }
 
     if need_fid_is:
         agg.update(fid_is_results)
@@ -2040,10 +2413,12 @@ def run_c2i(args) -> Dict:
             "sentinel_count": covr_sentinel_count,
             "sentinel_horizon": args.covr_sentinel_horizon,
             "sentinel_full_steps": covr_sentinel_full_steps,
-            "sentinel_wall_s": covr_sentinel_wall_s,
+            "sentinel_wall_s": covr_terminal_wall_s,
+            "terminal_feedback_wall_s": covr_terminal_wall_s,
             "candidate_flops_exclude_safety": True,
             "candidate_flops_exclude_sentinel": True,
             "online_flops_include_safety": True,
+            "online_flops_include_terminal": True,
             "online_flops_exclude_sentinel": True,
             "online_wall_exclude_sentinel": True,
         })
@@ -2095,6 +2470,8 @@ def run_c2i(args) -> Dict:
             "covr_session_id": covr_session_id,
             "covr_version_key": (
                 covr_version.key if covr_version is not None else None),
+            "covr_profile_stages": bool(getattr(
+                args, "covr_profile_stages", False)),
             "ttt": args.ttt,
             "ttt_lr": args.ttt_lr if args.ttt else None,
             "ttt_micro_epochs": args.ttt_micro_epochs if args.ttt else None,

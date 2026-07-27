@@ -20,7 +20,7 @@ Module-name convention (keys into ``cache.cache[-1][layer]``):
 """
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -84,6 +84,7 @@ class SpecAState:
         self.num_steps: int = num_steps
         self.controller = controller
         self.trajectory_id: int = trajectory_id
+        self.profiler: Optional[Any] = None
         self.refresh_mask = (
             tuple(refresh_mask) if refresh_mask is not None else None)
         if self.refresh_mask is not None:

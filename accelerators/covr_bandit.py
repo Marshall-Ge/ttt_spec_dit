@@ -16,6 +16,7 @@ import numpy as np
 
 
 BANDIT_SCHEMA_VERSION = 1
+STRATEGY_SCHEMA_VERSION = 2
 _LOG_EPSILON = 1e-12
 
 
@@ -107,6 +108,250 @@ class RefreshTemplate:
                 value["modeled_full_block_equivalents"]),
             source=str(value.get("source", "")),
         )
+
+    def to_strategy(self, num_steps: int) -> "AccelerationStrategy":
+        """Convert to a method-agnostic AccelerationStrategy."""
+        return AccelerationStrategy(
+            strategy_id=self.template_id,
+            method="speca",
+            params={
+                "refresh_mask": list(self.refresh_mask),
+                "refresh_count": self.refresh_count,
+                "num_steps": num_steps,
+            },
+            modeled_flops=float(self.modeled_full_block_equivalents),
+            source=self.source,
+        )
+
+
+@dataclass(frozen=True)
+class AccelerationStrategy:
+    """Method-agnostic acceleration strategy descriptor.
+
+    This is the core abstraction for the COVR bandit — a single
+    ``AccelerationStrategy`` represents one arm (e.g. one TeaCache
+    threshold or one SpecA refresh mask). The bandit selects among
+    strategies, and ``apply_strategy()`` (in ``strategy_dispatch.py``)
+    translates the selection into the concrete accelerator configuration.
+
+    Parameters
+    ----------
+    strategy_id : str
+        Unique identifier across the manifest.
+    method : str
+        Accelerator method, e.g. ``"speca"`` or ``"teacache"``.
+    params : Dict[str, Any]
+        Method-specific parameters (e.g. ``{"refresh_mask": [...]}``
+        for SpecA, ``{"rel_l1_thresh": 0.25}`` for TeaCache).
+    modeled_flops : float
+        Modeled FLOPs for this strategy (used for cost-aware bandit
+        decisions and FLOPs accounting).
+    source : str
+        Optional provenance tag.
+    """
+    strategy_id: str
+    method: str
+    params: Dict[str, Any]
+    modeled_flops: float
+    source: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.strategy_id:
+            raise ValueError("strategy_id must be non-empty")
+        if self.method not in ("speca", "teacache"):
+            raise ValueError(f"unsupported acceleration method: {self.method}")
+        if self.modeled_flops <= 0 and not math.isclose(self.modeled_flops, 0.0):
+            raise ValueError("modeled_flops must be non-negative")
+
+    @property
+    def template_id(self) -> str:
+        """Alias for strategy_id — enables duck-type compatibility with bandit internals."""
+        return self.strategy_id
+
+    @property
+    def refresh_mask(self) -> Optional[Tuple[bool, ...]]:
+        """Backward compat: SpecA strategies expose a refresh_mask.
+
+        Returns ``None`` for non-SpecA methods such as TeaCache.
+        """
+        if self.method != "speca":
+            return None
+        raw = self.params.get("refresh_mask")
+        if raw is None:
+            return None
+        return tuple(raw)
+
+    @property
+    def refresh_count(self) -> int:
+        if self.refresh_mask is not None:
+            return sum(self.refresh_mask)
+        return 0
+
+    def to_refresh_template(self) -> RefreshTemplate:
+        """Backward compat: convert SpecA strategy to a RefreshTemplate."""
+        if self.method != "speca":
+            raise RuntimeError(
+                f"cannot convert {self.method} strategy to RefreshTemplate")
+        mask = self.refresh_mask
+        if mask is None:
+            raise RuntimeError("SpecA strategy missing refresh_mask")
+        return RefreshTemplate(
+            template_id=self.strategy_id,
+            refresh_mask=mask,
+            modeled_full_block_equivalents=int(self.modeled_flops),
+            source=self.source,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "strategy_id": self.strategy_id,
+            "method": self.method,
+            "params": dict(self.params),
+            "modeled_flops": self.modeled_flops,
+            "source": self.source,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "AccelerationStrategy":
+        return cls(
+            strategy_id=str(value["strategy_id"]),
+            method=str(value["method"]),
+            params=dict(value.get("params", {})),
+            modeled_flops=float(value["modeled_flops"]),
+            source=str(value.get("source", "")),
+        )
+
+    @classmethod
+    def from_refresh_template(
+        cls, template: RefreshTemplate, num_steps: int
+    ) -> "AccelerationStrategy":
+        return template.to_strategy(num_steps)
+
+
+@dataclass(frozen=True)
+class StrategyManifest:
+    """A simpler manifest for method-agnostic acceleration strategies.
+
+    Unlike ``TemplateManifest`` (which is SpecA-specific and validates
+    mandatory_prefix, max_taylor_gap, per-step safety priors, etc.),
+    ``StrategyManifest`` holds only the essential structure needed by
+    the bandit: a list of strategies, a baseline, and a version key.
+
+    For SpecA use-cases, prefer ``TemplateManifest`` (which is also
+    accepted by the bandit).  For TeaCache (or future methods) use
+    this manifest.
+    """
+    version_key: str
+    num_steps: int
+    baseline_strategy_id: str
+    strategies: Tuple[AccelerationStrategy, ...]
+    schema_version: int = STRATEGY_SCHEMA_VERSION
+    source_groups: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.version_key:
+            raise ValueError("version_key must be non-empty")
+        if self.num_steps <= 0:
+            raise ValueError("num_steps must be positive")
+        if not self.strategies:
+            raise ValueError("manifest must contain at least one strategy")
+        ids = [s.strategy_id for s in self.strategies]
+        if len(set(ids)) != len(ids):
+            raise ValueError("strategy IDs must be unique")
+        if self.baseline_strategy_id not in ids:
+            raise ValueError("baseline strategy is missing")
+
+    @property
+    def strategy_map(self) -> Dict[str, AccelerationStrategy]:
+        return {s.strategy_id: s for s in self.strategies}
+
+    # -- Duck-type properties so StrategyManifest is compatible with
+    # -- ConservativeTemplateBandit / TimestepSafetyTable internals.
+    @property
+    def baseline_template_id(self) -> str:
+        return self.baseline_strategy_id
+
+    @property
+    def template_map(self) -> Dict[str, AccelerationStrategy]:
+        return self.strategy_map
+
+    @property
+    def templates(self) -> Tuple[AccelerationStrategy, ...]:
+        return self.strategies
+
+    @property
+    def prior_map(self) -> Dict[int, object]:
+        return {}
+
+    @property
+    def timestep_priors(self) -> Tuple:
+        return ()
+
+    @property
+    def safety_numerator_ucb_limit(self) -> float:
+        return float("inf")
+
+    @property
+    def safety_denominator_lcb_floor(self) -> float:
+        return 0.0
+
+    @property
+    def common_refresh_count(self) -> int:
+        return 0
+
+    @property
+    def common_full_block_equivalents(self) -> int:
+        return 0
+
+    @property
+    def num_layers(self) -> int:
+        return 0
+
+    @property
+    def mandatory_prefix(self) -> int:
+        return 0
+
+    @property
+    def max_taylor_gap(self) -> int:
+        return 0
+
+    @property
+    def manifest_hash(self) -> str:
+        payload = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "version_key": self.version_key,
+            "num_steps": self.num_steps,
+            "baseline_strategy_id": self.baseline_strategy_id,
+            "strategies": [s.to_dict() for s in self.strategies],
+            "source_groups": list(self.source_groups),
+        }
+
+    def save(self, path: str) -> None:
+        _atomic_json_write(Path(path), self.to_dict())
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "StrategyManifest":
+        return cls(
+            schema_version=int(value.get("schema_version", 0)),
+            version_key=str(value["version_key"]),
+            num_steps=int(value["num_steps"]),
+            baseline_strategy_id=str(value["baseline_strategy_id"]),
+            strategies=tuple(
+                AccelerationStrategy.from_dict(s)
+                for s in value["strategies"]
+            ),
+            source_groups=tuple(
+                str(g) for g in value.get("source_groups", [])),
+        )
+
+    @classmethod
+    def load(cls, path: str) -> "StrategyManifest":
+        with open(path, "r", encoding="utf-8") as handle:
+            return cls.from_dict(json.load(handle))
 
 
 @dataclass(frozen=True)
@@ -279,6 +524,11 @@ class TemplateAssignment:
         if self.sample_count < 0:
             raise ValueError("assignment sample_count must be non-negative")
 
+    @property
+    def strategy_id(self) -> str:
+        """Method-agnostic alias for template_id."""
+        return self.template_id
+
 
 @dataclass(frozen=True)
 class TemplateFeedback:
@@ -309,6 +559,11 @@ class TemplateFeedback:
             raise ValueError("sentinel labels must be finite and non-negative")
         if (self.h_step_numerator is None) != (self.h_step_denominator is None):
             raise ValueError("H-step numerator and denominator must be paired")
+
+    @property
+    def strategy_id(self) -> str:
+        """Method-agnostic alias for template_id."""
+        return self.template_id
 
     @property
     def bandit_loss(self) -> float:
@@ -520,16 +775,24 @@ class ConservativeTemplateBandit:
         self.run_identity = dict(run_identity or {})
         self.safety = TimestepSafetyTable(manifest)
         self._rng = np.random.default_rng(seed)
+
+        # Internal list of AccelerationStrategy objects (method-agnostic).
+        # Converted from templates for backward compat; for StrategyManifest
+        # the from_strategies classmethod sets this directly.
+        self._strategies: list[AccelerationStrategy] = [
+            t.to_strategy(manifest.num_steps) for t in manifest.templates
+        ]
+
         self._arm_stats = {
-            template.template_id: _ArmLossStats(
+            strategy.strategy_id: _ArmLossStats(
                 count=(baseline_prior_count
-                       if template.template_id == manifest.baseline_template_id
+                       if strategy.strategy_id == manifest.baseline_template_id
                        else 1),
                 mean=(0.0
-                      if template.template_id == manifest.baseline_template_id
+                      if strategy.strategy_id == manifest.baseline_template_id
                       else alternative_prior_penalty),
             )
-            for template in manifest.templates
+            for strategy in self._strategies
         }
         self._active: Optional[TemplateAssignment] = None
         self._pending_safety: list[Tuple[int, float, float]] = []
@@ -537,7 +800,56 @@ class ConservativeTemplateBandit:
         self.assignments: list[TemplateAssignment] = []
         self.feedback: list[TemplateFeedback] = []
 
-    def _eligible_templates(self) -> list[RefreshTemplate]:
+    @classmethod
+    def from_strategies(
+        cls, manifest: StrategyManifest, session_id: str,
+        epsilon: float = 0.1, seed: int = 0,
+        baseline_prior_count: int = 8,
+        alternative_prior_penalty: float = 0.25,
+        run_identity: Optional[Mapping[str, Any]] = None,
+    ) -> "ConservativeTemplateBandit":
+        """Create a bandit from a method-agnostic StrategyManifest.
+
+        Safety table is created but never queried — Theorem A (no
+        step-level safety) means observation is skipped at the runner
+        level for non-SpecA methods.
+        """
+        instance = cls.__new__(cls)
+        instance.manifest = manifest
+        instance.session_id = session_id
+        instance.epsilon = float(epsilon)
+        instance.seed = int(seed)
+        instance.run_identity = dict(run_identity or {})
+        instance.safety = TimestepSafetyTable(manifest)
+        instance._rng = np.random.default_rng(seed)
+        instance._strategies = list(manifest.strategies)
+        instance._arm_stats = {
+            s.strategy_id: _ArmLossStats(
+                count=(baseline_prior_count
+                       if s.strategy_id == manifest.baseline_strategy_id
+                       else 1),
+                mean=(0.0
+                      if s.strategy_id == manifest.baseline_strategy_id
+                      else alternative_prior_penalty),
+            )
+            for s in manifest.strategies
+        }
+        instance._active = None
+        instance._pending_safety = []
+        instance._completed_trajectories = set()
+        instance.assignments = []
+        instance.feedback = []
+        return instance
+
+    def _eligible_templates(self) -> list:
+        """Return arms eligible for selection.
+
+        For TemplateManifest (SpecA), this applies the safety gate.
+        For StrategyManifest (method-agnostic, e.g. TeaCache),
+        all strategies are eligible (no step-level safety).
+        """
+        if isinstance(self.manifest, StrategyManifest):
+            return list(self._strategies)
         baseline_id = self.manifest.baseline_template_id
         return [
             template for template in self.manifest.templates
@@ -619,23 +931,40 @@ class ConservativeTemplateBandit:
 
     @property
     def active_template(self) -> RefreshTemplate:
+        """Return the active arm as a RefreshTemplate (SpecA-only compat).
+
+        Raises ``RuntimeError`` if the active strategy is not SpecA.
+        """
+        return self.active_strategy.to_refresh_template()
+
+    @property
+    def active_strategy(self) -> AccelerationStrategy:
+        """Return the active arm as a method-agnostic AccelerationStrategy."""
         if self._active is None:
             raise RuntimeError("no trajectory is active")
-        return self.manifest.template_map[self._active.template_id]
+        strategy_id = self._active.template_id
+        if isinstance(self.manifest, StrategyManifest):
+            return self.manifest.strategy_map[strategy_id]
+        # TemplateManifest: look up from the internal _strategies list
+        for strategy in self._strategies:
+            if strategy.strategy_id == strategy_id:
+                return strategy
+        raise KeyError(f"active strategy {strategy_id} not found in _strategies")
 
     def summary(self) -> Dict[str, Any]:
+        if isinstance(self.manifest, StrategyManifest):
+            arm_ids = [s.strategy_id for s in self.manifest.strategies]
+        else:
+            arm_ids = [t.template_id for t in self.manifest.templates]
         assignment_counts = {
-            template.template_id: sum(
-                assignment.template_id == template.template_id
+            arm_id: sum(
+                assignment.template_id == arm_id
                 for assignment in self.assignments)
-            for template in self.manifest.templates
+            for arm_id in arm_ids
         }
-        return {
+        summary = {
             "session_id": self.session_id,
             "manifest_hash": self.manifest.manifest_hash,
-            "common_refresh_count": self.manifest.common_refresh_count,
-            "common_full_block_equivalents": (
-                self.manifest.common_full_block_equivalents),
             "assignments": len(self.assignments),
             "processed_samples": sum(
                 assignment.sample_count for assignment in self.assignments),
@@ -643,10 +972,17 @@ class ConservativeTemplateBandit:
             "delayed_feedback": len(self.feedback),
             "assignment_counts": assignment_counts,
             "arm_log1p_loss_mean": {
-                template_id: stats.mean
-                for template_id, stats in self._arm_stats.items()
+                arm_id: stats.mean
+                for arm_id, stats in self._arm_stats.items()
             },
         }
+        if not isinstance(self.manifest, StrategyManifest):
+            summary.update({
+                "common_refresh_count": self.manifest.common_refresh_count,
+                "common_full_block_equivalents": (
+                    self.manifest.common_full_block_equivalents),
+            })
+        return summary
 
     def state_dict(self) -> Dict[str, Any]:
         if self._active is not None:

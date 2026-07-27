@@ -11,6 +11,7 @@ from accelerators.covr_bandit import RefreshTemplate, TemplateManifest
 from main import parse_args, validate_args
 from models.dit import DiTTransformer2D
 from run_dit import (
+    _GenerationProfiler,
     _compute_generated_fid_is,
     _covr_canonical_json,
     _covr_full_rollout,
@@ -291,6 +292,35 @@ def test_online_accounting_separates_candidate_and_safety_cost():
     assert accounting["flops_safety_T"] == pytest.approx(1.5)
     assert accounting["flops_online_T"] == pytest.approx(4.5)
     assert accounting["flops_reduction_online"] == pytest.approx(0.625)
+
+
+def test_online_accounting_includes_terminal_and_control_cost():
+    accounting = _covr_online_accounting(
+        [6.0, 8.0], [1.0, 2.0], n_images=8, safety_full_steps=6,
+        candidate_flops_T=3.0, vanilla_flops_T=12.0,
+        full_step_flops=0.5e12,
+        terminal_wall_times=[0.5, 0.5], terminal_full_steps=2,
+        control_wall_times=[0.25, 0.25],
+    )
+    assert accounting["wall_s_candidate_total"] == pytest.approx(9.5)
+    assert accounting["wall_s_terminal_total"] == pytest.approx(1.0)
+    assert accounting["wall_s_control_total"] == pytest.approx(0.5)
+    assert accounting["speed_online_img_per_s"] == pytest.approx(8.0 / 14.0)
+    assert accounting["flops_terminal_T"] == pytest.approx(0.5)
+    assert accounting["flops_online_T"] == pytest.approx(5.0)
+
+
+def test_generation_profiler_cpu_collects_nested_stages_without_sync():
+    profiler = _GenerationProfiler("cpu", detailed=True)
+    generation = profiler.start_gpu("generation_online", required=True)
+    safety = profiler.start_gpu("safety_shadow_full", required=True)
+    profiler.stop_gpu(safety)
+    profiler.stop_gpu(generation)
+
+    assert profiler.synchronize() == 0.0
+    summary = profiler.summary()
+    assert summary["generation_online"] >= summary["safety_shadow_full"]
+    assert "cuda_sync_calls" not in summary
 
 
 def test_forced_template_loader_validates_version_and_id(tmp_path):

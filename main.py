@@ -146,6 +146,13 @@ Examples:
                         help="Equal-FLOPs COVR template manifest")
     parser.add_argument("--covr-force-template-id", type=str, default=None,
                         help="Evaluate one manifest template without bandit state")
+    # Method-agnostic COVR strategy-bandit (replaces template-bandit for non-SpecA)
+    parser.add_argument("--covr-strategy-manifest", type=str, default=None,
+                        help="Method-agnostic strategy manifest (works with any accelerator)")
+    parser.add_argument("--covr-strategy-bandit", action="store_true", default=False,
+                        help="Select one strategy per trajectory (method-agnostic)")
+    parser.add_argument("--covr-force-strategy-id", type=str, default=None,
+                        help="Evaluate one manifest strategy without bandit state")
     parser.add_argument("--covr-bandit-state", type=str, default=None,
                         help="Explicit COVR template-bandit state to resume/save")
     parser.add_argument("--covr-bandit-epsilon", type=float, default=0.1,
@@ -157,6 +164,8 @@ Examples:
     parser.add_argument("--covr-sentinel-horizon", type=int, default=0,
                         help="Delayed sentinel horizon in denoising steps; 0 uses "
                              "a terminal full-reference rollout")
+    parser.add_argument("--covr-profile-stages", action="store_true", default=False,
+                        help="Record per-stage generation timings with CUDA events")
     # ---- TTT (Test-Time Training plugin, DiT-only) ----
     parser.add_argument("--ttt", action="store_true", default=False,
                         help="Enable online TTT plugin on top of TeaCache "
@@ -360,6 +369,80 @@ def validate_args(args):
             return False
         if args.compute_controller != "none" or suffix_blocks or suffix_budget:
             print("[ERROR] --covr-force-template-id cannot use a compute "
+                  "controller or suffix recompute.")
+            return False
+
+    # Map old CLI args to new ones (backward compat + FutureWarning).
+    if args.covr_strategy_manifest is not None:
+        pass  # new-school, nothing to map
+    elif args.covr_template_manifest is not None:
+        import warnings as _w
+        _w.warn(
+            "--covr-template-manifest is deprecated; use --covr-strategy-manifest",
+            FutureWarning, stacklevel=2,
+        )
+    if args.covr_strategy_bandit:
+        pass  # new-school
+    elif args.covr_template_bandit:
+        import warnings as _w
+        _w.warn(
+            "--covr-template-bandit is deprecated; use --covr-strategy-bandit",
+            FutureWarning, stacklevel=2,
+        )
+    if args.covr_force_strategy_id is not None:
+        pass
+    elif args.covr_force_template_id is not None:
+        import warnings as _w
+        _w.warn(
+            "--covr-force-template-id is deprecated; use --covr-force-strategy-id",
+            FutureWarning, stacklevel=2,
+        )
+
+    # Method-agnostic COVR strategy-bandit (no model/method restriction).
+    if args.covr_strategy_bandit or args.covr_strategy_manifest:
+        if args.covr_strategy_bandit and not args.covr_strategy_manifest:
+            print("[ERROR] --covr-strategy-manifest is required with "
+                  "--covr-strategy-bandit.")
+            return False
+        if (not args.covr_strategy_bandit
+                and args.covr_strategy_manifest
+                and not args.covr_force_strategy_id):
+            print("[ERROR] --covr-strategy-manifest requires "
+                  "--covr-strategy-bandit or --covr-force-strategy-id.")
+            return False
+        if args.covr_shadow:
+            print("[ERROR] --covr-strategy-bandit cannot be combined with COVR shadow.")
+            return False
+        if args.compute_controller != "none" or suffix_blocks or suffix_budget:
+            print("[ERROR] --covr-strategy-bandit cannot use a compute controller "
+                  "or suffix recompute.")
+            return False
+        for name in ("covr_bandit_epsilon", "covr_safety_sample_rate",
+                     "covr_sentinel_rate"):
+            value = float(getattr(args, name))
+            if not 0.0 <= value <= 1.0:
+                print(f"[ERROR] --{name.replace('_', '-')} must be in [0, 1].")
+                return False
+        if args.covr_sentinel_horizon < 0 or args.covr_sentinel_horizon > args.num_steps:
+            print("[ERROR] --covr-sentinel-horizon must be between 0 and "
+                  "--num-steps.")
+            return False
+
+    if args.covr_force_strategy_id is not None:
+        if not args.covr_strategy_manifest:
+            print("[ERROR] --covr-strategy-manifest is required with "
+                  "--covr-force-strategy-id.")
+            return False
+        if args.covr_strategy_bandit:
+            print("[ERROR] --covr-force-strategy-id cannot be combined with "
+                  "--covr-strategy-bandit.")
+            return False
+        if args.covr_shadow:
+            print("[ERROR] --covr-force-strategy-id cannot be combined with "
+                  "COVR shadow.")
+            return False
+        if args.compute_controller != "none" or suffix_blocks or suffix_budget:
+            print("[ERROR] --covr-force-strategy-id cannot use a compute "
                   "controller or suffix recompute.")
             return False
 

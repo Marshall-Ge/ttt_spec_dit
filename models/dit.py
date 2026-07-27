@@ -420,8 +420,14 @@ class DiTTransformer2D(nn.Module):
                     taylor_hidden = hidden_states
                     if compute_action == ComputeAction.RECOMPUTE:
                         cache_dic.recompute_full_blocks += 1
+                        probe_stage = "speca_recompute_full_block"
                     else:
                         cache_dic.probe_full_blocks += 1
+                        probe_stage = "speca_probe_full_block"
+                    profiler = current.profiler
+                    probe_token = (
+                        profiler.start_gpu(probe_stage)
+                        if profiler is not None else None)
                     fnh, fgate_msa, fshift_mlp, fscale_mlp, fgate_mlp = block.norm1(
                         full_hidden, timestep=timestep, class_labels=class_labels,
                         hidden_dtype=full_hidden.dtype,
@@ -429,6 +435,8 @@ class DiTTransformer2D(nn.Module):
                     full_hidden = _compute_dit_block_from_norm(
                         block, full_hidden, fnh, fgate_msa,
                         fshift_mlp, fscale_mlp, fgate_mlp)
+                    if profiler is not None:
+                        profiler.stop_gpu(probe_token)
 
                     gate_value, _ = compute_error_gate(
                         hidden_states, full_hidden,

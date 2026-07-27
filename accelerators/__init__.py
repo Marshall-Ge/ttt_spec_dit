@@ -42,9 +42,11 @@ from .covr import (
     transition_defects,
 )
 from .covr_bandit import (
+    AccelerationStrategy,
     BANDIT_SCHEMA_VERSION,
     ConservativeTemplateBandit,
     RefreshTemplate,
+    StrategyManifest,
     TemplateAssignment,
     TemplateFeedback,
     TemplateManifest,
@@ -64,6 +66,10 @@ from .speca import (
     cache_step_dit,
     cache_step_pixart,
     compute_error_gate,
+)
+from .strategy_dispatch import (
+    apply_strategy,
+    strategy_from_refresh_template,
 )
 from .teacache import (
     teacache_init,
