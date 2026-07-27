@@ -142,7 +142,6 @@ def _collect_defect_pairs(
         latent_input = scheduler.scale_model_input(x_t, t_tensor)
 
         if current.type == 'full':
-            # Full step: run with speca state to populate cache
             noise_pred = transformer.forward_with_cfg(
                 latent_input, t_batch,
                 current=current, cache_dic=cache_dic,
