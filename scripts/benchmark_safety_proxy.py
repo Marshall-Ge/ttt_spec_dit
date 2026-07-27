@@ -134,7 +134,6 @@ def _collect_defect_pairs(
 
     x_t = latents
     for step_idx in range(len(timesteps)):
-        t_val = scheduler._host_timestep_values[step_idx]
         t_tensor = timesteps[step_idx]
         t_batch = t_tensor.expand(x_t.shape[0])
 
@@ -142,24 +141,19 @@ def _collect_defect_pairs(
         speca_cal_type(cache_dic, current)
         latent_input = scheduler.scale_model_input(x_t, t_tensor)
 
-        if current.type == 'full' or rng.random() >= safety_rate:
-            # Either a full step or not sampled — just run normally
-            noise_pred = _covr_shadow_full(
-                transformer, latent_input, t_batch, class_labels,
-                guidance_scale)
+        if current.type == 'full':
+            # Full step: run with speca state to populate cache
+            noise_pred = transformer.forward_with_cfg(
+                latent_input, t_batch,
+                current=current, cache_dic=cache_dic,
+                class_labels=class_labels, cfg_scale=guidance_scale,
+            )
             x_t = scheduler.step(
                 noise_pred[:, :in_channels], t_tensor, x_t,
                 return_dict=False)[0]
             continue
 
-        # ---- sampled Taylor step: collect full + proxy defects ----
-        # full shadow
-        full_noise = _covr_shadow_full(
-            transformer, latent_input, t_batch, class_labels,
-            guidance_scale)
-        full_noise = full_noise[:, :in_channels]
-
-        # candidate (run through SpecA with Taylor)
+        # Taylor step: always run candidate through speca to maintain cache
         candidate_noise = transformer.forward_with_cfg(
             latent_input, t_batch,
             current=current, cache_dic=cache_dic,
@@ -167,22 +161,28 @@ def _collect_defect_pairs(
         )
         candidate_noise = candidate_noise[:, :in_channels]
 
-        # proxy at each depth
-        for depth in proxy_depths:
-            proxy_noise = _shallow_proxy_forward(
-                transformer, latent_input, t_batch, class_labels, depth)
+        # Always compute full shadow for stepping (ground truth)
+        full_noise = _covr_shadow_full(
+            transformer, latent_input, t_batch, class_labels,
+            guidance_scale)
+        full_noise = full_noise[:, :in_channels]
 
-            # defect = ||candidate - X|| / ||X - x_t||
-            proxy_num, proxy_den = _covr_transition_components(
-                candidate_noise, proxy_noise, x_t)
-            full_num, full_den = _covr_transition_components(
-                candidate_noise, full_noise, x_t)
+        if rng.random() < safety_rate:
+            # ---- sampled: collect proxy vs full defect pairs ----
+            for depth in proxy_depths:
+                proxy_noise = _shallow_proxy_forward(
+                    transformer, latent_input, t_batch, class_labels, depth)
 
-            proxy_defect = (proxy_num / (proxy_den + 1e-8)).mean().item()
-            full_defect = (full_num / (full_den + 1e-8)).mean().item()
-            pairs[depth].append((proxy_defect, full_defect))
+                proxy_num, proxy_den = _covr_transition_components(
+                    candidate_noise, proxy_noise, x_t)
+                full_num, full_den = _covr_transition_components(
+                    candidate_noise, full_noise, x_t)
 
-        # step with the full noise (safety uses full, not candidate)
+                proxy_defect = (proxy_num / (proxy_den + 1e-8)).mean().item()
+                full_defect = (full_num / (full_den + 1e-8)).mean().item()
+                pairs[depth].append((proxy_defect, full_defect))
+
+        # Step with full noise (safety: ground truth, not candidate)
         x_t = scheduler.step(
             full_noise, t_tensor, x_t, return_dict=False)[0]
 
