@@ -11,7 +11,7 @@ import torch
 from config import DIT_REPO
 from models.dit import DiTTransformer2D
 from run_dit import _cache_scheduler_timestep_values
-from accelerators.speca import speca_init, speca_cal_type
+from accelerators.speca import speca_init
 
 def main():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -54,9 +54,8 @@ def main():
 
     # ---- step 0: force 'full' ----
     current.step = 49
-    speca_cal_type(cache_dic, current)
-    assert current.type == 'full', f"Expected full, got {current.type!r}"
-    print(f"  step 0: type={current.type!r}, activated_steps={current.activated_steps}")
+    # speca_cal_type is called internally by forward_with_cfg — do NOT call it here
+    print(f"  step 0: current.step={current.step}, activated_steps={current.activated_steps}")
 
     t0 = scheduler.timesteps[0]
     t_batch = t0.expand(latents.shape[0])
@@ -72,6 +71,9 @@ def main():
             current=current, cache_dic=cache_dic,
             class_labels=labels, cfg_scale=4.5,
         )
+
+    print(f"  after forward: type={current.type!r}")
+    assert current.type == 'full', f"Expected full after forward, got {current.type!r}"
 
     # Check cache state AFTER forward
     missing = []

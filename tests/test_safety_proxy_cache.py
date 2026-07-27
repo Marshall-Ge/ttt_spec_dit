@@ -14,7 +14,7 @@ import numpy as np
 from config import DIT_REPO
 from models.dit import DiTTransformer2D
 from run_dit import _covr_shadow_full, _cache_scheduler_timestep_values
-from accelerators.speca import speca_init, speca_cal_type
+from accelerators.speca import speca_init
 
 
 def main():
@@ -67,10 +67,9 @@ def main():
 
     # ---- Step 0: must be 'full' ----
     current.step = num_steps - 1  # 49
-    speca_cal_type(cache_dic, current)
-    print(f"Step 0 after cal_type: type={current.type}, "
+    # speca_cal_type is called internally by forward_with_cfg — do NOT call it here
+    print(f"Step 0 before forward: type={current.type}, "
           f"activated_steps={current.activated_steps}")
-    assert current.type == 'full', f"Expected 'full', got {current.type!r}"
 
     t_tensor = scheduler.timesteps[0]
     t_batch = t_tensor.expand(latents.shape[0])
@@ -83,6 +82,8 @@ def main():
             current=current, cache_dic=cache_dic,
             class_labels=class_labels, cfg_scale=4.5,
         )
+    print(f"  After forward: type={current.type}")
+    assert current.type == 'full', f"Expected 'full', got {current.type!r}"
     print(f"  noise_pred shape: {noise_pred.shape}")
 
     # Verify cache was populated for all layers
@@ -102,8 +103,8 @@ def main():
 
     # ---- Step 1: Taylor ----
     current.step = num_steps - 2  # 48
-    speca_cal_type(cache_dic, current)
-    print(f"Step 1 after cal_type: type={current.type}, "
+    # speca_cal_type is called internally by forward_with_cfg — do NOT call it here
+    print(f"Step 1 before forward: type={current.type}, "
           f"activated_steps={current.activated_steps}")
 
     t_tensor = scheduler.timesteps[1]
@@ -117,13 +118,14 @@ def main():
             transformer, latent_input, t_batch, class_labels, 4.5)
 
     # Run candidate through speca (Taylor)
-    print(f"  Running Taylor candidate (type={current.type})...")
+    print(f"  Running Taylor candidate...")
     with torch.no_grad():
         candidate_noise = transformer.forward_with_cfg(
             latent_input, t_batch,
             current=current, cache_dic=cache_dic,
             class_labels=class_labels, cfg_scale=4.5,
         )
+    print(f"  After forward: type={current.type}")
     print(f"  candidate_noise shape: {candidate_noise.shape}")
     print("  Taylor step succeeded ✓")
 
