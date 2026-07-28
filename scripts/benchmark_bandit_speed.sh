@@ -251,7 +251,9 @@ for key, (dirname, label) in experiments.items():
         print(f"  [{key}] {label}: MISSING (no results.json)")
         continue
     with open(rpath) as f:
-        data = json.load(f)
+        raw = json.load(f)
+    # results.json is {"aggregate": {...}, "config": {...}}
+    data = raw.get("aggregate", raw)
     results[key] = data
 
 if not results:
@@ -270,12 +272,12 @@ for key in "ABCD":
     data = results[key]
     label = experiments[key][1]
 
-    # Speed: try multiple locations
-    overall_speed = data.get("speed_img_per_s", 0)
+    # Speed
+    overall_speed = data.get("speed_img_per_s", data.get("speed_online_img_per_s", 0))
     candidate_speed = data.get("speed_candidate_img_per_s", overall_speed)
 
     # FLOPs
-    flops_T = data.get("flops_accel_T", data.get("flops_candidate_T", 0))
+    flops_T = data.get("flops_candidate_T", data.get("flops_accel_T", 0))
 
     # Safety wall time
     safety_total = data.get("wall_s_safety_total", 0)
