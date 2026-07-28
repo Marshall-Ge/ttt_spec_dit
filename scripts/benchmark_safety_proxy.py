@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
-"""Benchmark shallow DiT proxy vs full model for safety shadow defect estimation.
+"""Benchmark SpecA check_layer error as a proxy for COVR safety defect.
 
-Runs full-model safety shadows on N trajectories and, for each sampled step,
-computes:
+On each Taylor step with a check_layer probe, collects:
 
-  full_defect = ||candidate - full|| / ||full - x_t||
-  proxy_K_defect = ||candidate_proxy - proxy_K|| / ||proxy_K - x_t||
+  proxy  = current.last_layer_error  (cosine-sim error at check_layer, free)
+  defect = ||candidate - full|| / ||full - x_t||  (full shadow, expensive)
 
-where proxy_K runs only the first K transformer blocks (vanilla, no
-SpecA/TeaCache) before the tail projection.  Reports Spearman rank
-correlation per proxy depth.
+Reports Spearman rank correlation to determine whether the already-computed
+SpecA error signal can replace the expensive safety shadow.
 
 Usage:
-  python scripts/benchmark_safety_proxy.py --n-prompts 16 --proxy-depths 2,4,8
+  python scripts/benchmark_safety_proxy.py --n-prompts 16
 """
 
 import argparse
 import os
 import sys
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
 import torch
@@ -50,60 +48,6 @@ def _spearmanr(x, y):
     return float(num / den), 1.0
 
 
-def _shallow_proxy_forward(
-    transformer: DiTTransformer2D,
-    hidden_states: torch.Tensor,
-    timestep: torch.Tensor,
-    class_labels: torch.Tensor,
-    num_blocks: int,
-) -> torch.Tensor:
-    """Run only the first *num_blocks* blocks, then the normal tail.
-
-    Returns the per-sample noise prediction tensor (same shape as full forward).
-    """
-    B, C, H, W = hidden_states.shape
-    device = hidden_states.device
-    dtype = hidden_states.dtype
-
-    # pos_embed
-    height = H // transformer.patch_size
-    width = W // transformer.patch_size
-    hidden_states = transformer.pos_embed(hidden_states)
-
-    # first num_blocks (vanilla — no SpecA/TeaCache)
-    for layer_idx, block in enumerate(transformer.transformer_blocks[:num_blocks]):
-        norm_hidden, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.norm1(
-            hidden_states, timestep=timestep, class_labels=class_labels,
-            hidden_dtype=dtype,
-        )
-        attn_out = block.attn1(norm_hidden)
-        hidden_states = hidden_states + gate_msa.unsqueeze(1) * attn_out
-
-        norm_ff = block.norm3(hidden_states)
-        modulated_ff = norm_ff * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
-        ff_out = block.ff(modulated_ff)
-        hidden_states = hidden_states + gate_mlp.unsqueeze(1) * ff_out
-
-    # tail (same as full model)
-    conditioning = transformer.transformer_blocks[0].norm1.emb(
-        timestep, class_labels, hidden_dtype=dtype)
-    shift, scale = transformer.proj_out_1(
-        torch.nn.functional.silu(conditioning)).chunk(2, dim=1)
-    hidden_states = transformer.norm_out(
-        hidden_states) * (1 + scale[:, None]) + shift[:, None]
-    hidden_states = transformer.proj_out_2(hidden_states)
-
-    # unpatchify
-    hidden_states = hidden_states.reshape(
-        shape=(-1, height, width, transformer.patch_size,
-               transformer.patch_size, transformer.out_channels))
-    hidden_states = torch.einsum("nhwpqc->nchpwq", hidden_states)
-    output = hidden_states.reshape(
-        shape=(-1, transformer.out_channels, height * transformer.patch_size,
-               width * transformer.patch_size))
-    return output[:, :transformer.config.in_channels]
-
-
 def _collect_defect_pairs(
     transformer,
     scheduler,
@@ -113,23 +57,19 @@ def _collect_defect_pairs(
     guidance_scale,
     cache_dic,
     current,
-    proxy_depths,
-    safety_rate: float = 0.25,
+    safety_rate: float = 1.0,
     rng: np.random.Generator = None,
-) -> Dict[int, List[Tuple[float, float]]]:
-    """Run one full denoising trajectory and collect proxy vs full defect pairs.
+) -> List[Tuple[float, float]]:
+    """Run one full denoising trajectory, collect (speca_error, full_defect) pairs.
 
-    On randomly sampled steps, runs:
-      - full model forward (safety shadow)
-      - shallow proxy forward at each depth
-      - candidate (SpecA Taylor) output
-
-    Returns: {depth: [(proxy_defect, full_defect), ...]}
+    On Taylor steps where check_layer was probed, records:
+      - current.last_layer_error (the SpecA cosine-sim error at check_layer)
+      - full defect = ||candidate - full|| / ||full - x_t||
     """
     if rng is None:
         rng = np.random.default_rng()
     in_channels = transformer.config.in_channels
-    pairs: Dict[int, List[Tuple[float, float]]] = {d: [] for d in proxy_depths}
+    pairs: List[Tuple[float, float]] = []
 
     x_t = latents
     for step_idx in range(len(timesteps)):
@@ -139,7 +79,6 @@ def _collect_defect_pairs(
         current.step = len(timesteps) - 1 - step_idx
         latent_input = scheduler.scale_model_input(x_t, t_tensor)
 
-        # Run speca forward (forward_with_cfg calls speca_cal_type internally)
         noise_pred = transformer.forward_with_cfg(
             latent_input, t_batch,
             current=current, cache_dic=cache_dic,
@@ -147,34 +86,26 @@ def _collect_defect_pairs(
         )
 
         if current.type == 'full':
-            # Full step: use speca output directly
             x_t = scheduler.step(
                 noise_pred[:, :in_channels], t_tensor, x_t,
                 return_dict=False)[0]
             continue
 
-        # Taylor step: speca produced candidate; compute full shadow
+        # Taylor step: compute full shadow for ground-truth defect
         candidate_noise = noise_pred[:, :in_channels]
         full_noise = _covr_shadow_full(
             transformer, latent_input, t_batch, class_labels,
             guidance_scale)
         full_noise_sliced = full_noise[:, :in_channels]
 
-        if rng.random() < safety_rate:
-            for depth in proxy_depths:
-                proxy_noise = _shallow_proxy_forward(
-                    transformer, latent_input, t_batch, class_labels, depth)
+        # Collect when check_layer was probed and error is fresh
+        if (cache_dic.check and current.last_layer_error is not None
+                and rng.random() < safety_rate):
+            num, den = _covr_transition_components(
+                candidate_noise, full_noise_sliced, x_t)
+            defect = (num / (den + 1e-8)).mean().item()
+            pairs.append((current.last_layer_error, defect))
 
-                proxy_num, proxy_den = _covr_transition_components(
-                    candidate_noise, proxy_noise, x_t)
-                full_num, full_den = _covr_transition_components(
-                    candidate_noise, full_noise_sliced, x_t)
-
-                proxy_defect = (proxy_num / (proxy_den + 1e-8)).mean().item()
-                full_defect = (full_num / (full_den + 1e-8)).mean().item()
-                pairs[depth].append((proxy_defect, full_defect))
-
-        # Safety: step with full noise (ground truth)
         x_t = scheduler.step(
             full_noise_sliced, t_tensor, x_t, return_dict=False)[0]
 
@@ -183,17 +114,15 @@ def _collect_defect_pairs(
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Benchmark shallow proxy defect correlation")
+        description="Benchmark SpecA check_layer error as safety defect proxy")
     p.add_argument("--n-prompts", type=int, default=16,
                    help="Number of images to run (default: 16)")
     p.add_argument("--num-steps", type=int, default=50)
     p.add_argument("--guidance-scale", type=float, default=4.5)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--batch-size", type=int, default=4)
-    p.add_argument("--safety-rate", type=float, default=0.25,
-                   help="Fraction of Taylor steps to sample (default: 0.25)")
-    p.add_argument("--proxy-depths", type=str, default="2,4,6,8",
-                   help="Comma-separated block counts for proxy")
+    p.add_argument("--safety-rate", type=float, default=1.0,
+                   help="Fraction of probed Taylor steps to sample (default: 1.0)")
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--dtype", type=str, default="fp16",
                    choices=["fp16", "fp32"])
@@ -202,13 +131,11 @@ def parse_args():
 
 def main():
     args = parse_args()
-    proxy_depths = [int(d.strip()) for d in args.proxy_depths.split(",")]
     rng = np.random.default_rng(args.seed)
     device = torch.device(args.device)
     compute_dtype = torch.float16 if args.dtype == "fp16" else torch.float32
 
     print(f"Device: {device}, dtype: {args.dtype}")
-    print(f"Proxy depths: {proxy_depths}")
     print(f"Prompts: {args.n_prompts}, steps: {args.num_steps}")
     print(f"Safety sample rate: {args.safety_rate}")
 
@@ -234,9 +161,7 @@ def main():
     timesteps = scheduler.timesteps
     _cache_scheduler_timestep_values(scheduler)
 
-    # Accumulator
-    all_pairs: Dict[int, List[Tuple[float, float]]] = {
-        d: [] for d in proxy_depths}
+    all_pairs: List[Tuple[float, float]] = []
 
     n_batches = (args.n_prompts + args.batch_size - 1) // args.batch_size
     for batch_idx in tqdm(range(n_batches), desc="batches"):
@@ -249,21 +174,18 @@ def main():
             [item[2] for item in batch_items], device=device, dtype=torch.long)
         seeds = [args.seed * 1000 + i for i in range(start, end)]
 
-        # Init latents
         latents = torch.randn(
             (actual_bs, transformer.config.in_channels,
              transformer.config.sample_size // 8,
              transformer.config.sample_size // 8),
             generator=torch.Generator(device=device).manual_seed(
                 seeds[0]), device=device, dtype=compute_dtype)
-        # CFG doubling: [cond, uncond] for latents and [cond, null] for labels
         latents = torch.cat([latents, latents], dim=0)
         null_class = transformer.config.num_embeds_ada_norm
         null_labels = torch.full((actual_bs,), null_class,
                                  device=device, dtype=torch.long)
         class_labels = torch.cat([class_labels, null_labels], dim=0)
 
-        # SpecA init (adaptive)
         cache_dic, current = speca_init(
             num_steps=args.num_steps,
             num_layers=len(transformer.transformer_blocks),
@@ -275,28 +197,37 @@ def main():
         pairs = _collect_defect_pairs(
             transformer, scheduler, timesteps, latents, class_labels,
             args.guidance_scale, cache_dic, current,
-            proxy_depths, safety_rate=args.safety_rate, rng=rng)
+            safety_rate=args.safety_rate, rng=rng)
 
-        for depth, samples in pairs.items():
-            all_pairs[depth].extend(samples)
+        all_pairs.extend(pairs)
 
     # Report
-    print("\n===== Proxy Defect Correlation =====")
-    print(f"{'Depth':>6}  {'samples':>8}  {'Spearman r':>12}  {'p-value':>10}")
-    print("-" * 44)
-    for depth in proxy_depths:
-        samples = all_pairs[depth]
-        if len(samples) < 10:
-            print(f"{depth:>6}  {len(samples):>8}  {'(too few)':>12}")
-            continue
-        proxy_vals = [p for p, _ in samples]
-        full_vals = [f for _, f in samples]
-        r, pval = _spearmanr(proxy_vals, full_vals)
-        flag = " ***" if r > 0.9 else "  !!" if r < 0.7 else ""
-        print(f"{depth:>6}  {len(samples):>8}  {r:>12.4f}  {pval:>10.2e}{flag}")
+    print(f"\n===== SpecA Error vs Safety Defect =====")
+    print(f"Samples: {len(all_pairs)}")
+    if len(all_pairs) < 10:
+        print("(too few samples for correlation)")
+        return
 
-    print("\n*** r > 0.9 = strong proxy candidate")
-    print("!! r < 0.7 = insufficient correlation")
+    proxy_vals = [p for p, _ in all_pairs]
+    defect_vals = [d for _, d in all_pairs]
+    r, _ = _spearmanr(proxy_vals, defect_vals)
+
+    # Also try Pearson (linear correlation)
+    proxy_arr = np.array(proxy_vals)
+    defect_arr = np.array(defect_vals)
+    pearson = float(np.corrcoef(proxy_arr, defect_arr)[0, 1])
+
+    print(f"{'Spearman r':>16}: {r:+.4f}")
+    print(f"{'Pearson r':>16}: {pearson:+.4f}")
+    print(f"{'Proxy range':>16}: [{proxy_arr.min():.4f}, {proxy_arr.max():.4f}]")
+    print(f"{'Defect range':>16}: [{defect_arr.min():.4f}, {defect_arr.max():.4f}]")
+
+    if r > 0.9:
+        print("\n*** r > 0.9 — SpecA error is a strong safety proxy!")
+    elif r > 0.7:
+        print("\n**  r > 0.7 — moderate correlation, may be usable with calibration")
+    else:
+        print("\n!! r < 0.7 — insufficient correlation")
 
 
 if __name__ == "__main__":
