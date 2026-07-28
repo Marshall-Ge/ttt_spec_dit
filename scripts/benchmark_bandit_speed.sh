@@ -30,8 +30,8 @@ cd "${ROOT_DIR}"
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${ROOT_DIR}/output/bandit_speed_diag/${RUN_ID}}"
 
-# Manifest (defaults to tmp/manifest.json in project root)
-MANIFEST="${MANIFEST:-${ROOT_DIR}/tmp/manifest.json}"
+# Manifest (defaults to /tmp/manifest.json)
+MANIFEST="${MANIFEST:-/tmp/manifest.json}"
 
 # ---- Background launch logic ----
 # If not already the worker and FOREGROUND!=1, re-exec self via nohup
