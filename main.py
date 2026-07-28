@@ -159,7 +159,7 @@ Examples:
                         help="Template-bandit exploration probability")
     parser.add_argument("--covr-safety-sample-rate", type=float, default=0.1,
                         help="Action-independent one-step safety audit rate")
-    parser.add_argument("--covr-safety-chain-threshold", type=int, default=0,
+    parser.add_argument("--covr-safety-chain-threshold", type=int, default=5,
                         help="Skip safety shadow when consecutive Taylor steps "
                              "<= N (0=disabled). Short chains have lower defect, "
                              "so shadow can be skipped without hurting bandit learning.")
