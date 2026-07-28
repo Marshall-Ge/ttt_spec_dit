@@ -343,7 +343,52 @@ reward 从 H-step defect 切换到 terminal fidelity 后，损失尺度和含义
 6. 评估多目标 reward 或 Pareto 选择，避免只优化 FID 而牺牲 IS 和速度。
 7. TaylorSeer 只有在明确其初始化和运行时控制接口后再接入 dispatcher，不应先添加空实现。
 
-## 12. 数据完整性说明
+## 12. 50k No-CFG 实验结果 (2026-07-28)
+
+> guidance_scale=1.0, DiT-2-256, 50 steps, seed=42, 50,000 张全量评估  
+> COVR Bandit 速度优化配置：safety_sample_rate=0, sentinel_rate=0.02, chain_threshold=5
+
+### 12.1 三组对比
+
+| 方法 | FID ↓ | IS ↑ | FLOPs(T) | img/s | cand img/s | skip% |
+|---|---:|---:|---:|---:|---:|---:|
+| Baseline | 7.28 | 121.8 | 11.867 | 7.47 | 7.47 | — |
+| Adaptive SpecA | 8.04 | 118.9 | 3.089 | 14.45 | 14.45 | 75.8% |
+| COVR Bandit | 8.22 | 117.4 | 2.849 | 14.95 | 15.08 | 76.0% |
+
+### 12.2 Stage Profiling (COVR Bandit)
+
+| Stage | 时间(s) |
+|---|---:|
+| generation_online | 3318.2 |
+| denoise_loop | 2903.1 |
+| image_save_metrics | 1696.0 |
+| speca_full | 1578.4 |
+| speca_taylor | 1276.4 |
+| vae_decode | 412.5 |
+| cuda_sync_wait | 405.6 |
+| bandit_state_persist | 24.4 |
+
+COVR overhead: safety=0.0s, terminal=2.6s, control=26.9s
+
+### 12.3 与 CFG=4.5 实验的关键对比
+
+| 维度 | CFG=4.5 (§5) | No-CFG (§12) |
+|---|---|---|
+| Bandit vs Baseline FID | -7.27 (显著更好) | +0.94 (略差) |
+| Bandit vs SpecA 速度 | 4.78 vs 8.58 img/s (慢55%) | 15.08 vs 14.45 img/s (快4.4%) |
+| IS 退化 | 452→353 (暴跌22%) | 121.8→117.4 (仅-3.6%) |
+| Safety overhead | 0.87T (22% online FLOPs) | 0.0s (完全消除) |
+
+### 12.4 结论
+
+1. **速度优化有效**：消除 safety shadow 后，Bandit candidate 15.08 img/s 确实快于 Adaptive SpecA 14.45 img/s（+4.4%），确认之前瓶颈诊断结论。
+2. **无 CFG 下 Bandit FID 优势消失**：CFG=4.5 时 Bandit FID 改善 7.3 点，但 no-CFG 时反而略差 0.94 点。说明 Bandit 的 FID 优势依赖 CFG 放大效应。
+3. **IS 退化在无 CFG 下可忽略**：无 CFG 条件下三组 IS 差异仅 ~3.6%，不像 CFG 实验那样出现 22% 暴跌。
+4. **无 CFG 下 Bandit 的收益主要是速度**（+4.4%）和略低的 FLOPs（2.849T vs 3.089T），FID/IS 几乎持平。
+5. **需要在 CFG=4.5 条件下重新验证速度优化配置**，确认消除 safety 后是否仍保持 FID 优势。
+
+## 13. 数据完整性说明
 
 本记录保存的是当前已经得到并在讨论中确认的汇总数据。原始逐样本图像、完整 JSONL audit、manifest 和 bandit state 仍以实验输出目录/归档为准；如果重新运行实验，应在结果目录中同时保留：
 
