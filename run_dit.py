@@ -706,6 +706,7 @@ class DiTGenerator:
                  covr_sample_ids: Optional[List[str]] = None,
                  covr_bandit: Optional[ConservativeTemplateBandit] = None,
                  covr_safety_sample_rate: float = 0.0,
+                 covr_safety_chain_threshold: int = 0,
                  covr_sentinel_start_idx: Optional[int] = None,
                  covr_sentinel_horizon: int = 0,
                  covr_feedback_sink: Optional[Dict[str, Any]] = None,
@@ -770,6 +771,7 @@ class DiTGenerator:
             covr_sample_ids=covr_sample_ids,
             covr_bandit=covr_bandit,
             covr_safety_sample_rate=covr_safety_sample_rate,
+            covr_safety_chain_threshold=covr_safety_chain_threshold,
             covr_sentinel_start_idx=covr_sentinel_start_idx,
             covr_sentinel_horizon=covr_sentinel_horizon,
             covr_feedback_sink=covr_feedback_sink,
@@ -810,6 +812,7 @@ class DiTGenerator:
                        covr_sample_ids: Optional[List[str]] = None,
                        covr_bandit: Optional[ConservativeTemplateBandit] = None,
                        covr_safety_sample_rate: float = 0.0,
+                       covr_safety_chain_threshold: int = 0,
                        covr_sentinel_start_idx: Optional[int] = None,
                        covr_sentinel_horizon: int = 0,
                        covr_feedback_sink: Optional[Dict[str, Any]] = None,
@@ -1031,9 +1034,18 @@ class DiTGenerator:
                 )
                 covr_recorder.record(event)
 
+            # Safety shadow gate: skip when Taylor chain is short.
+            # Benchmark shows defect correlates with chain length (r=+0.63);
+            # first N steps after each full step have low defect → skip shadow.
+            _skip_safety_shadow = (
+                covr_safety_chain_threshold > 0
+                and cache_dic.taylor_step_counter <= covr_safety_chain_threshold
+            )
+
             if (covr_bandit is not None and method == "speca"
                     and current is not None and cache_dic is not None
                     and current.type == "Taylor"
+                    and not _skip_safety_shadow
                     and _covr_hash_sample(
                         covr_bandit.session_id, covr_trajectory_id, step_idx,
                         covr_safety_sample_rate, "safety")):
@@ -1960,6 +1972,9 @@ def run_c2i(args) -> Dict:
                 covr_safety_sample_rate=(
                     args.covr_safety_sample_rate
                     if covr_bandit is not None else 0.0),
+                covr_safety_chain_threshold=(
+                    args.covr_safety_chain_threshold
+                    if covr_bandit is not None else 0),
                 covr_sentinel_start_idx=covr_sentinel_start_idx,
                 covr_sentinel_horizon=(
                     args.covr_sentinel_horizon
