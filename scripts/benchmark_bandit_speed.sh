@@ -8,7 +8,7 @@ set -euo pipefail
 # 默认以 nohup 后台方式启动，通过 tail -f 查看日志。
 #
 # 用法:
-#   GPUS=0,1,2,3 MANIFEST=/path/to/manifest.json bash scripts/benchmark_bandit_speed.sh
+#   GPUS=0,1,2,3 bash scripts/benchmark_bandit_speed.sh
 #
 # 前台模式:
 #   FOREGROUND=1 GPUS=0,1,2,3 MANIFEST=... bash scripts/benchmark_bandit_speed.sh
@@ -30,8 +30,8 @@ cd "${ROOT_DIR}"
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${ROOT_DIR}/output/bandit_speed_diag/${RUN_ID}}"
 
-# Required
-MANIFEST="${MANIFEST:?'MANIFEST env var is required (path to template manifest)'}"
+# Manifest (defaults to tmp/manifest.json in project root)
+MANIFEST="${MANIFEST:-${ROOT_DIR}/tmp/manifest.json}"
 
 # ---- Background launch logic ----
 # If not already the worker and FOREGROUND!=1, re-exec self via nohup
