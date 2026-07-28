@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
-"""Benchmark SpecA check_layer error as a proxy for COVR safety defect.
+"""Benchmark free noise-space signals as proxies for COVR safety defect.
 
-On each Taylor step with a check_layer probe, collects:
+Collects multiple candidate signals during Taylor steps (all zero-extra-forward)
+and reports Spearman rank correlation vs the full shadow defect.
 
-  proxy  = current.last_layer_error  (cosine-sim error at check_layer, free)
-  defect = ||candidate - full|| / ||full - x_t||  (full shadow, expensive)
-
-Reports Spearman rank correlation to determine whether the already-computed
-SpecA error signal can replace the expensive safety shadow.
+Signals:
+  last_layer_error  — SpecA cosine-sim error at check_layer (baseline)
+  taylor_chain      — consecutive Taylor steps since last full
+  candidate_norm    — per-sample RMS norm of candidate noise prediction
+  noise_delta       — ||noise_t - noise_{t-1}|| / ||noise_{t-1}|| (step-to-step change)
+  step_progress     — step_idx / num_steps (progress through denoising)
 
 Usage:
-  python scripts/benchmark_safety_proxy.py --n-prompts 16
+  python scripts/benchmark_safety_proxy.py --n-prompts 32
 """
 
 import argparse
 import os
 import sys
-from typing import List, Tuple
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -36,8 +38,9 @@ from accelerators.speca import speca_init
 
 
 def _spearmanr(x, y):
-    """Spearman rank correlation (no scipy dependency)."""
     n = len(x)
+    if n < 3:
+        return 0.0, 1.0
     rx = np.argsort(np.argsort(x)).astype(float) + 1.0
     ry = np.argsort(np.argsort(y)).astype(float) + 1.0
     mx, my = rx.mean(), ry.mean()
@@ -48,7 +51,12 @@ def _spearmanr(x, y):
     return float(num / den), 1.0
 
 
-def _collect_defect_pairs(
+def _rms_norm(x: torch.Tensor) -> torch.Tensor:
+    """Per-sample RMS norm: sqrt(mean(x^2)) -> (B,)."""
+    return x.detach().float().flatten(1).square().mean(dim=1).sqrt()
+
+
+def _collect_signals(
     transformer,
     scheduler,
     timesteps,
@@ -57,26 +65,30 @@ def _collect_defect_pairs(
     guidance_scale,
     cache_dic,
     current,
-    safety_rate: float = 1.0,
-    rng: np.random.Generator = None,
-) -> List[Tuple[float, float]]:
-    """Run one full denoising trajectory, collect (speca_error, full_defect) pairs.
+    rng: np.random.Generator,
+) -> Dict[str, List[float]]:
+    """Run one denoising trajectory, collect all free signals + full defect."""
 
-    On Taylor steps where check_layer was probed, records:
-      - current.last_layer_error (the SpecA cosine-sim error at check_layer)
-      - full defect = ||candidate - full|| / ||full - x_t||
-    """
-    if rng is None:
-        rng = np.random.default_rng()
     in_channels = transformer.config.in_channels
-    pairs: List[Tuple[float, float]] = []
+    num_steps = len(timesteps)
+
+    signals: Dict[str, List[float]] = {
+        "last_layer_error": [],
+        "taylor_chain": [],
+        "candidate_norm": [],
+        "noise_delta": [],
+        "step_progress": [],
+        "full_defect": [],
+    }
 
     x_t = latents
-    for step_idx in range(len(timesteps)):
+    prev_candidate = None
+
+    for step_idx in range(num_steps):
         t_tensor = timesteps[step_idx]
         t_batch = t_tensor.expand(x_t.shape[0])
 
-        current.step = len(timesteps) - 1 - step_idx
+        current.step = num_steps - 1 - step_idx
         latent_input = scheduler.scale_model_input(x_t, t_tensor)
 
         noise_pred = transformer.forward_with_cfg(
@@ -89,40 +101,57 @@ def _collect_defect_pairs(
             x_t = scheduler.step(
                 noise_pred[:, :in_channels], t_tensor, x_t,
                 return_dict=False)[0]
+            prev_candidate = None  # reset: noise_delta only for consecutive Taylor
             continue
 
-        # Taylor step: compute full shadow for ground-truth defect
+        # ---- Taylor step ----
         candidate_noise = noise_pred[:, :in_channels]
         full_noise = _covr_shadow_full(
             transformer, latent_input, t_batch, class_labels,
             guidance_scale)
         full_noise_sliced = full_noise[:, :in_channels]
 
-        # Collect when check_layer was probed and error is fresh
-        if (cache_dic.check and current.last_layer_error is not None
-                and rng.random() < safety_rate):
-            num, den = _covr_transition_components(
-                candidate_noise, full_noise_sliced, x_t)
-            defect = (num / (den + 1e-8)).mean().item()
-            pairs.append((current.last_layer_error, defect))
+        # Compute full defect (ground truth)
+        num, den = _covr_transition_components(
+            candidate_noise, full_noise_sliced, x_t)
+        defect = (num / (den + 1e-8)).mean().item()
+
+        # Collect all free signals
+        signals["full_defect"].append(defect)
+        signals["step_progress"].append(step_idx / num_steps)
+        signals["taylor_chain"].append(cache_dic.taylor_step_counter)
+        signals["candidate_norm"].append(_rms_norm(candidate_noise).mean().item())
+
+        # last_layer_error (may be stale if check_layer wasn't probed this step)
+        signals["last_layer_error"].append(
+            current.last_layer_error if current.last_layer_error is not None
+            else float('nan'))
+
+        # noise_delta: step-to-step change in candidate noise
+        if prev_candidate is not None:
+            delta = _rms_norm(candidate_noise - prev_candidate)
+            delta_norm = (delta / (_rms_norm(prev_candidate) + 1e-8)).mean().item()
+        else:
+            delta_norm = float('nan')
+        signals["noise_delta"].append(delta_norm)
+
+        prev_candidate = candidate_noise.detach().clone()
 
         x_t = scheduler.step(
             full_noise_sliced, t_tensor, x_t, return_dict=False)[0]
 
-    return pairs
+    return signals
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Benchmark SpecA check_layer error as safety defect proxy")
-    p.add_argument("--n-prompts", type=int, default=16,
-                   help="Number of images to run (default: 16)")
+        description="Benchmark free noise-space signals as safety defect proxies")
+    p.add_argument("--n-prompts", type=int, default=32,
+                   help="Number of images to run (default: 32)")
     p.add_argument("--num-steps", type=int, default=50)
     p.add_argument("--guidance-scale", type=float, default=4.5)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--batch-size", type=int, default=4)
-    p.add_argument("--safety-rate", type=float, default=1.0,
-                   help="Fraction of probed Taylor steps to sample (default: 1.0)")
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--dtype", type=str, default="fp16",
                    choices=["fp16", "fp32"])
@@ -137,7 +166,6 @@ def main():
 
     print(f"Device: {device}, dtype: {args.dtype}")
     print(f"Prompts: {args.n_prompts}, steps: {args.num_steps}")
-    print(f"Safety sample rate: {args.safety_rate}")
 
     # Load model
     print("Loading DiT...")
@@ -161,7 +189,11 @@ def main():
     timesteps = scheduler.timesteps
     _cache_scheduler_timestep_values(scheduler)
 
-    all_pairs: List[Tuple[float, float]] = []
+    # Accumulator: lists per signal
+    all_signals: Dict[str, List[float]] = {
+        k: [] for k in
+        ["last_layer_error", "taylor_chain", "candidate_norm",
+         "noise_delta", "step_progress", "full_defect"]}
 
     n_batches = (args.n_prompts + args.batch_size - 1) // args.batch_size
     for batch_idx in tqdm(range(n_batches), desc="batches"):
@@ -194,40 +226,67 @@ def main():
             max_order=2, error_metric="cosine_similarity",
             check_layer=20)
 
-        pairs = _collect_defect_pairs(
+        batch_signals = _collect_signals(
             transformer, scheduler, timesteps, latents, class_labels,
-            args.guidance_scale, cache_dic, current,
-            safety_rate=args.safety_rate, rng=rng)
+            args.guidance_scale, cache_dic, current, rng)
 
-        all_pairs.extend(pairs)
+        for k in all_signals:
+            all_signals[k].extend(batch_signals[k])
 
     # Report
-    print(f"\n===== SpecA Error vs Safety Defect =====")
-    print(f"Samples: {len(all_pairs)}")
-    if len(all_pairs) < 10:
-        print("(too few samples for correlation)")
-        return
+    defect_arr = np.array(all_signals["full_defect"])
+    total = len(defect_arr)
+    print(f"\n===== Signal vs Defect Correlation ({total} Taylor steps) =====")
+    print(f"{'Signal':<22} {'valid':>6} {'Spearman r':>12} {'Pearson r':>12}")
 
-    proxy_vals = [p for p, _ in all_pairs]
-    defect_vals = [d for _, d in all_pairs]
-    r, _ = _spearmanr(proxy_vals, defect_vals)
+    signal_names = [
+        ("last_layer_error", "last_layer_error"),
+        ("taylor_chain", "taylor_chain"),
+        ("candidate_norm", "candidate_norm"),
+        ("noise_delta", "noise_delta"),
+        ("step_progress", "step_progress"),
+    ]
 
-    # Also try Pearson (linear correlation)
-    proxy_arr = np.array(proxy_vals)
-    defect_arr = np.array(defect_vals)
-    pearson = float(np.corrcoef(proxy_arr, defect_arr)[0, 1])
+    for label, key in signal_names:
+        raw = np.array(all_signals[key])
+        mask = ~np.isnan(raw)
+        valid = raw[mask]
+        if len(valid) < 10:
+            print(f"{label:<22} {len(valid):>6}  {'(too few)':>12}")
+            continue
+        defect_valid = defect_arr[mask]
+        sr, _ = _spearmanr(valid, defect_valid)
+        pr = float(np.corrcoef(valid, defect_valid)[0, 1])
+        flag = " ***" if abs(sr) > 0.9 else "  !!" if abs(sr) < 0.7 else ""
+        print(f"{label:<22} {len(valid):>6}  {sr:>+12.4f}  {pr:>+12.4f}{flag}")
 
-    print(f"{'Spearman r':>16}: {r:+.4f}")
-    print(f"{'Pearson r':>16}: {pearson:+.4f}")
-    print(f"{'Proxy range':>16}: [{proxy_arr.min():.4f}, {proxy_arr.max():.4f}]")
-    print(f"{'Defect range':>16}: [{defect_arr.min():.4f}, {defect_arr.max():.4f}]")
+    print("\n*** |r| > 0.9 = strong proxy candidate")
+    print("!! |r| < 0.7 = insufficient (individual)")
 
-    if r > 0.9:
-        print("\n*** r > 0.9 — SpecA error is a strong safety proxy!")
-    elif r > 0.7:
-        print("\n**  r > 0.7 — moderate correlation, may be usable with calibration")
-    else:
-        print("\n!! r < 0.7 — insufficient correlation")
+    # Quick multi-signal linear regression R²
+    # Collect samples where all signals are valid
+    all_keys = [k for _, k in signal_names]
+    all_valid = np.ones(total, dtype=bool)
+    for k in all_keys:
+        all_valid &= ~np.isnan(np.array(all_signals[k]))
+    n_valid = all_valid.sum()
+    if n_valid >= 20:
+        X = np.column_stack([
+            np.array(all_signals[k])[all_valid] for k in all_keys
+        ])
+        y = defect_arr[all_valid]
+        # Add bias column
+        Xb = np.column_stack([X, np.ones(n_valid)])
+        coef, *_ = np.linalg.lstsq(Xb, y, rcond=None)
+        y_pred = Xb @ coef
+        ss_res = ((y - y_pred) ** 2).sum()
+        ss_tot = ((y - y.mean()) ** 2).sum()
+        r2 = 1 - ss_res / ss_tot
+        print(f"\nMulti-signal linear R²: {r2:.4f}  (n={n_valid})")
+        if r2 > 0.5:
+            print("  => promising! Linear combination may be usable.")
+        else:
+            print("  => linear combination still insufficient.")
 
 
 if __name__ == "__main__":
