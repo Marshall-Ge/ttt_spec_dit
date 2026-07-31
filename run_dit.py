@@ -1048,6 +1048,7 @@ class DiTGenerator:
             # first N steps after each full step have low defect → skip shadow.
             _skip_safety_shadow = (
                 covr_safety_chain_threshold > 0
+                and cache_dic is not None
                 and cache_dic.taylor_step_counter <= covr_safety_chain_threshold
             )
 
