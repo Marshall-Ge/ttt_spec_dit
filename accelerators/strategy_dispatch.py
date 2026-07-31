@@ -33,8 +33,10 @@ def apply_strategy(
         ``controller`` kwargs are injected from the strategy.
     teacache_init_kwargs : dict, optional
         Base keyword arguments for ``teacache_init`` (used when
-        ``strategy.method == "teacache"``).  The ``rel_l1_thresh``
-        kwarg is injected from the strategy.
+        ``strategy.method == "teacache"``).  When the strategy carries a
+        ``refresh_mask`` (equal-FLOPs COVR arm) it is injected as
+        ``refresh_mask``; otherwise ``rel_l1_thresh`` is injected from the
+        strategy params.
 
     Returns
     -------
@@ -57,9 +59,15 @@ def apply_strategy(
 
     elif method == "teacache":
         kwargs = dict(teacache_init_kwargs or {})
-        rel_l1_thresh = strategy.params.get("rel_l1_thresh")
-        if rel_l1_thresh is not None:
-            kwargs["rel_l1_thresh"] = rel_l1_thresh
+        refresh_mask = strategy.refresh_mask
+        if refresh_mask is not None:
+            # Forced-schedule (equal-FLOPs COVR arm): the mask drives the
+            # per-step calc/skip decision, bypassing the dynamic threshold.
+            kwargs["refresh_mask"] = refresh_mask
+        else:
+            rel_l1_thresh = strategy.params.get("rel_l1_thresh")
+            if rel_l1_thresh is not None:
+                kwargs["rel_l1_thresh"] = rel_l1_thresh
         teacache_state = teacache_init(**kwargs)
         return {"teacache_state": teacache_state}
 

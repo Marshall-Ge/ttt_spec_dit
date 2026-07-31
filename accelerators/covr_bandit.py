@@ -170,12 +170,13 @@ class AccelerationStrategy:
 
     @property
     def refresh_mask(self) -> Optional[Tuple[bool, ...]]:
-        """Backward compat: SpecA strategies expose a refresh_mask.
+        """Refresh mask (per-step calc/skip schedule), if this strategy has one.
 
-        Returns ``None`` for non-SpecA methods such as TeaCache.
+        Both SpecA and forced-schedule TeaCache strategies carry a
+        ``refresh_mask`` in their params — it is the method-agnostic
+        "which timesteps recompute vs reuse cache" plan. Returns ``None``
+        when the strategy has no mask (e.g. a threshold-based TeaCache arm).
         """
-        if self.method != "speca":
-            return None
         raw = self.params.get("refresh_mask")
         if raw is None:
             return None

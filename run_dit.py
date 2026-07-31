@@ -970,9 +970,18 @@ class DiTGenerator:
             # Terminal fidelity for bandit reward: compare template vs full
             # forward at the LAST denoising step. Costs 1 extra forward pass
             # per sentinel trajectory (vs 50 for full baseline comparison).
+            # Method-agnostic: any refresh-mask accelerator (SpecA Taylor
+            # cache OR forced-schedule TeaCache residual cache) qualifies.
+            # noise_pred at the final step is well-defined whether that step
+            # recomputed or reused the cache — comparing it to the full
+            # forward is exactly the counterfactual the bandit rewards.
+            _terminal_reward_active = (
+                (method == "speca" and current is not None)
+                or (method == "teacache" and teacache_state is not None)
+            )
             if (covr_sentinel_selected and covr_sentinel_start_idx is None
                     and step_idx == len(timesteps) - 1
-                    and method == "speca" and current is not None
+                    and _terminal_reward_active
                     and covr_feedback_sink is not None):
                 terminal_token = (
                     covr_profiler.start_gpu(
@@ -1765,6 +1774,8 @@ def run_c2i(args) -> Dict:
             if not strat_path:
                 raise ValueError(
                     "--covr-strategy-bandit requires --covr-strategy-manifest")
+            covr_bandit_state_path = args.covr_bandit_state or os.path.join(
+                output_dir, "covr", "template_bandit_state.json")
             strat_manifest = StrategyManifest.load(strat_path)
             covr_bandit = ConservativeTemplateBandit.from_strategies(
                 strat_manifest, session_id=covr_session_id,
@@ -2082,9 +2093,11 @@ def run_c2i(args) -> Dict:
             assert covr_assignment is not None
             if covr_sentinel_selected and covr_sentinel_start_idx is None:
                 # Terminal fidelity: prefer the cheap one-step computation
-                # from _denoise_loop (1 extra forward pass, SpecA-only).
-                # Fall back to full-baseline comparison for non-SpecA
-                # methods (TeaCache bandit, etc.).
+                # from _denoise_loop (1 extra forward pass) — available for
+                # any refresh-mask accelerator (SpecA, forced-schedule
+                # TeaCache). Fall back to the expensive full-baseline
+                # comparison only when no cheap reward was produced (e.g. a
+                # threshold-based TeaCache arm with no forced mask).
                 tf_loss = covr_feedback_sink.get("terminal_fidelity_loss")
                 if tf_loss is None:
                     fallback_profiler = _GenerationProfiler(

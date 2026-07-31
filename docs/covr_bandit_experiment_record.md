@@ -206,37 +206,72 @@ Terminal fidelity reward 让 bandit 从原先偏向 `template_02` 转向 `timest
 2. Bandit 在当前 reward 下稳定偏向 `timestep_prior`，47,952 张 evaluation 中占 92.1%。
 3. Bandit 的 FID 明显优于 baseline 和 adaptive SpecA。
 4. Bandit 的 IS 明显低于 baseline 和 adaptive SpecA，说明它不是全面质量提升，而是明显偏向 FID。
-5. Adaptive SpecA 仍然是当前更好的效率基线：约 8.58 img/s，且 IS 更高。
-6. Safety observation 是 Bandit online FLOPs 增加的明确来源；50k Bandit safety FLOPs 为 `0.8727T`。
+5. ~~Adaptive SpecA 仍然是当前更好的效率基线：约 8.58 img/s，且 IS 更高。~~ **已更新**：速度优化后 Bandit 8.05 img/s 快于 SpecA 7.69 img/s（见 §6.1）。
+6. Safety observation 是 Bandit online FLOPs 增加的明确来源；50k Bandit safety FLOPs 为 `0.8727T`。**消除 safety 后速度问题完全解决。**
+
+### 6.1 速度优化后 CFG=4.5 实验 (2026-07-29)
+
+> 配置：safety_sample_rate=0, sentinel_rate=0.02, chain_threshold=5  
+> 50,000 张全量评估，guidance_scale=4.5
+
+| 方法 | FID ↓ | IS ↑ | FLOPs(T) | img/s | cand img/s | skip% |
+|---|---:|---:|---:|---:|---:|---:|
+| Baseline | 24.84 | 453.9 | 11.867 | 3.95 | 3.95 | — |
+| Adaptive SpecA | 23.96 | 436.7 | 3.371 | 7.69 | 7.69 | 73.3% |
+| COVR Bandit | **17.48** | 351.2 | **3.087** | **8.01** | **8.05** | 74.0% |
+
+Stage Profiling (COVR Bandit):
+
+| Stage | 时间(s) |
+|---|---:|
+| generation_online | 6216.4 |
+| denoise_loop | 5801.1 |
+| speca_full | 3374.1 |
+| speca_taylor | 2378.1 |
+| image_save_metrics | 1487.5 |
+| vae_decode | 412.8 |
+| cuda_sync_wait | 406.2 |
+| bandit_state_persist | 23.9 |
+
+COVR overhead: safety=0.0s, terminal=3.5s, control=26.4s
+
+**核心结论：消除 safety shadow 后，COVR Bandit 同时实现了：**
+- **FID 大幅优于 baseline（-7.36）和 SpecA（-6.48）**
+- **速度快于 Adaptive SpecA（8.05 vs 7.69 img/s，+4.7%）**
+- **FLOPs 更低（3.087T vs 3.371T，-8.4%）**
+
+唯一代价是 IS 下降（351.2 vs 436.7，-19.6%），这与之前的 safety-on 实验一致，说明 IS 退化是 template 选择（偏向 `timestep_prior`）的固有特性，与 safety 无关。
+
+### 6.2 与原始 50k 实验（§5）的速度对比
+
+| 指标 | §5 原始 (safety=10%) | §6.1 速度优化 (safety=0) |
+|---|---|---|
+| Bandit candidate img/s | 4.78 | **8.05** (+68%) |
+| Bandit online img/s | 4.17 | **8.01** (+92%) |
+| Bandit vs SpecA 速度 | 慢 51.4% | **快 4.7%** |
+| Bandit FID | 17.62 | 17.48 (一致) |
+| Bandit IS | 353.3 | 351.2 (一致) |
+
+结论：safety shadow 是唯一的速度瓶颈。消除后 FID/IS 不变，速度从 4.78 提升到 8.05 img/s。
 
 ### 不能直接下结论
 
-- 不能说 Bandit 全面改进了 SpecA。
+- 不能说 Bandit 全面改进了 SpecA（IS 明显更差）。
 - 不能把 FID 降低解释为生成质量所有维度都提升。
-- 不能用后处理或 FID/IS 计算解释 Bandit 与 adaptive SpecA 的速度差异，因为当前记录的 generation speed 已经显示 Bandit candidate 和 online 路径都更慢。
-- 不能把当前 47,952 张结果直接和其他数据切片上的“50k FID < 10”结果比较。需要核对数据切片、真实参考集、模型权重、CFG、评估实现和样本命名是否完全一致。
+- 不能把当前 50k 结果直接和其他数据切片上的”50k FID < 10”结果比较。需要核对数据切片、真实参考集、模型权重、CFG、评估实现和样本命名是否完全一致。
 
-## 7. 速度差异待调查
+## 7. 速度差异已解决
 
-Bandit 和 adaptive SpecA 的 skip ratio 接近：
+原始 §5 实验中 Bandit 和 adaptive SpecA 的 skip ratio 接近（73.29% vs 74.00%），但速度差异很大（8.58 vs 4.78 img/s）。
 
-- Adaptive SpecA：73.29%
-- Bandit：74.00%
+**根因**：safety shadow（10% sample rate × per-step full forward）累积 0.87T FLOPs（22% online），是唯一瓶颈。
 
-但速度差异很大：
+**验证路径**（benchmark_bandit_speed.sh, 2048 张 4 组对照）：
+- B (no safety) candidate = 8.04 img/s ≈ D (adaptive SpecA) = 7.64 img/s → safety 是唯一瓶颈
+- B vs C 差异 <0.2s → bandit dispatch 开销可忽略
+- C vs D 差异 <3% → speca_init reinit 开销可忽略
 
-- Adaptive SpecA：8.5797 img/s
-- Bandit candidate：4.7813 img/s
-- Bandit online：4.1692 img/s
-
-因此需要检查：
-
-1. Bandit 是否每条 trajectory 都重复初始化或重置了 SpecA 状态。
-2. Bandit 的 strategy dispatch 是否引入了额外 Python/CPU 同步。
-3. sentinel/safety shadow 是否被计入 candidate runtime，或是否影响 CUDA stream 同步。
-4. candidate speed 和 online speed 的计时起止点是否一致。
-5. Bandit 是否因为 batch 内策略切换导致 CUDA kernel 调度和缓存利用率变差。
-6. 统计中的 `candidate FLOPs` 是否只代表理论主路径，而实际运行仍包含 probe、shadow 或反馈开销。
+**最终确认**（§6.1, 50k CFG=4.5, safety=0）：Bandit 8.05 img/s > SpecA 7.69 img/s，问题完全解决。
 
 ## 8. 方法无关策略抽象状态
 

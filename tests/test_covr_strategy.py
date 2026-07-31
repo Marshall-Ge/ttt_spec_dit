@@ -77,6 +77,77 @@ def test_teacache_strategy_template_id_is_strategy_id():
     assert strategy.template_id == "thresh_0.1500"
 
 
+def test_teacache_mask_strategy_exposes_refresh_mask():
+    """Forced-schedule TeaCache arm carries a refresh_mask (equal-FLOPs)."""
+    strategy = AccelerationStrategy(
+        strategy_id="template_01",
+        method="teacache",
+        params={"refresh_mask": [True, False, True, False], "num_steps": 4},
+        modeled_flops=2.0,
+    )
+    assert strategy.refresh_mask == (True, False, True, False)
+    assert strategy.refresh_count == 2
+    # to_refresh_template still refuses non-SpecA methods.
+    with pytest.raises(RuntimeError, match="cannot convert teacache"):
+        strategy.to_refresh_template()
+
+
+def test_teacache_threshold_strategy_has_no_mask():
+    """A threshold-based TeaCache arm (no mask) yields refresh_mask=None."""
+    strategy = AccelerationStrategy(
+        strategy_id="thresh_0.25",
+        method="teacache",
+        params={"rel_l1_thresh": 0.25},
+        modeled_flops=1.0,
+    )
+    assert strategy.refresh_mask is None
+    assert strategy.refresh_count == 0
+
+
+# ===========================================================================
+# apply_strategy dispatch (method-agnostic)
+# ===========================================================================
+
+
+_TC_COEF = [0.0, 0.0, 0.0, 1.0, 0.0]
+
+
+def test_apply_strategy_injects_teacache_refresh_mask():
+    from accelerators.strategy_dispatch import apply_strategy
+
+    mask = [True, False, True, False, False]
+    strategy = AccelerationStrategy(
+        strategy_id="template_01",
+        method="teacache",
+        params={"refresh_mask": mask, "num_steps": 5},
+        modeled_flops=2.0,
+    )
+    result = apply_strategy(
+        strategy,
+        teacache_init_kwargs={"num_steps": 5, "coefficients": _TC_COEF},
+    )
+    state = result["teacache_state"]
+    assert state["refresh_mask"] == tuple(mask)
+
+
+def test_apply_strategy_injects_teacache_threshold_when_no_mask():
+    from accelerators.strategy_dispatch import apply_strategy
+
+    strategy = AccelerationStrategy(
+        strategy_id="thresh_0.35",
+        method="teacache",
+        params={"rel_l1_thresh": 0.35, "num_steps": 5},
+        modeled_flops=1.0,
+    )
+    result = apply_strategy(
+        strategy,
+        teacache_init_kwargs={"num_steps": 5, "coefficients": _TC_COEF},
+    )
+    state = result["teacache_state"]
+    assert state["refresh_mask"] is None
+    assert state["rel_l1_thresh"] == 0.35
+
+
 def test_speca_strategy_to_refresh_template():
     strategy = AccelerationStrategy(
         strategy_id="t1",

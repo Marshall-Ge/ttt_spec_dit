@@ -16,7 +16,7 @@ The state dict is owned by the caller (sampling loop in ``run_dit.py`` /
 State dict keys (created by ``teacache_init``):
   - cnt, accumulated, previous_modulated_input, previous_residual
   - decisions, accum_history, raw_diff_history, rescaled_diff_history
-  - num_steps, rel_l1_thresh, coefficients, rescale_func
+  - num_steps, rel_l1_thresh, coefficients, rescale_func, refresh_mask
 """
 
 import json
@@ -86,6 +86,7 @@ def teacache_init(
     num_steps: int,
     rel_l1_thresh: float = 0.25,
     coefficients: Optional[List[float]] = None,
+    refresh_mask: Optional[Tuple[bool, ...]] = None,
 ) -> Dict:
     """Allocate TeaCache state dict.
 
@@ -98,6 +99,15 @@ def teacache_init(
     coefficients : list of 5 floats, optional
         4th-order polynomial (highest degree first) for distance rescaling.
         Defaults to ``config.load_coefficients()``.
+    refresh_mask : tuple of bool, optional
+        Forced-schedule mode (used by the COVR bandit). When provided, the
+        per-step calc/skip decision follows the mask verbatim
+        (``mask[step] == True`` → recompute the full block stack), bypassing
+        the dynamic accumulate-vs-threshold logic. Because every arm in a
+        COVR manifest shares the same refresh count, arms become equal-FLOPs.
+        Must have length ``num_steps``, contain only booleans, and refresh
+        the first step (no residual is cached yet at step 0). ``None`` (the
+        default) keeps the original dynamic-threshold behaviour.
 
     Returns
     -------
@@ -108,12 +118,23 @@ def teacache_init(
     if coefficients is None:
         coefficients = load_coefficients()
 
+    validated_mask: Optional[Tuple[bool, ...]] = None
+    if refresh_mask is not None:
+        validated_mask = tuple(refresh_mask)
+        if len(validated_mask) != num_steps:
+            raise ValueError("refresh_mask length must match num_steps")
+        if any(type(value) is not bool for value in validated_mask):
+            raise ValueError("refresh_mask values must be booleans")
+        if not validated_mask[0]:
+            raise ValueError("refresh_mask must refresh the first step")
+
     return {
         # ---- config (immutable per generation) ----
         "num_steps": num_steps,
         "rel_l1_thresh": rel_l1_thresh,
         "coefficients": list(coefficients),
         "rescale_func": np.poly1d(coefficients),
+        "refresh_mask": validated_mask,
 
         # ---- runtime state ----
         "cnt": 0,
@@ -157,6 +178,23 @@ def teacache_decide(state: Dict, modulated_input: torch.Tensor,
     num_steps = state["num_steps"]
     timestep_bucket = int(cnt * 3 / num_steps) if num_steps > 0 else 0
     timestep_bucket = min(timestep_bucket, 2)
+
+    # Forced-schedule mode (COVR bandit): follow the mask verbatim, bypassing
+    # the dynamic accumulate-vs-threshold logic. previous_modulated_input is
+    # still updated so state stays consistent, but no diff/threshold is used.
+    refresh_mask = state.get("refresh_mask")
+    if refresh_mask is not None:
+        if not 0 <= cnt < len(refresh_mask):
+            raise ValueError("TeaCache step is outside the refresh mask")
+        should_calc = bool(refresh_mask[cnt])
+        state["accumulated"] = 0.0
+        state["accum_history"].append(0.0)
+        state["raw_diff_history"].append(0.0)
+        state["rescaled_diff_history"].append(0.0)
+        state["decisions"].append("calc" if should_calc else "skip")
+        state["previous_modulated_input"] = modulated_input.detach()
+        state["last_raw_diff"] = 0.0
+        return should_calc, 0.0
 
     # Rescale: always use offline poly4 (RLS-based online rescale was removed —
     # it predicted values too small for the accumulate-vs-threshold mechanism).

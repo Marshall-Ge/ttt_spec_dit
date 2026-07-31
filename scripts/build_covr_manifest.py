@@ -6,9 +6,15 @@ Supports:
     from action-audit counterfactual events.
   - TeaCache (--method teacache): builds a StrategyManifest with one
     AccelerationStrategy per threshold value.
+  - TeaCache equal-FLOPs masks (--method teacache-mask): reuses the SpecA
+    equal-FLOPs template search over action-audit events, then emits each
+    refresh mask as a ``method="teacache"`` AccelerationStrategy. Every arm
+    shares the same refresh count, so arms are equal-FLOPs and the COVR
+    bandit compares them apple-to-apple.
 
 The SpecA path uses the existing ``build_template_manifest`` pipeline;
-the TeaCache path creates strategies directly from the CLI thresholds.
+the TeaCache path creates strategies directly from the CLI thresholds;
+the TeaCache-mask path bridges the two (SpecA search → TeaCache arms).
 """
 
 import argparse
@@ -39,8 +45,10 @@ def parse_args():
     parser.add_argument("--output", required=True,
                         help="Manifest JSON output path")
     parser.add_argument("--method", type=str, default="speca",
-                        choices=["speca", "teacache"],
-                        help="Acceleration method (default: speca)")
+                        choices=["speca", "teacache", "teacache-mask"],
+                        help="Acceleration method (default: speca). "
+                             "'teacache-mask' reuses the SpecA equal-FLOPs "
+                             "search to build equal-FLOPs TeaCache arms.")
 
     # SpecA-specific
     parser.add_argument("--num-layers", type=int, default=28,
@@ -83,6 +91,8 @@ def main() -> int:
 
     if args.method == "teacache":
         return _build_teacache_manifest(args)
+    elif args.method == "teacache-mask":
+        return _build_teacache_mask_manifest(args)
     else:
         return _build_speca_manifest(args)
 
@@ -167,6 +177,71 @@ def _build_teacache_manifest(args) -> int:
         "baseline_strategy_id": manifest.baseline_strategy_id,
         "thresholds": thresholds,
         "source_groups": [],
+    }, indent=2, sort_keys=True))
+    return 0
+
+
+def _build_teacache_mask_manifest(args) -> int:
+    """Reuse the SpecA equal-FLOPs template search to build TeaCache arms.
+
+    Each ``RefreshTemplate`` produced by ``build_template_manifest`` becomes a
+    ``method="teacache"`` ``AccelerationStrategy`` carrying the same refresh
+    mask. Because all masks share one refresh count, the arms are equal-FLOPs
+    and the COVR bandit compares them apple-to-apple (unlike threshold arms).
+    """
+    if not args.audits:
+        print("[ERROR] --method teacache-mask requires action-audit JSONL files "
+              "(the SpecA equal-FLOPs search runs over them).", file=sys.stderr)
+        return 1
+
+    events = read_action_audits(args.audits)
+    speca_manifest = build_template_manifest(
+        events,
+        num_layers=args.num_layers,
+        template_count=args.template_count,
+        mandatory_prefix=args.mandatory_prefix,
+        max_taylor_gap=args.max_taylor_gap,
+        refresh_count=args.refresh_count,
+        version_key=args.version_key,
+        training_sessions=args.training_session,
+        safety_numerator_ucb_limit=args.safety_numerator_ucb_limit,
+        safety_denominator_lcb_floor=args.safety_denominator_lcb_floor,
+    )
+
+    num_steps = speca_manifest.num_steps
+    version_key = args.version_key or f"teacache_mask_{speca_manifest.version_key}"
+    refresh_count = speca_manifest.common_refresh_count
+
+    strategies = []
+    for template in speca_manifest.templates:
+        strategies.append(AccelerationStrategy(
+            strategy_id=template.template_id,
+            method="teacache",
+            params={
+                "refresh_mask": list(template.refresh_mask),
+                "num_steps": num_steps,
+            },
+            modeled_flops=float(refresh_count),
+            source=template.source,
+        ))
+
+    manifest = StrategyManifest(
+        version_key=version_key,
+        num_steps=num_steps,
+        baseline_strategy_id=speca_manifest.baseline_template_id,
+        strategies=tuple(strategies),
+        source_groups=speca_manifest.source_groups,
+    )
+    manifest.save(args.output)
+    print(json.dumps({
+        "manifest": os.path.abspath(args.output),
+        "manifest_hash": manifest.manifest_hash,
+        "version_key": manifest.version_key,
+        "num_steps": manifest.num_steps,
+        "strategies": len(manifest.strategies),
+        "baseline_strategy_id": manifest.baseline_strategy_id,
+        "refresh_count": refresh_count,
+        "source_groups": list(manifest.source_groups),
     }, indent=2, sort_keys=True))
     return 0
 
