@@ -53,6 +53,15 @@ from .covr_bandit import (
     TimestepSafetyPrior,
     TimestepSafetyTable,
 )
+from .registry import (
+    AcceleratorAdapter,
+    SpecAAdapter,
+    TeaCacheAdapter,
+    get_adapter,
+    is_registered,
+    register_adapter,
+    registered_methods,
+)
 from .speca import (
     SpecACache,
     SpecAState,

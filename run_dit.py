@@ -20,7 +20,6 @@ import json
 import os
 import time
 from collections import defaultdict
-from types import SimpleNamespace
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
@@ -53,6 +52,7 @@ from accelerators.teacache import (
 )
 from accelerators.speca import SpecACache, SpecAState, speca_init
 from accelerators.strategy_dispatch import apply_strategy
+from accelerators.registry import get_adapter, is_registered
 from accelerators.covr import (
     ActionAuditContext,
     ActionAuditEvent,
@@ -173,6 +173,61 @@ def _covr_hash_index(session_id: str, trajectory_id: int,
     payload = f"{purpose}:{session_id}:{trajectory_id}".encode("utf-8")
     value = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
     return value % size
+
+
+def _covr_sentinel_selection(session_id: str, trajectory_id: int,
+                             rate: float, horizon: int, num_steps: int,
+                             mandatory_prefix: int = 0) -> Tuple[bool, Optional[int]]:
+    """Determine whether a trajectory is a sentinel and, if so, where its
+    H-step reference rollout starts.
+
+    Shared by the bandit and forced-strategy paths so both make the same
+    deterministic decision: hashed by (session_id, trajectory_id) with the
+    "delayed_sentinel" purpose string, so a trajectory is selected (or not)
+    identically under both modes.
+
+    Returns ``(selected, start_idx)`` where:
+      * ``selected`` is ``_covr_hash_sample(session_id, trajectory_id, -1,
+        rate, "delayed_sentinel")`` (strict 0.0/1.0 short-circuits, same as
+        the hash helper);
+      * ``start_idx`` is None when ``selected`` is False, ``horizon <= 0``,
+        or ``horizon >= num_steps`` (no interior H-step window);
+      * otherwise ``start_idx`` is a deterministic random index inside
+        ``[min(mandatory_prefix, max_start), max_start]`` with
+        ``max_start = num_steps - horizon`` (the bandit's existing formula).
+    """
+    selected = _covr_hash_sample(
+        session_id, trajectory_id, -1, rate, "delayed_sentinel")
+    start_idx = None
+    if selected and 0 < horizon < num_steps:
+        max_start = num_steps - horizon
+        min_start = min(int(mandatory_prefix), max_start)
+        start_idx = min_start + _covr_hash_index(
+            session_id, trajectory_id, "sentinel_start",
+            max_start - min_start + 1)
+    return selected, start_idx
+
+
+def _covr_bandit_sentinel_selection(covr_bandit, trajectory_id: int,
+                                    rate: float, horizon: int,
+                                    num_steps: int) -> Tuple[bool, Optional[int]]:
+    """Bandit-path wrapper over ``_covr_sentinel_selection`` (identity logic)."""
+    return _covr_sentinel_selection(
+        covr_bandit.session_id, trajectory_id, rate, horizon, num_steps,
+        int(getattr(covr_bandit.manifest, "mandatory_prefix", 0)))
+
+
+def _covr_forced_sentinel_selection(covr_session_id: Optional[str],
+                                    covr_forced_manifest, trajectory_id: int,
+                                    rate: float, horizon: int,
+                                    num_steps: int) -> Tuple[bool, Optional[int]]:
+    """Forced-strategy wrapper over ``_covr_sentinel_selection`` (identity
+    logic; ``covr_session_id`` is None when no COVR mode is active, which
+    only happens when no forced strategy was requested)."""
+    return _covr_sentinel_selection(
+        str(covr_session_id) if covr_session_id is not None else "",
+        trajectory_id, rate, horizon, num_steps,
+        int(getattr(covr_forced_manifest, "mandatory_prefix", 0)))
 
 
 def _covr_resume_metadata(path: Optional[str]) -> Optional[Dict[str, object]]:
@@ -711,6 +766,7 @@ class DiTGenerator:
                  covr_sentinel_horizon: int = 0,
                  covr_feedback_sink: Optional[Dict[str, Any]] = None,
                  covr_sentinel_selected: bool = False,
+                 covr_terminal_reward_active: bool = False,
                  covr_profiler: Optional[_GenerationProfiler] = None,
                  ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Generate image(s).
@@ -776,6 +832,7 @@ class DiTGenerator:
             covr_sentinel_horizon=covr_sentinel_horizon,
             covr_feedback_sink=covr_feedback_sink,
             covr_sentinel_selected=covr_sentinel_selected,
+            covr_terminal_reward_active=covr_terminal_reward_active,
             covr_profiler=covr_profiler,
         )
         if covr_profiler is not None:
@@ -817,6 +874,7 @@ class DiTGenerator:
                        covr_sentinel_horizon: int = 0,
                        covr_feedback_sink: Optional[Dict[str, Any]] = None,
                        covr_sentinel_selected: bool = False,
+                       covr_terminal_reward_active: bool = False,
                        covr_profiler: Optional[_GenerationProfiler] = None,
                        ) -> torch.Tensor:
         """Single denoising loop with method dispatch.
@@ -975,9 +1033,17 @@ class DiTGenerator:
             # noise_pred at the final step is well-defined whether that step
             # recomputed or reused the cache — comparing it to the full
             # forward is exactly the counterfactual the bandit rewards.
-            _terminal_reward_active = (
-                (method == "speca" and current is not None)
-                or (method == "teacache" and teacache_state is not None)
+            # Whether this method exposes that reward is the adapter's call.
+            # (``covr_terminal_reward_active`` is the loop-level gate: in
+            # bandit mode it duplicates the old local adapter check, and in
+            # forced mode it enables the reward without a bandit.)
+            _terminal_reward_active = bool(covr_terminal_reward_active) or (
+                is_registered(method)
+                and get_adapter(method).terminal_reward_active({
+                    "cache_dic": cache_dic,
+                    "current": current,
+                    "teacache_state": teacache_state,
+                })
             )
             if (covr_sentinel_selected and covr_sentinel_start_idx is None
                     and step_idx == len(timesteps) - 1
@@ -1668,6 +1734,10 @@ def run_c2i(args) -> Dict:
     covr_sentinel_full_steps = 0
     covr_terminal_wall_s = 0.0
     covr_sentinel_count = 0
+    covr_terminal_losses = []
+    covr_h_step_numerators = []
+    covr_h_step_denominators = []
+    covr_sentinel_skipped = 0
     covr_trajectory_offset = 0
     _covr_has_any_covr = (
         getattr(args, "covr_shadow", False)
@@ -1869,18 +1939,22 @@ def run_c2i(args) -> Dict:
         covr_sentinel_start_idx = None
         strategy_select_start = time.perf_counter()
         if covr_bandit is not None:
-            covr_sentinel_selected = _covr_hash_sample(
-                covr_bandit.session_id, trajectory_id, -1,
-                args.covr_sentinel_rate, "delayed_sentinel")
-            if (covr_sentinel_selected and
-                    0 < args.covr_sentinel_horizon < args.num_steps):
-                max_start = args.num_steps - args.covr_sentinel_horizon
-                min_start = min(covr_bandit.manifest.mandatory_prefix, max_start)
-                covr_sentinel_start_idx = min_start + _covr_hash_index(
-                    covr_bandit.session_id, trajectory_id, "sentinel_start",
-                    max_start - min_start + 1)
+            covr_sentinel_selected, covr_sentinel_start_idx = (
+                _covr_bandit_sentinel_selection(
+                    covr_bandit, trajectory_id,
+                    args.covr_sentinel_rate, args.covr_sentinel_horizon,
+                    args.num_steps))
             covr_assignment = covr_bandit.begin_trajectory(
                 trajectory_id, sample_count=actual_bs)
+        elif covr_forced_strategy is not None:
+            # Forced single-arm sweep: no bandit to update, but sentinel
+            # trajectories still collect the same reward telemetry (terminal
+            # fidelity / H-step) for the Spearman-vs-FID analysis.
+            covr_sentinel_selected, covr_sentinel_start_idx = (
+                _covr_forced_sentinel_selection(
+                    covr_session_id, covr_forced_manifest_strategy,
+                    trajectory_id, args.covr_sentinel_rate,
+                    args.covr_sentinel_horizon, args.num_steps))
         covr_profiler.add_cpu(
             "strategy_selection", time.perf_counter() - strategy_select_start)
 
@@ -1897,7 +1971,10 @@ def run_c2i(args) -> Dict:
 
         strategy_init_start = time.perf_counter()
         # Strategy dispatch: configure the accelerator from the
-        # bandit/forced-template selection when one is active.
+        # bandit/forced-template selection when one is active. Method-agnostic
+        # via the adapter registry — apply_strategy() looks up the strategy's
+        # AcceleratorAdapter and returns its state_keys, so adding a new
+        # accelerator needs no branch here.
         _using_strategy = covr_bandit is not None or covr_forced_strategy is not None
         if _using_strategy:
             strategy = (
@@ -1905,29 +1982,31 @@ def run_c2i(args) -> Dict:
                 if covr_forced_strategy is not None
                 else covr_bandit.active_strategy
             )
-            if strategy.method == "speca":
-                dispatch_result = apply_strategy(
-                    strategy,
-                    speca_init_kwargs={
+            dispatch_result = apply_strategy(
+                strategy,
+                speca_init_kwargs=(
+                    {
                         **speca_init_kwargs,
                         "controller": compute_controller,
                         "trajectory_id": trajectory_id,
-                    },
-                )
-                speca_cache_dic = dispatch_result["cache_dic"]
-                speca_current = dispatch_result["current"]
-                if compute_controller is not None:
-                    compute_controller.begin_trajectory(trajectory_id)
-            elif strategy.method == "teacache":
-                dispatch_result = apply_strategy(
-                    strategy,
-                    teacache_init_kwargs={
-                        "num_steps": args.num_steps,
-                        "coefficients": _load_dit_coefficients(args.coef_path)
-                        if args.coef_path else _load_dit_coefficients(),
-                    },
-                )
-                teacache_state = dispatch_result["teacache_state"]
+                    }
+                    if speca_init_kwargs is not None else None
+                ),
+                teacache_init_kwargs={
+                    "num_steps": args.num_steps,
+                    "coefficients": _load_dit_coefficients(args.coef_path)
+                    if args.coef_path else _load_dit_coefficients(),
+                },
+            )
+            # Unpack whatever the selected adapter produced; untouched state
+            # objects keep their prior (None) values.
+            speca_cache_dic = dispatch_result.get("cache_dic", speca_cache_dic)
+            speca_current = dispatch_result.get("current", speca_current)
+            teacache_state = dispatch_result.get(
+                "teacache_state", teacache_state)
+            # SpecA controller lifecycle (controller is None for other methods).
+            if "cache_dic" in dispatch_result and compute_controller is not None:
+                compute_controller.begin_trajectory(trajectory_id)
         elif speca_init_kwargs is not None:
             # No bandit, direct SpecA config (no refresh_mask = auto-decay)
             speca_cache_dic, speca_current = speca_init(
@@ -1993,6 +2072,8 @@ def run_c2i(args) -> Dict:
                     if covr_sentinel_start_idx is not None else 0),
                 covr_feedback_sink=covr_feedback_sink,
                 covr_sentinel_selected=covr_sentinel_selected,
+                covr_terminal_reward_active=(
+                    covr_forced_strategy is not None),
                 covr_profiler=covr_profiler,
             )
 
@@ -2164,6 +2245,29 @@ def run_c2i(args) -> Dict:
             profile_stage_totals["bandit_state_persist"] += persist_s
             profile_stage_counts["bandit_state_persist"] += 1
 
+        if covr_forced_strategy is not None:
+            # Forced single-arm sweep: same reward telemetry as the bandit
+            # path, aggregated into results.json. Never fall back to a full
+            # 50-step baseline comparison (that is the bandit-mode fallback
+            # and would cost ~50x per missing reward) — a sentinel without a
+            # cheap reward is skipped and counted instead.
+            if covr_sentinel_selected:
+                if covr_sentinel_start_idx is None:
+                    tf_loss = covr_feedback_sink.get("terminal_fidelity_loss")
+                    if tf_loss is not None:
+                        covr_terminal_losses.append(float(tf_loss))
+                    else:
+                        covr_sentinel_skipped += 1
+                else:
+                    if {"h_step_numerator", "h_step_denominator"}.issubset(
+                            covr_feedback_sink):
+                        covr_h_step_numerators.append(
+                            covr_feedback_sink["h_step_numerator"])
+                        covr_h_step_denominators.append(
+                            covr_feedback_sink["h_step_denominator"])
+                    else:
+                        covr_sentinel_skipped += 1
+
         wall_times.append(wall_s)
         per_img_s = wall_s / actual_bs
 
@@ -2225,18 +2329,24 @@ def run_c2i(args) -> Dict:
                     + n_skip * flops_skip
                 )
                 metrics["flops"]._n += 1
-            elif args.method == "teacache" and teacache_state is not None:
-                metrics["flops"].add_generation(
-                    SimpleNamespace(decisions=teacache_state["decisions"]))
-            elif args.method == "speca" and speca_cache_dic is not None:
-                metrics["flops"].add_speca_generation(
-                    full_steps=speca_cache_dic.full_count,
-                    taylor_steps=speca_cache_dic.taylor_count,
-                    probe_full_blocks=(
-                        speca_cache_dic.probe_full_blocks
-                        + speca_cache_dic.recompute_full_blocks),
-                    num_layers=len(generator.transformer.transformer_blocks),
-                )
+            elif is_registered(args.method):
+                # Method-agnostic FLOPs accounting via the adapter registry.
+                # Adapters no-op when their state object is absent, falling
+                # through to the vanilla-step count below only if nothing was
+                # accumulated.
+                adapter = get_adapter(args.method)
+                states = {
+                    "cache_dic": speca_cache_dic,
+                    "current": speca_current,
+                    "teacache_state": teacache_state,
+                }
+                if any(states.get(k) is not None for k in adapter.state_keys):
+                    adapter.add_flops(
+                        metrics["flops"], states,
+                        num_layers=len(
+                            generator.transformer.transformer_blocks))
+                else:
+                    metrics["flops"].add_vanilla_steps(args.num_steps)
             else:
                 metrics["flops"].add_vanilla_steps(args.num_steps)
 
@@ -2261,6 +2371,7 @@ def run_c2i(args) -> Dict:
         # Phase 2: 推理循环内不再调用任何训练方法。后台线程独立轮询
         # buffer, 在数据足够时自行触发训练。这里只做 event / anchor
         # 收集 (在 _denoise_loop 内部完成), latency 完全不受训练影响。
+        # -- COVR: done. --
 
     elapsed = time.time() - t_start
     print(f"\n  Total time: {elapsed/60:.1f} min "
@@ -2470,6 +2581,38 @@ def run_c2i(args) -> Dict:
                 covr_forced_template.modeled_full_block_equivalents),
             "probe_full_blocks": speca_totals["probe_full_blocks"],
         }
+
+    # COVR sentinel reward telemetry (bandit and forced modes).
+    # Forced-mode sweeps rely on these to correlate per-arm reward with
+    # per-arm FID; bandit-mode fills the same fields from the same scalars.
+    if _covr_has_any_covr:
+        covr_reward_stats = {
+            "sentinel_count": covr_sentinel_count,
+            "sentinel_full_steps": covr_sentinel_full_steps,
+            "sentinel_wall_s": covr_terminal_wall_s,
+            "sentinel_horizon": int(getattr(args, "covr_sentinel_horizon", 0)),
+            "sentinel_rate": float(getattr(args, "covr_sentinel_rate", 0.0)),
+            "sentinel_skipped": covr_sentinel_skipped,
+        }
+        if covr_terminal_losses:
+            covr_reward_stats["terminal_fidelity_loss_mean"] = float(
+                np.mean(covr_terminal_losses))
+            covr_reward_stats["terminal_fidelity_loss_std"] = float(
+                np.std(covr_terminal_losses))
+            covr_reward_stats["terminal_fidelity_loss_n"] = len(
+                covr_terminal_losses)
+        if covr_h_step_numerators:
+            covr_reward_stats["h_step_numerator_mean"] = float(
+                np.mean(covr_h_step_numerators))
+            covr_reward_stats["h_step_numerator_n"] = len(covr_h_step_numerators)
+        if covr_h_step_denominators:
+            covr_reward_stats["h_step_denominator_mean"] = float(
+                np.mean(covr_h_step_denominators))
+            covr_reward_stats["h_step_denominator_n"] = len(covr_h_step_denominators)
+        if covr_forced_strategy is not None:
+            covr_reward_stats["forced_strategy_id"] = (
+                covr_forced_strategy.strategy_id)
+        agg["covr_reward_telemetry"] = covr_reward_stats
 
     if "speed" in selected and all_results:
         unique_walls = list(dict.fromkeys(r["wall_s"] for r in all_results))

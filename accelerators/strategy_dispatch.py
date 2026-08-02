@@ -2,24 +2,28 @@
 """Method-agnostic accelerator strategy dispatcher.
 
 Given an ``AccelerationStrategy`` (e.g. "speca" with a refresh_mask, or
-"teacache" with a rel_l1_thresh), ``apply_strategy`` calls the correct
-accelerator's init function with the strategy's parameters and returns
-the resulting state objects.
+"teacache" with a rel_l1_thresh), ``apply_strategy`` looks up the method's
+``AcceleratorAdapter`` in the registry and calls its ``init_state`` with the
+strategy's parameters, returning the resulting state objects.
+
+The method-specific logic lives in the adapters (``accelerators/registry.py``),
+so a new accelerator becomes dispatchable by registering an adapter — no edit
+here.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional
 
 from .covr_bandit import AccelerationStrategy, RefreshTemplate
-from .speca import SpecACache, SpecAState, speca_init
-from .teacache import teacache_init
+from .registry import get_adapter
 
 
 def apply_strategy(
     strategy: AccelerationStrategy,
     speca_init_kwargs: Optional[Dict[str, Any]] = None,
     teacache_init_kwargs: Optional[Dict[str, Any]] = None,
+    **method_init_kwargs: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Configure an accelerator from an AccelerationStrategy.
 
@@ -28,51 +32,38 @@ def apply_strategy(
     strategy : AccelerationStrategy
         The selected strategy (from a bandit or forced).
     speca_init_kwargs : dict, optional
-        Base keyword arguments for ``speca_init`` (used when
-        ``strategy.method == "speca"``).  The ``refresh_mask`` and
-        ``controller`` kwargs are injected from the strategy.
+        Base keyword arguments for SpecA init (used when
+        ``strategy.method == "speca"``). The ``refresh_mask`` kwarg is
+        injected by the adapter from the strategy.
     teacache_init_kwargs : dict, optional
-        Base keyword arguments for ``teacache_init`` (used when
-        ``strategy.method == "teacache"``).  When the strategy carries a
+        Base keyword arguments for TeaCache init (used when
+        ``strategy.method == "teacache"``). When the strategy carries a
         ``refresh_mask`` (equal-FLOPs COVR arm) it is injected as
         ``refresh_mask``; otherwise ``rel_l1_thresh`` is injected from the
         strategy params.
+    **method_init_kwargs
+        Base init kwargs for any other registered method, keyed by that
+        adapter's ``init_kwargs_key`` (e.g. ``foo_init_kwargs={...}``).
 
     Returns
     -------
     dict
-        Method-specific state dictionary.  Guaranteed keys:
+        Method-specific state dictionary. Guaranteed keys are the selected
+        adapter's ``state_keys``:
 
-        * For ``"speca"``:  ``{"cache_dic": SpecACache,
-          "current": SpecAState}``
+        * For ``"speca"``:   ``{"cache_dic": SpecACache, "current": SpecAState}``
         * For ``"teacache"``: ``{"teacache_state": dict}``
     """
-    method = strategy.method
+    adapter = get_adapter(strategy.method)
 
-    if method == "speca":
-        kwargs = dict(speca_init_kwargs or {})
-        refresh_mask = strategy.refresh_mask
-        if refresh_mask is not None:
-            kwargs["refresh_mask"] = refresh_mask
-        cache_dic, current = speca_init(**kwargs)
-        return {"cache_dic": cache_dic, "current": current}
+    # Gather every method's base-kwargs bag by its adapter key, so this
+    # function forwards the right one without branching on the method.
+    kwargs_bags: Dict[str, Any] = dict(method_init_kwargs)
+    kwargs_bags["speca_init_kwargs"] = speca_init_kwargs
+    kwargs_bags["teacache_init_kwargs"] = teacache_init_kwargs
 
-    elif method == "teacache":
-        kwargs = dict(teacache_init_kwargs or {})
-        refresh_mask = strategy.refresh_mask
-        if refresh_mask is not None:
-            # Forced-schedule (equal-FLOPs COVR arm): the mask drives the
-            # per-step calc/skip decision, bypassing the dynamic threshold.
-            kwargs["refresh_mask"] = refresh_mask
-        else:
-            rel_l1_thresh = strategy.params.get("rel_l1_thresh")
-            if rel_l1_thresh is not None:
-                kwargs["rel_l1_thresh"] = rel_l1_thresh
-        teacache_state = teacache_init(**kwargs)
-        return {"teacache_state": teacache_state}
-
-    else:
-        raise ValueError(f"unsupported acceleration method: {method}")
+    base_kwargs = kwargs_bags.get(adapter.init_kwargs_key)
+    return adapter.init_state(strategy, base_kwargs)
 
 
 def strategy_from_refresh_template(

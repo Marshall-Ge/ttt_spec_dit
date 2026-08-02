@@ -449,6 +449,18 @@ def validate_args(args):
             print("[ERROR] --covr-force-strategy-id cannot use a compute "
                   "controller or suffix recompute.")
             return False
+        # Sentinel telemetry is a valid companion to a forced single-arm
+        # sweep (it is what the reward-vs-FID correlation analysis needs).
+        # Keep the same range checks the bandit path applies.
+        for name in ("covr_sentinel_rate",):
+            value = float(getattr(args, name))
+            if not 0.0 <= value <= 1.0:
+                print(f"[ERROR] --{name.replace('_', '-')} must be in [0, 1].")
+                return False
+        if args.covr_sentinel_horizon < 0 or args.covr_sentinel_horizon > args.num_steps:
+            print("[ERROR] --covr-sentinel-horizon must be between 0 and "
+                  "--num-steps.")
+            return False
 
     if args.covr_max_events is not None and args.covr_max_events <= 0:
         print("[ERROR] --covr-max-events must be positive.")

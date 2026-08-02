@@ -158,8 +158,15 @@ class AccelerationStrategy:
     def __post_init__(self) -> None:
         if not self.strategy_id:
             raise ValueError("strategy_id must be non-empty")
-        if self.method not in ("speca", "teacache"):
-            raise ValueError(f"unsupported acceleration method: {self.method}")
+        # Method validity is delegated to the adapter registry — a method is
+        # supported iff an AcceleratorAdapter is registered for it. This is
+        # the pluggable seam: new accelerators register an adapter and become
+        # valid strategies without editing this file.
+        from .registry import is_registered, registered_methods
+        if not is_registered(self.method):
+            raise ValueError(
+                f"unsupported acceleration method: {self.method} "
+                f"(registered: {registered_methods()})")
         if self.modeled_flops <= 0 and not math.isclose(self.modeled_flops, 0.0):
             raise ValueError("modeled_flops must be non-negative")
 
