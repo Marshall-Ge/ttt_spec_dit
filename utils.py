@@ -1,10 +1,16 @@
 # -*- coding: utf-8 -*-
 """CUDA timer, VAE decode, tensor↔PIL, image I/O helpers."""
 
+import hashlib
 import numpy as np
+import re
 import time
 import torch
 from PIL import Image
+from typing import Tuple
+
+# Old, seed-dependent cache naming: "<6-digit dataset index>_<class name>.png".
+_re_old_cache_name = re.compile(r"^\d{6}_.*\.png$")
 
 
 # ---------------------------------------------------------------------------
@@ -98,14 +104,59 @@ def load_real_image(path: str, size: int = 299) -> torch.Tensor:
 # FID real-image preprocessing (one-time, shared across runs)
 # ---------------------------------------------------------------------------
 
+def _real_299_cache_name(img_path: str) -> str:
+    """Cache filename for one source image, keyed by its PATH.
+
+    Keying by dataset index is WRONG and silently corrupts FID: dataset order
+    depends on ``--seed`` (``ImageNetDataset`` does ``RandomState(seed).shuffle``),
+    so index 000000 names a different source image at every seed. A cache built
+    at one seed then answers "already preprocessed" for another seed while
+    holding none of that seed's files. Path keying makes an entry mean the same
+    image for every seed, so the cache is shared instead of mutually
+    invalidating.
+
+    The stem keeps the source basename for human inspection; the hash makes it
+    collision-free across class subdirectories that reuse filenames.
+    """
+    digest = hashlib.sha1(img_path.encode("utf-8")).hexdigest()[:16]
+    stem = _os_basename_stem(img_path)
+    return f"{stem}_{digest}.png"
+
+
+def _os_basename_stem(path: str) -> str:
+    import os as _os
+    base = _os.path.basename(path)
+    stem = _os.path.splitext(base)[0]
+    return "".join(c if (c.isalnum() or c in "-_") else "_" for c in stem)[:64]
+
+
+def _real_299_items(ds, start_index: int, n: int) -> Tuple[list, int]:
+    """Return (all source paths, total_items) with the slice bounds checked."""
+    total_items = len(ds.items) if hasattr(ds, "items") else len(ds)
+    if start_index < 0 or n < 0 or start_index + n > total_items:
+        raise ValueError("real-image slice exceeds the loaded dataset prefix")
+    paths = []
+    for idx in range(total_items):
+        item = ds.items[idx] if hasattr(ds, "items") else ds[idx]
+        paths.append(item[0])
+    return paths, total_items
+
+
 def ensure_real_299(ds, output_dir: str, n: int, start_index: int = 0) -> str:
     """Ensure a deterministic real-image slice at 299×299 exists for FID.
 
-    Pre-processes all dataset images to 299×299 once into a flat directory,
-    then creates a lightweight subset via symlinks for the requested absolute
-    slice in the dataset's deterministic order.
+    Pre-processes every dataset image to 299×299 once into a shared cache keyed
+    by SOURCE PATH (see ``_real_299_cache_name``), then links the requested
+    absolute slice ``[start_index, start_index + n)`` of the dataset's
+    deterministic order into ``<output_dir>/real_299``.
 
-    Returns path to the subset directory (symlinks into the pre-processed cache).
+    Raises RuntimeError if fewer than ``n`` images could be linked. A short
+    real set does not fail loudly inside torch-fidelity — 1 image yields a
+    degenerate covariance ("Array must not contain infs or NaNs" -> FID NaN)
+    and 2 images yield a meaningless finite number, either of which quietly
+    destroys a whole sweep. Fail here instead.
+
+    Returns path to the subset directory (symlinks into the shared cache).
     """
     import os as _os
     from tqdm import tqdm as _tqdm
@@ -117,36 +168,31 @@ def ensure_real_299(ds, output_dir: str, n: int, start_index: int = 0) -> str:
     cache_dir = _os.path.join(_os.path.dirname(val_dir) or val_dir, "val_299_cache")
     _os.makedirs(cache_dir, exist_ok=True)
 
-    # Pre-process all dataset images once (including class name in filename)
-    existing = set(_os.listdir(cache_dir))
-    total_items = len(ds.items) if hasattr(ds, 'items') else len(ds)
-    if start_index < 0 or n < 0 or start_index + n > total_items:
-        raise ValueError("real-image slice exceeds the loaded dataset prefix")
-    need_preprocess = sum(1 for i in range(total_items)
-                          if not any(f.startswith(f"{i:06d}_") for f in existing))
+    all_paths, total_items = _real_299_items(ds, start_index, n)
+    cached = set(_os.listdir(cache_dir))
+    stale = sum(1 for f in cached if _re_old_cache_name.match(f))
+    if stale:
+        print(f"  [FID] note: {stale} cache entries use the old index-keyed "
+              f"naming and are now unused (safe to delete: "
+              f"find {cache_dir} -name '[0-9][0-9][0-9][0-9][0-9][0-9]_*.png' "
+              f"-delete)")
+    todo = [(idx, p) for idx, p in enumerate(all_paths)
+            if _real_299_cache_name(p) not in cached]
 
-    if need_preprocess > 0:
-        print(f"  [FID] Pre-processing {need_preprocess} real images to 299×299 "
+    if todo:
+        print(f"  [FID] Pre-processing {len(todo)} real images to 299×299 "
               f"(one-time, cached in {cache_dir})...")
-        for idx in _tqdm(range(total_items), desc="preprocess real 299", ncols=80):
-            # Get class name from dataset prompt
-            if hasattr(ds, '__getitem__'):
-                _, prompt, _ = ds[idx]
-                cls_name = prompt.replace("a photo of a ", "").replace(" ", "_")
-            else:
-                cls_name = "unknown"
-            fname = f"{idx:06d}_{cls_name}.png"
-            out_path = _os.path.join(cache_dir, fname)
-            if _os.path.exists(out_path):
-                continue
-            img_path = ds[idx][0] if hasattr(ds, '__getitem__') else ds.items[idx][0]
+        for _, img_path in _tqdm(todo, desc="preprocess real 299", ncols=80):
             if not _os.path.exists(img_path):
+                continue
+            out_path = _os.path.join(cache_dir, _real_299_cache_name(img_path))
+            if _os.path.exists(out_path):
                 continue
             pil_img = Image.open(img_path).convert("RGB")
             pil_img = pil_img.resize((299, 299), Image.BICUBIC)
             pil_img.save(out_path)
 
-    # Create run-specific subset via symlinks (match cache filename format)
+    # Create run-specific subset via symlinks
     subset_dir = _os.path.join(output_dir, "real_299")
     _os.makedirs(subset_dir, exist_ok=True)
 
@@ -156,16 +202,26 @@ def ensure_real_299(ds, output_dir: str, n: int, start_index: int = 0) -> str:
         if _os.path.islink(p) or f.endswith('.png'):
             _os.remove(p)
 
+    linked = 0
+    missing = []
     for idx in range(start_index, start_index + n):
-        _, prompt, _ = ds[idx] if hasattr(ds, '__getitem__') else (None, "unknown", None)
-        cls_name = prompt.replace("a photo of a ", "").replace(" ", "_")
-        fname = f"{idx:06d}_{cls_name}.png"
-        src = _os.path.join(cache_dir, fname)
-        dst = _os.path.join(subset_dir, fname)
-        if _os.path.exists(src):
-            _os.symlink(src, dst)
+        img_path = all_paths[idx]
+        src = _os.path.join(cache_dir, _real_299_cache_name(img_path))
+        if not _os.path.exists(src):
+            missing.append(img_path)
+            continue
+        _os.symlink(src, _os.path.join(subset_dir, f"{idx:06d}_"
+                                       + _real_299_cache_name(img_path)))
+        linked += 1
 
-    print(f"  [FID] real_299 ready: {n} symlinks → {cache_dir}")
+    if linked < n:
+        raise RuntimeError(
+            f"real_299 incomplete: linked {linked}/{n} images into "
+            f"{subset_dir} (cache: {cache_dir}). FID computed from a short "
+            f"real set is invalid, so this is fatal rather than a warning. "
+            f"First missing source: {missing[0] if missing else 'n/a'}")
+
+    print(f"  [FID] real_299 ready: {linked} symlinks → {cache_dir}")
     return subset_dir
 
 

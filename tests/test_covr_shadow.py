@@ -273,10 +273,70 @@ def test_real_299_subset_uses_absolute_dataset_indices(tmp_path):
             return self.items[index]
 
     subset = ensure_real_299(Dataset(), str(tmp_path / "run"), 2, start_index=2)
-    assert sorted(path.name for path in Path(subset).iterdir()) == [
-        "000002_class_2.png",
-        "000003_class_3.png",
-    ]
+    names = sorted(path.name for path in Path(subset).iterdir())
+    assert len(names) == 2
+    # Absolute dataset index prefixes the link; the cache stem identifies the
+    # SOURCE image (path-keyed), so links resolve regardless of --seed order.
+    assert names[0].startswith("000002_source_2_")
+    assert names[1].startswith("000003_source_3_")
+    assert all(Path(subset, n).resolve().exists() for n in names)
+
+
+def test_real_299_cache_is_shared_across_shuffle_orders(tmp_path):
+    """Two datasets over the SAME files in different order must both link n.
+
+    This is the seed-shuffle bug: an index-keyed cache built by seed A answers
+    "already preprocessed" for seed B while holding none of B's filenames, so
+    B links ~0 images and its FID silently becomes NaN.
+    """
+    val_dir = tmp_path / "imagenet" / "val"
+    val_dir.mkdir(parents=True)
+    paths = []
+    for index in range(4):
+        path = val_dir / f"source_{index}.png"
+        Image.new("RGB", (8, 8), color=(index, index, index)).save(path)
+        paths.append(str(path))
+
+    class Dataset:
+        def __init__(self, order):
+            self.val_dir = str(val_dir)
+            self.items = [(paths[i], f"a photo of a class {i}", i)
+                          for i in order]
+
+        def __len__(self):
+            return len(self.items)
+
+        def __getitem__(self, index):
+            return self.items[index]
+
+    first = ensure_real_299(Dataset([0, 1, 2, 3]), str(tmp_path / "a"), 4)
+    assert len(list(Path(first).iterdir())) == 4
+    # Reversed order == a different --seed. Cache is warm but keyed by path.
+    second = ensure_real_299(Dataset([3, 2, 1, 0]), str(tmp_path / "b"), 4)
+    assert len(list(Path(second).iterdir())) == 4
+
+
+def test_real_299_raises_when_source_images_are_missing(tmp_path):
+    """A short real set must be fatal, not a silent skip -> NaN FID."""
+    val_dir = tmp_path / "imagenet" / "val"
+    val_dir.mkdir(parents=True)
+    good = val_dir / "present.png"
+    Image.new("RGB", (8, 8), color=(1, 2, 3)).save(good)
+
+    class Dataset:
+        def __init__(self):
+            self.val_dir = str(val_dir)
+            self.items = [(str(good), "a photo of a present", 0),
+                          (str(val_dir / "absent.png"), "a photo of a gone", 1)]
+
+        def __len__(self):
+            return len(self.items)
+
+        def __getitem__(self, index):
+            return self.items[index]
+
+    with pytest.raises(RuntimeError, match="real_299 incomplete: linked 1/2"):
+        ensure_real_299(Dataset(), str(tmp_path / "run"), 2)
 
 
 def test_online_accounting_separates_candidate_and_safety_cost():

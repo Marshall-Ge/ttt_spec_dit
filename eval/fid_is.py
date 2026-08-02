@@ -94,9 +94,21 @@ class FIDISComputer(Metric):
 
         try:
             from torch_fidelity import calculate_metrics
+            real_files = [f for f in os.listdir(self.real_dir)
+                          if f.endswith('.png')]
             print(f"\n  [FID/IS] Computing via torch-fidelity...")
-            print(f"    Real: {self.real_dir}")
-            print(f"    Gen:  {self.gen_dir} ({len(gen_files)} images)")
+            print(f"    input1: {self.real_dir} ({len(real_files)} images)")
+            print(f"    input2: {self.gen_dir} ({len(gen_files)} images)")
+            if len(real_files) < 2 or len(gen_files) < 2:
+                # FID needs a covariance estimate; a 1-image set makes it
+                # singular and torch-fidelity dies with "Array must not
+                # contain infs or NaNs", which reads like a numerical fluke
+                # rather than a short input set. Say what is actually wrong.
+                print(f"  [WARN] FID needs >=2 images per side "
+                      f"(input1={len(real_files)}, input2={len(gen_files)}); "
+                      f"FID/IS -> NaN")
+                return {"fid": float("nan"), "is_mean": float("nan"),
+                        "is_std": float("nan")}
 
             metrics = calculate_metrics(
                 input1=self.real_dir,
