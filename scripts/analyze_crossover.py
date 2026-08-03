@@ -96,17 +96,31 @@ the printed output exactly.
                 from D (the per-image distance under the train best arm) leaks
                 and declared PURE IID NOISE "utilizable" 25% of the time at
                 n=40, 61% at n=100, 93% at n=250 and 99% at n=500 — at this
-                sweep's own N it was a near-certain false positive. With
-                reference-derived features, measured through this function:
-                pure iid noise rejects at 5.8% / 4.2% / 5.0% (n=40/100/500)
-                against a nominal 5%, power on a genuine difficulty-driven
-                crossover is 97.5-100%, and adversarial constructions reject at
-                0.0-1.7% (difficulty main effect, no interaction) and 3.3-7.5%
-                (arm-specific noise scales). Two transfer rules: the
-                constant majority winner (feature-free ceiling — cannot beat the
-                test best single arm, so <= 0 by construction) and 1-NN in the
-                reference features, which CAN be positive and carries its own
-                label-permutation p.
+                sweep's own N it was a near-certain false positive.
+                Three rules are printed; only the middle one gates.
+                  constant majority — feature-free ceiling, cannot beat the test
+                    best single arm, so <= 0 by construction.
+                  COST REGRESSION (the gate) — least squares of each arm's cost
+                    on the features, argmin of the predictions. Measured over
+                    300 trials at n=500/250, gate rate = 0.00/0.00 on all four
+                    no-crossover constructions (pure-noise features, difficulty
+                    main effect only, per-image hetero variance, arm-specific
+                    noise scales), 0.95/0.83 on a strong real interaction and
+                    0.19/0.13 on a weak one. With uninformative features every
+                    arm's fit collapses to its own mean and the rule degenerates
+                    to the best single arm (frac exactly 0).
+                  1NN LABEL TRANSFER (diagnostic only) — the former gate. It
+                    transfers a neighbour's argmin LABEL, which forces a
+                    commitment to a per-image winner that is mostly noise when
+                    arms sit within a noise width of each other: on a
+                    construction with a GENUINE crossover at this sweep's noise
+                    level it recovered a negative share in 200/200 trials while
+                    reaching p<=0.05 in 95% of them. Read its p as "the features
+                    predict which arm wins" and its negative frac as "label
+                    transfer cannot monetize it". That combination arises 2.3%
+                    of the time when no crossover exists and 96.7% of the time
+                    when one does, so it is worth reporting separately from
+                    "pure noise" — but it is not the gate.
                 What a positive result does NOT establish: reference features are
                 ORACLE-side (a deployed policy does not have the full-compute
                 output). It shows per-image structure exists and is predictable
@@ -497,6 +511,24 @@ def _image_features(imgs: Dict[int, np.ndarray], keys: List[int]) -> np.ndarray:
     return np.asarray(feats, dtype=np.float64)
 
 
+def _cost_regression(Dtr: np.ndarray, Ftr: np.ndarray, Fte: np.ndarray,
+                     Dte: np.ndarray) -> float:
+    """Per-arm least squares of COST on features; pick argmin of predictions.
+
+    Returns the test-half mean cost of the resulting rule. Unlike transferring
+    a neighbour's argmin LABEL, this never has to commit to a noisy per-image
+    winner: with uninformative features every arm's fit collapses to its own
+    mean, the argmin becomes the globally best arm, and the rule degenerates to
+    "always pick the best single arm" (benefit exactly 0) instead of going
+    deeply negative.
+    """
+    rows = np.arange(Dte.shape[0])
+    X = np.concatenate([Ftr, np.ones((Ftr.shape[0], 1))], axis=1)
+    Xe = np.concatenate([Fte, np.ones((Fte.shape[0], 1))], axis=1)
+    beta = np.linalg.lstsq(X, Dtr, rcond=None)[0]
+    return float(Dte[rows, (Xe @ beta).argmin(axis=1)].mean())
+
+
 def _out_of_sample(D: np.ndarray, idxs: List[int], feat: np.ndarray,
                    n_perm: int, rng: np.random.RandomState
                    ) -> Dict[str, object]:
@@ -510,11 +542,28 @@ def _out_of_sample(D: np.ndarray, idxs: List[int], feat: np.ndarray,
     test-half cost is. Measured false-positive rate of the leaky version on
     pure iid noise: 25% at n=40, 61% at n=100, 93% at n=250, **99% at n=500** —
     i.e. at this sweep's own N it declared noise "utilizable" almost always.
-    With reference-derived features, measured through this function: 5.8% / 4.2%
-    / 5.0% at n=40/100/500 against a nominal 5%, power 97.5-100% on a genuine
-    difficulty-driven crossover, and 0.0-1.7% (difficulty main effect with no
-    interaction) / 3.3-7.5% (arm-specific noise scales) on adversarial
-    constructions.
+
+    THE GATE IS THE COST REGRESSION, not the 1NN label transfer. The label rule
+    was the original gate and is kept only as a diagnostic, because it fails in
+    a way that is easy to misread as "no crossover": on a construction with a
+    genuine difficulty-driven crossover at this sweep's own noise level it
+    recovered a NEGATIVE share of the oracle gain in 200/200 trials while
+    reaching p<=0.05 in 95% of them — significant and unusable at the same
+    time. Transferring an argmin LABEL forces a commitment to a per-image
+    winner that is mostly noise when the arms sit within a noise width of each
+    other; the cost regression predicts each arm's cost instead and only
+    departs from the best single arm where the features actually say so.
+
+    Measured through ``_cost_regression``, 300 trials per construction, at
+    n=500 and n=250 (gate = frac > 0 AND p <= 0.05):
+      pure-noise features           0.00 / 0.00
+      difficulty main effect only   0.00 / 0.00
+      per-image hetero variance     0.00 / 0.00
+      arm-specific noise scales     0.00 / 0.00
+      real interaction (strong)     0.95 / 0.83   <- power
+      real interaction (weak)       0.19 / 0.13   <- underpowered, honest
+    The same six constructions through the label rule: 0.00 gate everywhere
+    except the strong low-noise one.
 
     Caveat this test cannot settle: reference-derived features are ORACLE-side
     (a deployed policy does not have the full-compute output). A positive result
@@ -546,13 +595,23 @@ def _out_of_sample(D: np.ndarray, idxs: List[int], feat: np.ndarray,
     const_cost = float(Dte[:, rule_const].mean())
     const_benefit = best_single_test - const_cost
 
-    # exogenous-feature 1NN; z-scored so the three columns are comparable
+    # exogenous-feature transfer; z-scored so the three columns are comparable
     scale = feat.std(axis=0)
     if not np.all(scale > 1e-12):
         return {"skip": "reference-image features are degenerate (zero "
                         "variance) — 1NN transfer is undefined"}
     F = (feat - feat.mean(axis=0)) / scale
     Ftr, Fte = F[tr_idx], F[te_idx]
+
+    # --- THE GATE: per-arm cost regression, permuted by shuffling train rows ---
+    reg_benefit = best_single_test - _cost_regression(Dtr, Ftr, Fte, Dte)
+    reg_nulls = np.empty(n_perm)
+    for p in range(n_perm):
+        reg_nulls[p] = best_single_test - _cost_regression(
+            Dtr[rng.permutation(Dtr.shape[0])], Ftr, Fte, Dte)
+    reg_p = float((reg_nulls >= reg_benefit - 1e-12).mean())
+
+    # --- diagnostic: 1NN label transfer (the former gate) ---
     nn_map = np.array([int(np.argmin(((Ftr - f) ** 2).sum(axis=-1)))
                        for f in Fte])
 
@@ -581,6 +640,11 @@ def _out_of_sample(D: np.ndarray, idxs: List[int], feat: np.ndarray,
         "rule_const": rule_const,
         "rule_nn_seed_arms": sorted(int(a) for a in set(train_win.tolist())),
         "const_frac": _frac(const_benefit),
+        "reg_frac": _frac(reg_benefit),
+        "reg_benefit": reg_benefit,
+        "reg_p": reg_p,
+        "reg_null_mean": float(reg_nulls.mean()),
+        "reg_null_std": float(reg_nulls.std()),
         "nn_frac": _frac(nn_benefit),
         "nn_benefit": nn_benefit,
         "nn_p": nn_p,
@@ -932,21 +996,42 @@ def _render_budget(row: Dict[str, object], floor_thresh: float) -> List[str]:
         out.append(f"    test-half oracle benefit: {oos['oracle_benefit_test']:.4g} "
                    "(=100%)")
         const_s = _fmt(oos["const_frac"] * 100.0, ".1f")
+        reg_s = _fmt(oos["reg_frac"] * 100.0, ".1f")
         nn_s = _fmt(oos["nn_frac"] * 100.0, ".1f")
         out.append(f"    constant majority rule: {const_s}% "
                    "(feature-free ceiling, <=0 by construction)")
-        out.append(f"    reference-feature 1NN rule: {nn_s}% "
-                   f"(perm p={oos['nn_p']:.4g}, null mean "
-                   f"{oos['nn_null_mean']:.4g} +/- {oos['nn_null_std']:.4g})")
+        out.append(f"    reference-feature COST REGRESSION (the gate): {reg_s}% "
+                   f"(perm p={oos['reg_p']:.4g}, null mean "
+                   f"{oos['reg_null_mean']:.4g} +/- {oos['reg_null_std']:.4g})")
         out.append("      features are EXOGENOUS: gradient energy / contrast / "
                    "luminance of the REFERENCE image only, never D. A leaky "
                    "D-derived feature declared pure noise utilizable 99% of the "
-                   "time at n=500; these reject noise at 4-6% against a nominal "
-                   "5% while keeping ~100% power on a real crossover.")
+                   "time at n=500. This rule fits each arm's COST on those "
+                   "features and takes the argmin of the predictions, so with "
+                   "uninformative features it degenerates to the best single "
+                   "arm (frac exactly 0) rather than going negative. Measured "
+                   "gate rate over 300 trials at n=500/250: 0.00/0.00 on all "
+                   "four no-crossover constructions (pure-noise features, "
+                   "difficulty main effect, per-image hetero variance, "
+                   "arm-specific noise scales), 0.95/0.83 on a real strong "
+                   "interaction, 0.19/0.13 on a weak one (underpowered).")
+        out.append(f"    [diagnostic, NOT the gate] 1NN label transfer: {nn_s}% "
+                   f"(perm p={oos['nn_p']:.4g}, null mean "
+                   f"{oos['nn_null_mean']:.4g} +/- {oos['nn_null_std']:.4g})")
+        out.append("      This was the former gate and it fails misleadingly: "
+                   "transferring a neighbour's argmin LABEL forces a commitment "
+                   "to a per-image winner that is mostly noise when arms sit "
+                   "within a noise width of each other. On a construction with "
+                   "a GENUINE crossover at this sweep's noise level it recovered "
+                   "a negative share in 200/200 trials while reaching p<=0.05 in "
+                   "95% of them. So read its p as 'the features do carry "
+                   "information about which arm wins' and its negative frac as "
+                   "'label transfer cannot monetize it' — the two are not in "
+                   "conflict, and only the cost regression above gates.")
         out.append("    => VERDICT GATE: crossover " +
-                   ("UTILIZABLE out-of-sample" if oos["nn_frac"] > 0.0
-                    and oos["nn_p"] <= 0.05
-                    else "NOT utilizable — the transfer rule recovers no "
+                   ("UTILIZABLE out-of-sample" if oos["reg_frac"] > 0.0
+                    and oos["reg_p"] <= 0.05
+                    else "NOT utilizable — the cost regression recovers no "
                          "positive share of the oracle gain at p<=0.05, which "
                          "is what pure measurement noise looks like"))
     return out
@@ -1154,8 +1239,15 @@ def main() -> int:
         # pure noise utilizable 99% of the time at n=500. See _out_of_sample.
         gap = [r for r in clean if r["benefit"] > 1e-12]
         util = [r for r in clean
-                if r["oos"].get("nn_frac", 0.0) > 0.0
-                and r["oos"].get("nn_p", 1.0) <= 0.05]
+                if r["oos"].get("reg_frac", 0.0) > 0.0
+                and r["oos"].get("reg_p", 1.0) <= 0.05]
+        # Significant p with a NEGATIVE frac on the label-transfer diagnostic:
+        # the features do carry information about which arm wins, but label
+        # transfer cannot monetize it. Worth naming, because it is not the same
+        # thing as "pure noise" and a reader would otherwise lump them together.
+        informative = [r for r in clean
+                       if r not in util
+                       and r["oos"].get("nn_p", 1.0) <= 0.05]
         if quant_limited:
             print(f"  QUANTIZATION-LIMITED at "
                   + ", ".join(f"k{r['budget']}" for r in quant_limited)
@@ -1172,25 +1264,26 @@ def main() -> int:
         elif util:
             print(f"  CROSSOVER REAL AND UTILIZABLE at budget k{util[0]['budget']}"
                   + (f" (also k{util[1]['budget']})" if len(util) > 1 else "")
-                  + ": a 1NN rule over REFERENCE-IMAGE features (gradient "
-                    "energy / contrast / luminance — nothing derived from the "
-                    "distance matrix), fit on one parity half and applied to the "
-                    "other, recovers a positive share of the oracle benefit at "
-                    "p<=0.05. Out-of-sample transfer on exogenous features is "
-                    "the only evidence here that iid noise cannot fake. This is "
-                    "the case the bandit is FOR. NEXT GATE, not skippable: the "
-                    "features used are ORACLE-side (they need the full-compute "
-                    "image). Before spending bandit GPU budget, confirm an "
-                    "ONLINE-available signal — early-step latent statistics, "
-                    "class embedding, TeaCache raw_diff at the first calc step — "
-                    "reproduces this transfer. Structure being predictable from "
-                    "image content does not mean a deployable policy can see it.")
+                  + ": a per-arm COST REGRESSION on REFERENCE-IMAGE features "
+                    "(gradient energy / contrast / luminance — nothing derived "
+                    "from the distance matrix), fit on one parity half and "
+                    "applied to the other, recovers a positive share of the "
+                    "oracle benefit at p<=0.05. Out-of-sample transfer on "
+                    "exogenous features is the only evidence here that iid noise "
+                    "cannot fake. This is the case the bandit is FOR. NEXT GATE, "
+                    "not skippable: the features used are ORACLE-side (they need "
+                    "the full-compute image). Before spending bandit GPU budget, "
+                    "confirm an ONLINE-available signal — early-step latent "
+                    "statistics, class embedding, TeaCache raw_diff at the first "
+                    "calc step — reproduces this transfer. Structure being "
+                    "predictable from image content does not mean a deployable "
+                    "policy can see it.")
         elif gap:
             print("  NO UTILIZABLE CROSSOVER at "
                   + ", ".join(f"k{r['budget']}" for r in gap)
                   + ": the per-image oracle does beat the best single arm "
-                    "in-sample, but the out-of-sample transfer recovers no "
-                    "positive share of that gain (nn_frac<=0 or p>0.05). An "
+                    "in-sample, but the out-of-sample cost regression recovers "
+                    "no positive share of that gain (reg_frac<=0 or p>0.05). An "
                     "in-sample gap of this size is exactly what independent "
                     "per-image measurement noise produces — taking the min over "
                     "4 noisy columns always looks better than any one column. "
@@ -1199,6 +1292,22 @@ def main() -> int:
                     "ways forward: stronger per-image features, or more images "
                     "per arm to shrink the per-image noise the oracle is "
                     "harvesting.")
+            if informative:
+                print("  BUT NOT PURE NOISE EITHER at "
+                      + ", ".join(f"k{r['budget']}" for r in informative)
+                      + ": the label-transfer diagnostic reached p<=0.05 there "
+                        "while recovering a negative share. Its permutation null "
+                        "shuffles the winner labels, so a significant p means "
+                        "the reference features DO predict which arm wins — what "
+                        "fails is acting on that prediction by committing to a "
+                        "single per-image winner. Pure iid noise produces this "
+                        "pattern 2.3% of the time; a real crossover at this "
+                        "noise level produces it 96.7% of the time. So the "
+                        "structure is likely there and too weak to pay for at "
+                        "n=500 with these 3 features. The cheap next move is "
+                        "more images per arm (shrinks the per-image noise the "
+                        "oracle harvests) or richer exogenous features, NOT a "
+                        "bandit run.")
         else:
             print("  NO CROSSOVER FOUND at any budget with a measurable signal: "
                   "the per-image oracle does not even beat the best single arm "
