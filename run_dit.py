@@ -2623,6 +2623,12 @@ def run_c2i(args) -> Dict:
             "model": "dit",
             "task": "c2i",
             "dataset": dataset_name,
+            # The seed drives BOTH the dataset shuffle (ImageNetDataset does
+            # RandomState(seed).shuffle) and, through it, which source image
+            # every global_idx names. Per-image analyses pair arms by
+            # global_idx, so a run whose seed is unknown cannot be paired
+            # against another run at all — record it.
+            "seed": args.seed,
             "dataset_start_index": dataset_start_index,
             "resume_sample_offset": covr_resume_sample_offset,
             "generation_start_index": generation_start_index,

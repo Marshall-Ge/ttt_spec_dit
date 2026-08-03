@@ -22,9 +22,36 @@ Why per-image and not per-class:
 Four sections per budget; only [d] is a verdict gate. Lettering below matches
 the printed output exactly.
 
-  [a] validity   per-arm MEAN per-image distance must rank the arms the same way
+  [a] validity   per-arm MEAN per-image loss must rank the arms the same way
                 FID does. If not, the proxy measures something other than what
                 FID measures and the crossover conclusion is void.
+                ``--metric`` picks the loss, and WHICH loss fails [a] changes
+                what the failure means:
+                  ``inception`` (default when torch-fidelity loads) — squared
+                    distance in FID's OWN InceptionV3 pool3 ("2048") features.
+                    Strictly the strongest reference-based per-image proxy for
+                    FID available here, so an [a] failure under it is evidence
+                    about the fidelity-to-full-compute REWARD FAMILY (terminal
+                    and its H-step sentinel variant alike), not about metric
+                    choice — it closes the family without spending the
+                    sentinel's +125% forwards.
+                  ``inception_conf`` — REFERENCE-FREE predictive entropy of the
+                    same network's ``logits_unbiased``, i.e. the per-image half
+                    of Inception Score (IS's confidence term is -H[p(y|x)]; the
+                    diversity term is a distribution property and cannot exist
+                    per image). Its purpose is to remove the one escape route
+                    ``inception`` leaves open — that the reference is not the FID
+                    optimum, so distance-TO-reference is the wrong anchor
+                    regardless of feature space. Known bias, printed in the
+                    output rather than hidden: entropy rewards
+                    class-prototypicality, so an arm collapsing toward confident
+                    generic exemplars scores well here while FID punishes it.
+                    FID therefore still gates; a second Spearman against IS is
+                    printed to separate "unfaithful to its own aggregate" from
+                    "faithful to IS, and IS disagrees with FID".
+                  ``lpips`` / ``pixel_mse`` — neither is in FID's feature space,
+                    so their [a] failures do NOT close anything; they may just
+                    mean the proxy is weak. The RECOMMENDATION block says so.
   [b] floor      PNGs are 8-bit. If the arm-to-arm signal sits at the uint8
                 rounding floor, the measured crossover is rounding noise and the
                 budget is excluded from the verdict.
@@ -169,10 +196,117 @@ def _pixel_mse_vectorized(ref_al: np.ndarray, arm_al: np.ndarray) -> np.ndarray:
     return (d * d).mean(axis=(1, 2, 3))
 
 
+def _metric_desc(metric: str, device: str) -> str:
+    """One-line description of a metric NAME, printed in the header and per
+    budget. Kept separate from the metric implementations so the header and the
+    per-budget rows cannot disagree (they did: ``_analyze_budget`` used to
+    re-resolve the metric and always landed on pixel MSE)."""
+    if metric == "lpips":
+        return f"lpips (eval/lpips.py LPIPSScorer, device={device})"
+    if metric == "inception":
+        return ("inception (mean squared difference of torch-fidelity "
+                "InceptionV3 pool3 '2048' features vs the reference; "
+                f"smaller = closer to full compute, device={device})")
+    if metric == "inception_conf":
+        return ("inception_conf (REFERENCE-FREE: predictive entropy of "
+                "torch-fidelity InceptionV3 'logits_unbiased' in nats; "
+                f"smaller = more confident, device={device})")
+    return "pixel_mse (eval/mse.py compute_pixel_mse)"
+
+
+# --- InceptionV3 feature metrics -------------------------------------------
+# FID is a Frechet distance between Gaussians fitted to torch-fidelity's
+# InceptionV3 pool3 ("2048") activations, and IS comes from the same network's
+# "logits_unbiased". Both metrics below therefore live in the SAME feature space
+# as the aggregate numbers [a] validates against, which is the entire reason to
+# prefer them over pixel MSE or LPIPS: if a per-image distance in FID's own
+# feature space still cannot rank the arms like FID, no reference-based per-image
+# metric can, and the whole fidelity-to-full-compute reward family (terminal AND
+# the H-step sentinel) is closed rather than merely badly measured.
+
+_INCEPTION_CACHE: Dict[Tuple[str, str], object] = {}
+
+
+def _inception_extractor(feature: str, device: str):
+    """Cached torch-fidelity InceptionV3 extractor for one features_list entry.
+
+    ``forward`` asserts a uint8 4-D BxCxHxW tensor and performs the 299x299
+    resize and the (x-128)/128 scaling internally, TF-compatibly — so the input
+    must NOT be pre-normalized to [0,1] the way the LPIPS and pixel-MSE paths
+    do. Passing floats trips the extractor's own dtype assert.
+    """
+    key = (feature, device)
+    if key in _INCEPTION_CACHE:
+        return _INCEPTION_CACHE[key]
+    try:
+        from torch_fidelity.registry import FEATURE_EXTRACTORS_REGISTRY
+        cls = FEATURE_EXTRACTORS_REGISTRY["inception-v3-compat"]
+    except Exception:
+        from torch_fidelity.feature_extractor_inceptionv3 import (
+            FeatureExtractorInceptionV3 as cls)
+    ext = cls("inception-v3-compat", [feature]).to(device).eval()
+    for p in ext.parameters():
+        p.requires_grad_(False)
+    _INCEPTION_CACHE[key] = ext
+    return ext
+
+
+def _inception_features(imgs: List[np.ndarray], feature: str, device: str,
+                        batch: int = 32) -> np.ndarray:
+    """uint8 [H,W,3] list -> (n, d) float64 activations."""
+    import torch
+    ext = _inception_extractor(feature, device)
+    out = []
+    with torch.no_grad():
+        for s in range(0, len(imgs), batch):
+            chunk = np.stack(imgs[s:s + batch]).transpose(0, 3, 1, 2)
+            t = torch.from_numpy(np.ascontiguousarray(chunk)).to(device)
+            out.append(ext(t)[0].float().cpu().numpy())
+    return np.concatenate(out, axis=0).astype(np.float64)
+
+
+def _entropy_from_logits(logits: np.ndarray) -> np.ndarray:
+    """(n, 1008) logits -> (n,) predictive entropy in nats; smaller = more
+    confident. The single-image analogue of Inception Score: IS is the mean KL
+    from p(y|x) to the marginal p(y), whose per-image term is exactly
+    -H[p(y|x)] plus a distribution-level constant. Using entropy directly keeps
+    this script's "smaller = better" convention, at the cost of dropping IS's
+    diversity term — which is a DISTRIBUTION property and cannot exist per
+    image, and is also the half of IS that a per-image reward would need in
+    order not to collapse onto class prototypes."""
+    m = logits.max(axis=1, keepdims=True)
+    z = logits - m
+    logsum = np.log(np.exp(z).sum(axis=1, keepdims=True))
+    logp = z - logsum
+    p = np.exp(logp)
+    return -(p * logp).sum(axis=1)
+
+
+def _distance_matrix(metric: str, device: str, ref_al: np.ndarray,
+                     arm_stacks: List[np.ndarray]) -> np.ndarray:
+    """(n, n_arm) loss matrix, smaller = better, for the BATCHED metrics."""
+    n_arm = len(arm_stacks)
+    D = np.empty((ref_al.shape[0], n_arm))
+    if metric == "inception":
+        ref_f = _inception_features(list(ref_al), "2048", device)
+        for j, arm_al in enumerate(arm_stacks):
+            d = ref_f - _inception_features(list(arm_al), "2048", device)
+            D[:, j] = (d * d).mean(axis=1)
+        return D
+    if metric == "inception_conf":
+        # REFERENCE-FREE: ref_al is deliberately never touched here.
+        for j, arm_al in enumerate(arm_stacks):
+            lg = _inception_features(list(arm_al), "logits_unbiased", device)
+            D[:, j] = _entropy_from_logits(lg)
+        return D
+    raise ValueError(f"not a batched metric: {metric}")
+
+
 def _make_distance(metric: str, device: str):
-    """Return (fn(ref_arr, arm_arr)->float, description). Both args are
-    uint8 [H,W,3] arrays. ``eval/lpips.py`` LPIPSScorer is preferred; the
-    pixel-MSE path reuses ``eval/mse.py compute_pixel_mse``."""
+    """Return (fn(ref_arr, arm_arr)->float, description) for the PER-PAIR
+    metrics. Both args are uint8 [H,W,3] arrays. Batched metrics
+    (``inception``, ``inception_conf``) do not go through this — see
+    ``_distance_matrix``."""
     import torch
 
     if metric == "lpips":
@@ -186,7 +320,7 @@ def _make_distance(metric: str, device: str):
                 arm.transpose(2, 0, 1).astype(np.float32) / 255.0)[None]
             return float(scorer.score(rt, at))
 
-        return fn, f"lpips (eval/lpips.py LPIPSScorer, device={device})"
+        return fn, _metric_desc("lpips", device)
 
     from eval.mse import compute_pixel_mse
 
@@ -195,7 +329,7 @@ def _make_distance(metric: str, device: str):
         at = torch.from_numpy(arm.transpose(2, 0, 1).astype(np.float32) / 255.0)
         return float(compute_pixel_mse(at, rt))
 
-    return fn, "pixel_mse (eval/mse.py compute_pixel_mse)"
+    return fn, _metric_desc("pixel_mse", device)
 
 
 def _lpips_usable(device: str) -> bool:
@@ -211,15 +345,54 @@ def _lpips_usable(device: str) -> bool:
         return False
 
 
-def _resolve_metric(choice: str, device: str):
+def _inception_usable(device: str) -> Tuple[bool, str]:
+    """Build the extractor and score one 8x8 image; (ok, reason)."""
+    try:
+        _inception_features([np.zeros((8, 8, 3), dtype=np.uint8)],
+                            "2048", device)
+        return True, ""
+    except Exception as exc:  # torch_fidelity missing, no weights, no net
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+# Metrics that need the batched path and a reference-free [a] gate.
+_BATCHED = ("inception", "inception_conf")
+_REFERENCE_FREE = ("inception_conf",)
+
+
+def _resolve_metric(choice: str, device: str) -> Tuple[str, str]:
+    """Resolve ``--metric`` to a concrete (name, description).
+
+    Returns the NAME, not a callable: ``inception``/``inception_conf`` are
+    batched over the whole image set, so the per-pair callable would be the
+    wrong interface for them. ``_analyze_budget`` dispatches on the name.
+    """
     if choice == "auto":
-        choice = "lpips" if _lpips_usable(device) else "pixel_mse"
+        # Prefer FID's own feature space when it is available, since that is the
+        # only per-image metric whose failure at [a] is informative about the
+        # reward family rather than about the metric.
+        ok, _ = _inception_usable(device)
+        if ok:
+            choice = "inception"
+        elif _lpips_usable(device):
+            choice = "lpips"
+        else:
+            choice = "pixel_mse"
     elif choice == "lpips" and not _lpips_usable(device):
         print("  [WARN] --metric lpips requested but LPIPS is unusable "
               "(torchmetrics / VGG weights unavailable); falling back to "
               "pixel_mse")
         choice = "pixel_mse"
-    return _make_distance(choice, device)
+    elif choice in _BATCHED:
+        ok, why = _inception_usable(device)
+        if not ok:
+            print(f"  [WARN] --metric {choice} requested but the "
+                  f"torch-fidelity InceptionV3 extractor is unusable ({why}); "
+                  "falling back to pixel_mse. Note this changes what the "
+                  "verdict means: pixel MSE is NOT in FID's feature space, so "
+                  "an [a] failure under it does not close the reward family.")
+            choice = "pixel_mse"
+    return choice, _metric_desc(choice, device)
 
 
 # --------------------------------------------------------------------------
@@ -456,31 +629,44 @@ def _analyze_budget(budget_dir: str, ref_imgs: Dict[int, np.ndarray],
         row["skip"] = f"only {len(common)} images shared with reference (need >=2)"
         return row
 
-    fn, metric_desc = _make_distance(metric, device)
+    metric_desc = _metric_desc(metric, device)
     ref_al = np.stack([ref_imgs[k] for k in common])
     n = len(common)
     n_arm = len(labels)
 
-    # distance matrix in the primary metric's units
-    if metric == "pixel_mse":
+    # Per-arm uint8 stacks, aligned to `common`, shared by every metric below.
+    arm_stacks = [np.stack([arm_imgs[label][k] for k in common])
+                  for label in labels]
+
+    # loss matrix in the primary metric's units (smaller = better everywhere)
+    row["pixel_mse_crosscheck"] = None
+    if metric in _BATCHED:
+        try:
+            D = _distance_matrix(metric, device, ref_al, arm_stacks)
+        except Exception as exc:
+            row["skip"] = (f"{metric} extractor failed at analysis time "
+                           f"({type(exc).__name__}: {exc})")
+            return row
+        if not np.isfinite(D).all():
+            row["skip"] = f"{metric} produced non-finite values"
+            return row
+    elif metric == "pixel_mse":
         D = np.empty((n, n_arm))
-        for j, label in enumerate(labels):
-            arm_al = np.stack([arm_imgs[label][k] for k in common])
+        for j, arm_al in enumerate(arm_stacks):
             D[:, j] = _pixel_mse_vectorized(ref_al, arm_al)
-        D_pmse = D
         # cross-check the vectorized path against eval/mse.py's compute_pixel_mse
         try:
             import torch
             from eval.mse import compute_pixel_mse
             rt = torch.from_numpy(ref_al[0].transpose(2, 0, 1).astype(np.float32) / 255.0)
             at = torch.from_numpy(
-                np.stack([arm_imgs[labels[0]][k] for k in common])[0]
-                .transpose(2, 0, 1).astype(np.float32) / 255.0)
+                arm_stacks[0][0].transpose(2, 0, 1).astype(np.float32) / 255.0)
             chk = float(compute_pixel_mse(at, rt))
             row["pixel_mse_crosscheck"] = abs(chk - D[0, 0])
         except Exception:
             row["pixel_mse_crosscheck"] = None
     else:
+        fn, _ = _make_distance(metric, device)
         D = np.empty((n, n_arm))
         for j, label in enumerate(labels):
             for i, k in enumerate(common):
@@ -488,31 +674,47 @@ def _analyze_budget(budget_dir: str, ref_imgs: Dict[int, np.ndarray],
         if np.isnan(D).any():
             row["skip"] = "LPIPS produced NaN (model load failed)"
             return row
+
+    # [b]'s quantization floor is ALWAYS in pixel-MSE units: it asks whether the
+    # arm IMAGES differ by more than 8-bit rounding, which is a property of the
+    # PNGs and not of whatever metric ranks them. For a reference-free metric it
+    # therefore answers "do the images differ above rounding", not "does the
+    # score differ above rounding" — stated explicitly in the rendering.
+    if metric == "pixel_mse":
+        D_pmse = D
+    else:
         D_pmse = np.empty((n, n_arm))
-        for j, label in enumerate(labels):
-            arm_al = np.stack([arm_imgs[label][k] for k in common])
+        for j, arm_al in enumerate(arm_stacks):
             D_pmse[:, j] = _pixel_mse_vectorized(ref_al, arm_al)
 
     fids: Dict[str, Optional[float]] = {
         label: (results[label].get("aggregate") or {}).get("fid")
         for label in labels}
+    is_means: Dict[str, Optional[float]] = {
+        label: (results[label].get("aggregate") or {}).get("is_mean")
+        for label in labels}
     row["fids"] = fids
+    row["is_means"] = is_means
+    row["metric"] = metric
+    row["reference_free"] = metric in _REFERENCE_FREE
     row["metric_desc"] = metric_desc
     row["n_images"] = n
     row["mean_dist"] = {label: float(D[:, j].mean()) for j, label in enumerate(labels)}
     row["argmin_counts"] = {label: int((D.argmin(axis=1) == j).sum())
                             for j, label in enumerate(labels)}
 
-    # --- (a) validity: mean per-image distance must rank arms like FID ---
+    # --- (a) validity: mean per-image loss must rank arms like FID ---
     dist_vals = [float(D[:, j].mean()) for j in range(n_arm)]
     fid_vals = [fids[label] for label in labels]
     if any(v is None or (isinstance(v, float) and math.isnan(v)) for v in fid_vals):
-        row["valid"] = False
+        # Leave ``valid`` at None so the renderer prints a SKIPPED line instead
+        # of trying to build the [a] table: it would call float() on the missing
+        # FID and read row["spearman"], neither of which exists here.
         row["skip"] = "some arm results.json missing FID"
         return row
     # Rank consistency ignoring ties: every pair of arms whose FIDs differ must
-    # be ranked the same way by the per-image mean distance. Tied FIDs impose
-    # no constraint (near-tied distances must not flip the gate).
+    # be ranked the same way by the per-image mean loss. Tied FIDs impose
+    # no constraint (near-tied losses must not flip the gate).
     consistent = True
     for a in range(n_arm):
         for b in range(a + 1, n_arm):
@@ -525,8 +727,19 @@ def _analyze_budget(budget_dir: str, ref_imgs: Dict[int, np.ndarray],
     rho = _spearman(dist_vals, [float(v) for v in fid_vals])  # type: ignore[arg-type]
     row["valid"] = consistent
     row["spearman"] = rho
+    # A reference-free confidence score is structurally the per-image half of IS,
+    # not of FID (see _entropy_from_logits), so ALSO rank it against IS with the
+    # sign flipped (higher IS is better, lower entropy is better). This separates
+    # two very different failures when [a] fails: the proxy is unfaithful to its
+    # own aggregate, versus the proxy is faithful to IS and IS disagrees with FID.
+    row["spearman_is"] = None
+    if metric in _REFERENCE_FREE and not any(
+            v is None or (isinstance(v, float) and math.isnan(v))
+            for v in is_means.values()):
+        row["spearman_is"] = _spearman(
+            dist_vals, [-float(is_means[label]) for label in labels])  # type: ignore[arg-type]
     if not row["valid"]:
-        row["skip"] = "mean per-image distance does not rank arms like FID"
+        row["skip"] = "mean per-image loss does not rank arms like FID"
         return row
 
     # --- (b) crossover ---
@@ -556,10 +769,9 @@ def _analyze_budget(budget_dir: str, ref_imgs: Dict[int, np.ndarray],
     # direct arm-vs-arm pixel MSE (6 pairs for 4 arms)
     pair_mses = []
     for a in range(n_arm):
-        arm_a = np.stack([arm_imgs[labels[a]][k] for k in common])
         for b in range(a + 1, n_arm):
-            arm_b = np.stack([arm_imgs[labels[b]][k] for k in common])
-            pair_mses.append(float(_pixel_mse_vectorized(arm_a, arm_b).mean()))
+            pair_mses.append(float(_pixel_mse_vectorized(
+                arm_stacks[a], arm_stacks[b]).mean()))
     row["floor_ratio"] = mean_spread / _FLOOR
     row["mean_spread_pmse"] = mean_spread
     row["mean_arm_arm_pmse"] = float(np.mean(pair_mses)) if pair_mses else None
@@ -595,20 +807,43 @@ def _render_budget(row: Dict[str, object], floor_thresh: float) -> List[str]:
                    f"{row['pixel_mse_crosscheck']:.3e}")
     mean_dist = row["mean_dist"]
     fids = row["fids"]
-    out.append("  [a] validity — mean per-image distance vs FID")
+    ref_free = bool(row.get("reference_free"))
+    loss_name = "mean_conf" if ref_free else "mean_dist"
+    if ref_free:
+        out.append("  [a] validity — mean per-image Inception entropy vs FID "
+                   "(REFERENCE-FREE metric: lower entropy = more confident = "
+                   "asserted better, so it must still rank arms like FID)")
+    else:
+        out.append("  [a] validity — mean per-image distance vs FID")
     dist_ranks = _average_ranks([mean_dist[l] for l in labels])
     fid_ranks = _average_ranks([float(fids[l]) for l in labels])  # type: ignore[arg-type]
-    out.append(f"    {'arm':<14} {'mean_dist':>12} {'FID':>8} {'d_rank':>6} "
-               f"{'fid_rank':>8}")
+    is_means = row.get("is_means") or {}
+    out.append(f"    {'arm':<14} {loss_name:>12} {'FID':>8} {'IS':>7} "
+               f"{'d_rank':>6} {'fid_rank':>8}")
     for j, label in enumerate(labels):
         out.append(f"    {label:<14} {_fmt(mean_dist[label]):>12} "
                    f"{_fmt(fids[label], '.2f'):>8} "
+                   f"{_fmt(is_means.get(label), '.1f'):>7} "
                    f"{dist_ranks[j]:>6.1f} {fid_ranks[j]:>8.1f}")
     rho = row["spearman"]
-    out.append(f"    Spearman(mean_dist, FID) = {rho:.3f}; rank consistency "
+    out.append(f"    Spearman({loss_name}, FID) = {rho:.3f}; rank consistency "
                "(pairs with tied FIDs impose no constraint) -> "
                + ("PROXY VALID" if row["valid"]
                   else "度量不可比 — crossover 结论不成立 (this budget skipped)"))
+    if ref_free:
+        rho_is = row.get("spearman_is")
+        out.append("    Spearman(mean_conf, -IS) = "
+                   + (f"{rho_is:.3f}" if rho_is is not None else "n/a")
+                   + " — a reference-free confidence score is the per-image half"
+                     " of IS, not of FID, so this second correlation separates "
+                     "two different [a] failures: proxy unfaithful to its OWN "
+                     "aggregate (both low), versus proxy faithful to IS while IS "
+                     "disagrees with FID (this high, the FID one low). Only the "
+                     "FID column gates.")
+        out.append("    [KNOWN BIAS, not a bug] entropy rewards "
+                   "class-prototypicality, so an arm that collapses toward "
+                   "confident, generic exemplars scores WELL here while FID "
+                   "punishes it. That is exactly why FID remains the gate.")
     if not row["valid"]:
         return out
 
@@ -616,6 +851,11 @@ def _render_budget(row: Dict[str, object], floor_thresh: float) -> List[str]:
     out.append("  [b] quantization floor (8-bit PNG; per-pixel MSE units)")
     out.append(f"    uint8 rounding floor, two rounded images: {_FLOOR:.3e}; "
                f"one rounded: {FLOOR_ONE_ROUNDED:.3e}")
+    if row.get("metric") not in (None, "pixel_mse"):
+        out.append("    (the floor is deliberately in pixel-MSE units even "
+                   "though [a]/[c] are not: it asks whether the arm IMAGES "
+                   "differ by more than 8-bit rounding, which is a property of "
+                   "the saved PNGs, not of the ranking metric)")
     out.append(f"    mean per-image arm-distance spread: "
                f"{_fmt(row['mean_spread_pmse']):>10} = {floor_ratio:.0f}x floor")
     arm_arm = row["mean_arm_arm_pmse"]
@@ -720,13 +960,22 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="Per-image crossover verdict for the COVR budget probe")
     ap.add_argument("probe_dir", help="root containing k<K>/ and reference/")
-    ap.add_argument("--metric", choices=["auto", "lpips", "pixel_mse"],
+    ap.add_argument("--metric",
+                    choices=["auto", "inception", "inception_conf", "lpips",
+                             "pixel_mse"],
                     default="auto",
-                    help="per-image distance metric (auto: LPIPS if usable, "
-                         "else pixel MSE; MUST be printed in the output)")
-    ap.add_argument("--device", default="cpu",
-                    help="device for the distance metric (cpu here; cuda on "
-                         "the GPU box)")
+                    help="per-image loss (auto: inception if torch-fidelity's "
+                         "InceptionV3 loads, else LPIPS, else pixel MSE). "
+                         "inception = squared difference of FID's own pool3 "
+                         "'2048' features vs the reference; inception_conf = "
+                         "REFERENCE-FREE Inception predictive entropy (the "
+                         "per-image half of IS). The resolved choice is always "
+                         "printed in the output.")
+    ap.add_argument("--device", default="auto",
+                    help="device for the loss network (auto: cuda when "
+                         "available, else cpu). Only matters for inception* and "
+                         "lpips; on the GPU box auto keeps the 299x299 "
+                         "Inception forwards off the CPU.")
     ap.add_argument("--max-perm", type=int, default=20000,
                     help="permutations for the crossover nulls")
     ap.add_argument("--oos-perm", type=int, default=2000,
@@ -735,6 +984,13 @@ def main() -> int:
     ap.add_argument("--floor-ratio", type=float, default=5.0,
                     help="arm spread / floor below this = quantization-limited")
     args = ap.parse_args()
+
+    if args.device == "auto":
+        try:
+            import torch
+            args.device = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            args.device = "cpu"
 
     probe = args.probe_dir
     ref_dir = os.path.join(probe, "reference")
@@ -751,6 +1007,11 @@ def main() -> int:
               "Per-image crossover cannot be established without it.")
     metric, metric_desc = _resolve_metric(args.metric, args.device)
     print(f"  metric: {metric_desc}")
+    if metric in _REFERENCE_FREE:
+        print("  note: reference-free applies to the LOSS only. The reference "
+              "run is still required — [b]'s quantization floor and [d]'s "
+              "exogenous 1NN features both come from the reference image, and "
+              "arms are still paired to it by global_idx.")
 
     if ref_fid is not None:
         print(f"  reference FID: {_fmt(ref_fid, '.2f')}"
@@ -837,11 +1098,45 @@ def main() -> int:
         if all(r.get("skip") and "rank arms like FID" in str(r.get("skip"))
                for r in rows):
             print("  度量不可比，crossover 结论不成立: in every budget, the "
-                  "per-image distance's arm ordering disagrees with the FID "
+                  "per-image loss's arm ordering disagrees with the FID "
                   "ordering. The proxy is not measuring what FID measures, so "
-                  "no crossover conclusion can be drawn from it. Fix the "
-                  "proxy (metric choice / reference quality) before trusting "
-                  "any per-image claim.")
+                  "no crossover conclusion can be drawn from it.")
+            if metric == "inception":
+                print("  WHAT THIS METRIC'S FAILURE ADDITIONALLY BUYS: the loss "
+                      "here is a squared distance in FID's OWN InceptionV3 "
+                      "pool3 feature space — the strongest reference-based "
+                      "per-image proxy available, strictly stronger than pixel "
+                      "MSE or LPIPS for predicting FID. Its failing [a] is "
+                      "therefore evidence about the REWARD FAMILY, not about "
+                      "metric choice: 'per-image fidelity to the full-compute "
+                      "output' does not order arms the way FID does at this N. "
+                      "That closes the terminal-fidelity reward AND its H-step "
+                      "sentinel variant (same family, intermediate latents) "
+                      "without spending the sentinel's +125% forwards. The "
+                      "remaining escape is that the reference is not the FID "
+                      "optimum (measured: reference 128.61 vs k8 uniform 119.29 "
+                      "under identical pairing), i.e. distance-to-reference is "
+                      "the wrong anchor no matter how good the feature space — "
+                      "test that with --metric inception_conf, which needs no "
+                      "reference at all.")
+            elif metric == "inception_conf":
+                print("  WHAT THIS METRIC'S FAILURE ADDITIONALLY BUYS: this "
+                      "loss is reference-FREE, so its failure cannot be blamed "
+                      "on the reference not being the FID optimum. Check the "
+                      "printed Spearman(mean_conf, -IS) per budget: high there "
+                      "and low against FID means the proxy is faithful to IS "
+                      "and IS is the thing that disagrees with FID (a known "
+                      "property of prototypicality-rewarding scores, not a "
+                      "measurement defect); low against BOTH means the "
+                      "per-image entropy is simply not tracking either "
+                      "aggregate at n=500.")
+            else:
+                print(f"  CAVEAT ON THIS RUN'S METRIC ({metric}): it is not in "
+                      "FID's feature space, so its failure does NOT close the "
+                      "reward family — it may only mean the proxy is weak. "
+                      "Re-run with --metric inception (torch-fidelity's "
+                      "InceptionV3 pool3, i.e. FID's own features) before "
+                      "concluding anything about the reward design.")
         else:
             print(f"  INSUFFICIENT EVIDENCE: no budget passed the validity gate "
                   f"(skips: {sorted({str(r.get('skip')) for r in rows})}).")
