@@ -195,8 +195,9 @@ PY
 then
   exit 2
 fi
-if [ "${SKIP_ARMS}" = "1" ] && [ "${SKIP_NOISE}" = "1" ]; then
-  echo "SKIP_ARMS=1 and SKIP_NOISE=1 leaves nothing to run" >&2
+if [ "${SKIP_ARMS}" = "1" ] && [ "${SKIP_NOISE}" = "1" ] && \
+   [ -z "${THRESHOLDS}" ]; then
+  echo "SKIP_ARMS=1, SKIP_NOISE=1, and empty THRESHOLDS leave nothing to run" >&2
   exit 2
 fi
 
