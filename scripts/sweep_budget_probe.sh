@@ -35,6 +35,10 @@
 #       or a parallel job can take them)
 #   REWARD_MODE (terminal|hstep, default terminal)  SENTINEL_RATE (1.0)
 #   SENTINEL_HORIZON (hstep mode only, default 10)  SESSION_ID (auto)
+#   ARM_FILTER (comma-separated strategy IDs; empty = all manifest arms)
+#   PAIRED_REPLICAS (total latent draws per selected arm, default 1)
+#   THRESHOLDS (comma-separated plain TeaCache thresholds; empty = disabled)
+#   THRESHOLD_REPLICAS (total latent draws per threshold, default 1)
 #   REFERENCE (1|0, default 1)  REFERENCE_DIR (default <OUT_DIR>/reference)
 #   IMG_SAVE_LIMIT (default N_PROMPTS = save every image; per-image crossover
 #       analysis needs the full set, the old default of 50 is not enough)
@@ -118,6 +122,10 @@ REWARD_MODE="${REWARD_MODE:-terminal}"
 SENTINEL_RATE="${SENTINEL_RATE:-1.0}"
 SENTINEL_HORIZON="${SENTINEL_HORIZON:-10}"
 SESSION_ID="${SESSION_ID:-}"
+ARM_FILTER="${ARM_FILTER:-}"
+PAIRED_REPLICAS="${PAIRED_REPLICAS:-1}"
+THRESHOLDS="${THRESHOLDS:-}"
+THRESHOLD_REPLICAS="${THRESHOLD_REPLICAS:-1}"
 
 # --- noise floor: WHICH noise the floor measures (see header) ---
 NOISE_MODE="${NOISE_MODE:-seed}"       # latent|seed
@@ -139,10 +147,26 @@ case "${REWARD_MODE}" in
     exit 2
     ;;
 esac
-if ! python - "$SENTINEL_RATE" <<'PY' >/dev/null
+if ! python - "$SENTINEL_RATE" "$PAIRED_REPLICAS" \
+        "$THRESHOLD_REPLICAS" "$ARM_FILTER" "$THRESHOLDS" <<'PY' >/dev/null
+import math
 import sys
 rate = float(sys.argv[1])
 assert 0.0 <= rate <= 1.0, "SENTINEL_RATE must be in [0, 1]"
+paired = int(sys.argv[2])
+threshold = int(sys.argv[3])
+arms = [value.strip() for value in sys.argv[4].split(",") if value.strip()]
+thresholds = [value.strip() for value in sys.argv[5].split(",") if value.strip()]
+assert paired >= 1, "PAIRED_REPLICAS must be >= 1"
+assert threshold >= 1, "THRESHOLD_REPLICAS must be >= 1"
+assert len(arms) == len(set(arms)), "ARM_FILTER contains duplicate strategy IDs"
+for value in thresholds:
+    parsed = float(value)
+    assert math.isfinite(parsed) and parsed >= 0.0, (
+        "THRESHOLDS values must be finite and >= 0")
+assert (paired == 1 and not thresholds) or rate == 0.0, (
+    "paired/threshold static validation requires SENTINEL_RATE=0; static runs "
+    "must not pay delayed full-reference shadow cost")
 PY
 then
   exit 2
@@ -192,22 +216,34 @@ if [ -z "${REFERENCE_DIR}" ]; then
   REFERENCE_DIR="${OUT_DIR}/reference"
 fi
 
-run_arm() {  # run_arm <out> <manifest> <arm> <seed> <session-id> [latent-offset]
-  local out="$1" manifest="$2" arm="$3" seed="$4" session_id="$5"
-  local lat_offset="${6:-0}"
+run_teacache() {  # run_teacache <out> <seed> <latent-offset> [extra args...]
+  local out="$1" seed="$2" lat_offset="$3"
+  shift 3
   rm -rf "${out}"
   python main.py --model dit --task c2i --dataset imagenet \
       --method teacache --metrics fid is latency flops speed \
-      --covr-strategy-manifest "${manifest}" \
-      --covr-force-strategy-id "${arm}" \
-      --covr-session-id "${session_id}" \
-      --covr-sentinel-rate "${SENTINEL_RATE}" \
-      --covr-sentinel-horizon "${SENTINEL_HORIZON}" \
       --seed "${seed}" --num_steps "${NUM_STEPS}" --n_prompts "${N_PROMPTS}" \
       --latent-seed-offset "${lat_offset}" \
       --guidance_scale "${GUIDANCE}" --batch_size "${BATCH_SIZE}" \
       --img_save_limit "${IMG_SAVE_LIMIT}" \
-      --output_dir "${out}"
+      --output_dir "${out}" "$@"
+}
+
+run_arm() {  # run_arm <out> <manifest> <arm> <seed> <session-id> [latent-offset]
+  local out="$1" manifest="$2" arm="$3" seed="$4" session_id="$5"
+  local lat_offset="${6:-0}"
+  run_teacache "${out}" "${seed}" "${lat_offset}" \
+      --covr-strategy-manifest "${manifest}" \
+      --covr-force-strategy-id "${arm}" \
+      --covr-session-id "${session_id}" \
+      --covr-sentinel-rate "${SENTINEL_RATE}" \
+      --covr-sentinel-horizon "${SENTINEL_HORIZON}"
+}
+
+run_threshold() {  # run_threshold <out> <threshold> [latent-offset]
+  local out="$1" threshold="$2"
+  local lat_offset="${3:-0}"
+  run_teacache "${out}" "${SEED}" "${lat_offset}" --thresh "${threshold}"
 }
 
 run_reference() {  # run_reference <out>  — full compute, shared cross-budget anchor
@@ -222,7 +258,9 @@ run_reference() {  # run_reference <out>  — full compute, shared cross-budget 
 
 # ---- cost / disk statement BEFORE any GPU spend ----
 python - "$BUDGETS" "$NUM_STEPS" "$N_PROMPTS" "$IMG_SAVE_LIMIT" "$REFERENCE" \
-        "$NOISE_REPLICAS" "$SKIP_ARMS" "$SKIP_NOISE" "$NOISE_MODE" <<'PY'
+        "$NOISE_REPLICAS" "$SKIP_ARMS" "$SKIP_NOISE" "$NOISE_MODE" \
+        "$ARM_FILTER" "$PAIRED_REPLICAS" "$THRESHOLDS" \
+        "$THRESHOLD_REPLICAS" <<'PY'
 import sys
 budgets = [int(k) for k in sys.argv[1].split(",") if k.strip()]
 num_steps, n_prompts, img_limit = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
@@ -230,16 +268,23 @@ reference = sys.argv[5] == "1"
 replicas = int(sys.argv[6])
 skip_arms, skip_noise = sys.argv[7] == "1", sys.argv[8] == "1"
 noise_mode = sys.argv[9]
-n_arms = 0 if skip_arms else 4            # build_budget_manifest emits 4 arms
+arm_filter = [a.strip() for a in sys.argv[10].split(",") if a.strip()]
+paired_replicas = int(sys.argv[11])
+thresholds = [t.strip() for t in sys.argv[12].split(",") if t.strip()]
+threshold_replicas = int(sys.argv[13])
+n_selected = len(arm_filter) if arm_filter else 4
+n_arms = 0 if skip_arms else n_selected * paired_replicas
 n_noise = 0 if skip_noise else replicas
 per_budget = n_arms + n_noise
 arm_runs = per_budget * len(budgets)
 arm_units = sum(per_budget * k for k in budgets)  # each run costs K forwards/traj
 ref_units = num_steps if reference else 0
+threshold_runs = len(thresholds) * threshold_replicas
 mean_k = sum(budgets) / len(budgets)
 print("--- cost / disk budget (before any GPU spend) ---")
-print(f"  arm runs: {arm_runs} ({n_arms} arms + {n_noise} noise[{noise_mode}] "
-      f"per budget, K={budgets})")
+print(f"  arm runs: {arm_runs} ({n_arms} selected-arm replicas + "
+      f"{n_noise} noise[{noise_mode}] per budget, K={budgets})")
+print(f"  plain TeaCache threshold runs: {threshold_runs}")
 if skip_arms:
     print("    SKIP_ARMS=1 -> the 4 forced arms are REUSED from disk, not rerun")
 if skip_noise:
@@ -304,6 +349,34 @@ for s in json.load(open(sys.argv[1]))["strategies"]:
     print(s["strategy_id"])
 PY
 )
+  if [ -n "${ARM_FILTER}" ]; then
+    FILTERED_ARMS=()
+    IFS=',' read -ra REQUESTED_ARMS <<< "${ARM_FILTER}"
+    for requested in "${REQUESTED_ARMS[@]}"; do
+      requested="$(echo "${requested}" | xargs)"
+      if [ -z "${requested}" ]; then
+        continue
+      fi
+      found=0
+      for arm in "${ARMS[@]}"; do
+        if [ "${arm}" = "${requested}" ]; then
+          FILTERED_ARMS+=("${arm}")
+          found=1
+          break
+        fi
+      done
+      if [ "${found}" -ne 1 ]; then
+        echo "ARM_FILTER contains unknown strategy '${requested}'" >&2
+        echo "  available: ${ARMS[*]}" >&2
+        exit 2
+      fi
+    done
+    if [ "${#FILTERED_ARMS[@]}" -eq 0 ]; then
+      echo "ARM_FILTER selected no strategies" >&2
+      exit 2
+    fi
+    ARMS=("${FILTERED_ARMS[@]}")
+  fi
   BASE="$(python - "${MANIFEST}" <<'PY'
 import json, sys
 print(json.load(open(sys.argv[1]))["baseline_strategy_id"])
@@ -351,9 +424,16 @@ PY
     echo "  SKIP_ARMS=1 -> reusing existing arm_* dirs"
   else
     for arm in "${ARMS[@]}"; do
-      echo "  arm=${arm}"
+      echo "  arm=${arm} latent-seed-offset=0"
       run_arm "${BK}/equalflops/arm_${arm}" "${MANIFEST}" "${arm}" "${SEED}" \
           "${BUDGET_SESSION}" 0
+      if [ "${PAIRED_REPLICAS}" -gt 1 ]; then
+        for r in $(seq 1 $((PAIRED_REPLICAS - 1))); do
+          echo "  arm=${arm} latent-seed-offset=${r}"
+          run_arm "${BK}/equalflops/arm_${arm}/rep_${r}" "${MANIFEST}" \
+              "${arm}" "${SEED}" "${BUDGET_SESSION}-${arm}-rep${r}" "${r}"
+        done
+      fi
     done
   fi
 
@@ -391,6 +471,31 @@ PY
   python scripts/analyze_teacache_sweeps.py "${BK}"
 done
 
+# Thresholds are shared across budgets and run after ARM_FILTER has been
+# validated against every generated manifest.
+if [ -n "${THRESHOLDS}" ]; then
+  echo ""
+  echo "############################################################"
+  echo "########## plain TeaCache threshold comparators ##########"
+  echo "############################################################"
+  IFS=',' read -ra THRESHOLD_ARR <<< "${THRESHOLDS}"
+  for threshold in "${THRESHOLD_ARR[@]}"; do
+    threshold="$(echo "${threshold}" | xargs)"
+    if [ -z "${threshold}" ]; then
+      continue
+    fi
+    echo "  threshold=${threshold} latent-seed-offset=0"
+    run_threshold "${OUT_DIR}/threshold/thresh_${threshold}" "${threshold}" 0
+    if [ "${THRESHOLD_REPLICAS}" -gt 1 ]; then
+      for r in $(seq 1 $((THRESHOLD_REPLICAS - 1))); do
+        echo "  threshold=${threshold} latent-seed-offset=${r}"
+        run_threshold "${OUT_DIR}/threshold/thresh_${threshold}/rep_${r}" \
+            "${threshold}" "${r}"
+      done
+    fi
+  done
+fi
+
 echo ""
 echo "########## cross-budget summary ##########"
 echo "########## arm-spread verdict: ##########"
@@ -403,3 +508,9 @@ echo "########## per-image crossover verdict ##########"
 echo "########## one arm best for every image, or do arms flip per image? ##########"
 echo "########## (requires the full-compute reference; REFERENCE=0 disables it) ##########"
 python scripts/analyze_crossover.py "${OUT_DIR}"
+
+if [ "${PAIRED_REPLICAS}" -gt 1 ] || [ -n "${THRESHOLDS}" ]; then
+  echo ""
+  echo "########## paired static-mask verdict ##########"
+  python scripts/analyze_static_masks.py "${OUT_DIR}"
+fi
