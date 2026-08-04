@@ -199,21 +199,16 @@ def paired_stats(deltas: Sequence[Tuple[int, float]]) -> Dict[str, object]:
 
 
 def calc_per_trajectory(run: Run) -> Optional[float]:
+    """Return calc steps from the final generation recorded by the runner.
+
+    ``run_dit`` resets TeaCache's decision history before every batch, so the
+    aggregate ``total_calc`` is already one trajectory's count rather than a
+    sum over all batches.
+    """
     total_calc = run.get("total_calc")
-    config = run.get("config")
-    aggregate = run.get("aggregate")
-    if not _finite(total_calc) or not isinstance(config, dict) or not isinstance(
-            aggregate, dict):
+    if not _finite(total_calc):
         return None
-    n_images = aggregate.get("n_images", config.get("total_images",
-                                                    config.get("n_prompts")))
-    batch_size = config.get("batch_size")
-    if not _finite(n_images) or not _finite(batch_size) or float(batch_size) <= 0:
-        return None
-    trajectories = math.ceil(float(n_images) / float(batch_size))
-    if trajectories <= 0:
-        return None
-    return float(total_calc) / trajectories
+    return float(total_calc)
 
 
 def nearest_threshold(thresholds: Dict[str, RunMap], target_calc: float

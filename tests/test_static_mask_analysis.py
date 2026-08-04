@@ -14,7 +14,7 @@ from analyze_teacache_sweeps import analyze_equalflops_sweep  # noqa: E402
 
 
 def _write_result(path, *, offset=0, fid=100.0, is_mean=30.0,
-                  total_calc=128, seed=42, n_images=500, batch_size=32,
+                  total_calc=8, seed=42, n_images=500, batch_size=32,
                   num_steps=50):
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -120,8 +120,8 @@ def test_paired_stats_and_exact_sign_gates():
 
 
 def test_calc_per_trajectory_and_nearest_threshold(tmp_path):
-    _write_threshold(tmp_path, "0.50", 0, total_calc=128)
-    _write_threshold(tmp_path, "0.75", 0, total_calc=160)
+    _write_threshold(tmp_path, "0.50", 0, total_calc=8)
+    _write_threshold(tmp_path, "0.75", 0, total_calc=12)
     thresholds, warnings = asm.discover_threshold_runs(str(tmp_path))
 
     label, mean_calc, distance = asm.nearest_threshold(thresholds, 8)
@@ -153,7 +153,7 @@ def test_cli_passes_five_pair_gate_and_matches_threshold(tmp_path, capsys):
         _write_arm(tmp_path, "geometric", offset,
                    fid=100.5 + offset, is_mean=30.0 + offset)
     _write_threshold(tmp_path, "0.50", 0, fid=101.0,
-                     is_mean=29.0, total_calc=128)
+                     is_mean=29.0, total_calc=8)
 
     assert asm.main([str(tmp_path), "--fid-margin", "1.86"]) == 0
     output = capsys.readouterr().out
@@ -174,7 +174,7 @@ def test_cli_paired_threshold_gate_produces_static_winner(tmp_path, capsys):
                    fid=100.5 + offset, is_mean=30.0 + offset)
         _write_threshold(tmp_path, "0.50", offset,
                          fid=100.4 + offset, is_mean=31.0 + offset,
-                         total_calc=128)
+                         total_calc=8)
 
     assert asm.main([str(tmp_path), "--fid-margin", "1.86"]) == 0
     output = capsys.readouterr().out
