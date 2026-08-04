@@ -29,7 +29,10 @@
 #   bash scripts/sweep_budget_probe.sh
 # Env overrides:
 #   BUDGETS ("8,6,4")  N_PROMPTS (500)  NUM_STEPS (50)  BATCH_SIZE (32)
-#   SEED (42)  GUIDANCE (4.5)  OUT_DIR (/tmp/covr_budget_probe)
+#   SEED (42)  GUIDANCE (4.5)  OUT_DIR (output/covr_budget_probe, relative to
+#       the repo root — the script cds there, so a relative OUT_DIR survives
+#       being invoked from anywhere and keeps the PNGs off /tmp, where a reboot
+#       or a parallel job can take them)
 #   REWARD_MODE (terminal|hstep, default terminal)  SENTINEL_RATE (1.0)
 #   SENTINEL_HORIZON (hstep mode only, default 10)  SESSION_ID (auto)
 #   REFERENCE (1|0, default 1)  REFERENCE_DIR (default <OUT_DIR>/reference)
@@ -110,7 +113,7 @@ NUM_STEPS="${NUM_STEPS:-50}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 SEED="${SEED:-42}"
 GUIDANCE="${GUIDANCE:-4.5}"
-OUT_DIR="${OUT_DIR:-/tmp/covr_budget_probe}"
+OUT_DIR="${OUT_DIR:-output/covr_budget_probe}"
 REWARD_MODE="${REWARD_MODE:-terminal}"
 SENTINEL_RATE="${SENTINEL_RATE:-1.0}"
 SENTINEL_HORIZON="${SENTINEL_HORIZON:-10}"
