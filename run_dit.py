@@ -34,7 +34,10 @@ from config import (
     DEFAULT_REL_L1_THRESH, DEFAULT_NUM_STEPS,
     DDIM_FLOP_MATCHED_STEPS, load_coefficients,
 )
-from utils import decode_latent, save_image, pil_to_tensor, ensure_real_299, get_vfl_checkpoint_dir, prune_checkpoints
+from utils import (
+    decode_latent, save_image, pil_to_tensor, ensure_real_299,
+    get_vfl_checkpoint_dir, prune_checkpoints, latent_seed_for_index,
+)
 
 from models.dit import (
     DiTTransformer2D, set_vfl_step_info, get_vfl_buffer, set_vfl_sample_id,
@@ -1930,7 +1933,15 @@ def run_c2i(args) -> Dict:
             else:
                 gen_input = data[1]  # text prompt for PixArt; DiT can't handle text
             batch_inputs.append(gen_input)
-            batch_seeds.append(100000 + absolute_idx)
+            # Per-image latent seed: the (image, latent draw) cell. --seed
+            # decides which image absolute_idx names; --latent-seed-offset
+            # selects an INDEPENDENT latent draw for the same image, so
+            # replicate runs can be paired per-image across draws. Distinct
+            # offsets give disjoint seed sets (stride 1e6 > any index < 50k),
+            # and offset=0 stays bit-identical to the legacy
+            # `100000 + absolute_idx` formula.
+            batch_seeds.append(latent_seed_for_index(
+                absolute_idx, int(getattr(args, "latent_seed_offset", 0))))
 
         # Reset accelerator state
         trajectory_id = covr_trajectory_offset + batch_start // bs
@@ -2629,6 +2640,11 @@ def run_c2i(args) -> Dict:
             # global_idx, so a run whose seed is unknown cannot be paired
             # against another run at all — record it.
             "seed": args.seed,
+            # Which independent latent draw this run used for its images.
+            # Pairing runs by global_idx is only sound when both consumed the
+            # same seed AND the same offset; record it so downstream analysis
+            # can verify two runs differ in draws without trusting dir names.
+            "latent_seed_offset": int(getattr(args, "latent_seed_offset", 0)),
             "dataset_start_index": dataset_start_index,
             "resume_sample_offset": covr_resume_sample_offset,
             "generation_start_index": generation_start_index,

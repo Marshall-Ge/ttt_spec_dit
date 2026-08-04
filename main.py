@@ -91,6 +91,13 @@ Examples:
                         help="Number of prompts/images (default varies by dataset)")
     parser.add_argument("--dataset-start-index", type=int, default=0,
                         help="Absolute start index in the deterministic dataset order")
+    parser.add_argument("--latent-seed-offset", type=int, default=0,
+                        help="Selects an INDEPENDENT latent draw for the SAME "
+                             "images (default: 0). Does not change which "
+                             "images are generated — that is --seed. Replicate "
+                             "runs over identical images at offsets 0/1/2 get "
+                             "disjoint per-image latent seeds for "
+                             "replicate-based per-image analysis.")
 
     # ---- Model ----
     parser.add_argument("--num_steps", type=int, default=DEFAULT_NUM_STEPS,
@@ -278,6 +285,10 @@ def validate_args(args):
             args.model != "dit" or args.task != "c2i" or args.dataset != "imagenet"):
         print("[ERROR] nonzero --dataset-start-index requires "
               "--model dit --task c2i --dataset imagenet.")
+        return False
+
+    if getattr(args, "latent_seed_offset", 0) < 0:
+        print("[ERROR] --latent-seed-offset must be non-negative.")
         return False
 
     # Default n_prompts

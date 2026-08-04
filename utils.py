@@ -48,6 +48,36 @@ class CudaTimer:
 
 
 # ---------------------------------------------------------------------------
+# Per-image latent seeds
+# ---------------------------------------------------------------------------
+
+# Stride between latent draws of the same image. absolute_idx is bounded by
+# 50,000 (ImageNet val size; COCO/drawbench/geneval are smaller), so 1_000_000
+# leaves the per-offset ranges disjoint and the seeds stay far below
+# torch.Generator's int64 range even for large offsets.
+_LATENT_SEED_BASE = 100000
+_LATENT_SEED_STRIDE = 1_000_000
+
+
+def latent_seed_for_index(absolute_idx: int, latent_seed_offset: int = 0) -> int:
+    """Deterministic per-image latent seed for (image, latent draw) cells.
+
+    ``--seed`` selects which image ``absolute_idx`` names (dataset shuffle);
+    this selects which independent latent draw a run uses for that image, so
+    two runs over the SAME images can pair per-image metrics across latent
+    draws. Distinct offsets give disjoint, reproducible seed sets for the same
+    image indices.
+
+    INVARIANT: offset=0 must stay bit-identical to the legacy formula
+    ``100000 + absolute_idx`` — every existing run and cached comparison was
+    produced with it.
+    """
+    if latent_seed_offset < 0:
+        raise ValueError("latent_seed_offset must be non-negative")
+    return _LATENT_SEED_BASE + latent_seed_offset * _LATENT_SEED_STRIDE + absolute_idx
+
+
+# ---------------------------------------------------------------------------
 # VAE decode
 # ---------------------------------------------------------------------------
 

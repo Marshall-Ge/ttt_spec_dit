@@ -19,8 +19,8 @@ Why per-image and not per-class:
   ``{global_idx:06d}_{cls}.png``), so every arm-vs-arm and arm-vs-reference
   comparison is properly paired.
 
-Four sections per budget; only [d] is a verdict gate. Lettering below matches
-the printed output exactly.
+Five sections per budget; [d] is the verdict gate and [e] can veto it.
+Lettering below matches the printed output exactly.
 
   [a] validity   per-arm MEAN per-image loss must rank the arms the same way
                 FID does. If not, the proxy measures something other than what
@@ -109,6 +109,27 @@ the printed output exactly.
                     0.19/0.13 on a weak one. With uninformative features every
                     arm's fit collapses to its own mean and the rule degenerates
                     to the best single arm (frac exactly 0).
+                    THE GATE IS NOT p<=0.05 ALONE. Permuting the train rows
+                    destroys feature->cost, so every arm's fit collapses to its
+                    own mean and the permuted benefit is EXACTLY 0 for 0.56-0.60
+                    of the null draws; p<=0.05 is therefore nearly the same
+                    statement as frac>0 and carries almost no effect-size
+                    information. Two magnitude floors are required on top:
+                      RELATIVE — the recovered share must exceed 5% of the oracle
+                        gain. No-crossover worlds that still reach p<=0.05 report
+                        a median 0.67% (noise features) to 1.58% (high noise); a
+                        real crossover reports ~21%. The floor keeps 0.963 power
+                        on the real interaction and cuts the worst false-positive
+                        rate from 0.048 to 0.003.
+                      ABSOLUTE — the recovered benefit, converted to FID with the
+                        budget's own (mean loss, FID) arm pairs, must exceed 2x
+                        the same-arm replica FID noise SD from ``noise_*``
+                        (unbiased: ``sd / c4(n)``, NOT the range — see
+                        ``_noise_fid_stats`` for why range would tighten the
+                        floor as replicas are added). This is the same
+                        2x-noise-floor rule the project applies to every other
+                        arm-spread claim. A per-image gain smaller than
+                        resampling noise cannot be spent even if it is real.
                   1NN LABEL TRANSFER (diagnostic only) — the former gate. It
                     transfers a neighbour's argmin LABEL, which forces a
                     commitment to a per-image winner that is mostly noise when
@@ -126,6 +147,27 @@ the printed output exactly.
                 output). It shows per-image structure exists and is predictable
                 from image content; whether an ONLINE-available feature sees it
                 is a separate experiment.
+  [e] granularity — WHAT THE BANDIT CAN ACTUALLY CAPTURE. [d] measures
+                  per-IMAGE crossover, but the bandit does not decide per image:
+                  ``run_dit.py`` assigns each contiguous block of global_idx to
+                  ONE trajectory (``batch_start // bs``) and calls
+                  ``apply_strategy`` once per batch, so a single refresh mask
+                  serves the whole batch (``accelerators/teacache.py``'s forced
+                  mask is indexed by step only). The per-batch oracle gain is
+                  therefore the ceiling a per-batch bandit could reach: the
+                  best single arm's mean cost minus, per batch, that batch's
+                  own best-mean-cost arm (rows grouped by
+                  ``(global_idx - generation_start_index) // batch_size``,
+                  never by row position, since ``common`` may have holes).
+                  Converted to FID with the same max loss->FID slope [d] uses,
+                  it must clear the same absolute floor — and because the whole
+                  point of a bandit is to make per-batch choices, a per-image
+                  crossover that the batch granularity cannot monetize makes
+                  the verdict NOT utilizable even if checks 1-3 all pass.
+                  Simulated at bs=32 on the real k8 arm table the omniscient
+                  ceiling is two orders of magnitude below what [d] reports.
+                  At n=500 / bs=32 there are only ~16 bandit decisions, i.e.
+                  ~16 reward samples, not 500.
 
 Layout expected (written by scripts/sweep_budget_probe.sh)::
 
@@ -139,12 +181,13 @@ Analysis only; always exits 0. The RECOMMENDATION block carries the reasoning.
 from __future__ import annotations
 
 import argparse
+import datetime
 import glob
 import json
 import math
 import os
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
@@ -372,6 +415,17 @@ def _inception_usable(device: str) -> Tuple[bool, str]:
 # Metrics that need the batched path and a reference-free [a] gate.
 _BATCHED = ("inception", "inception_conf")
 _REFERENCE_FREE = ("inception_conf",)
+
+# Magnitude floors for the [d] gate. See _gate for the calibration behind both.
+# _REL_FLOOR: the share of the oracle gain the transfer rule must recover.
+# Constructed no-crossover worlds that slip past p<=0.05 report a median 0.67%
+# (noise features) to 1.58% (high noise); a real crossover reports ~21%. 5%
+# keeps 0.963 power on the real one and cuts the worst false-positive rate from
+# 0.048 to 0.003.
+_REL_FLOOR = 0.05
+# Used only when the sweep produced no noise_* replicas; matches the heuristic
+# in analyze_teacache_sweeps.py so the two scripts cannot disagree.
+_FALLBACK_FID_FLOOR = 2.0
 
 
 def _resolve_metric(choice: str, device: str) -> Tuple[str, str]:
@@ -653,13 +707,320 @@ def _out_of_sample(D: np.ndarray, idxs: List[int], feat: np.ndarray,
     }
 
 
+def _loss_to_fid_slopes(dist_vals: List[float],
+                        fid_vals: List[float]) -> Optional[Tuple[float, float]]:
+    """(min, max) plausible FID change per unit of the per-image loss.
+
+    The gate's recovered benefit is in loss units, which are not comparable to
+    anything. The arms themselves supply the only available conversion: four
+    (mean loss, FID) pairs. Adjacent-pair slopes plus the OLS slope bracket it.
+    The MAX is what the magnitude test uses — deliberately the most generous
+    conversion, so a signal cannot be dismissed by a stingy slope.
+    """
+    order = np.argsort(np.asarray(dist_vals, dtype=np.float64))
+    loss = np.asarray(dist_vals, dtype=np.float64)[order]
+    fid = np.asarray(fid_vals, dtype=np.float64)[order]
+    slopes = [(fid[i + 1] - fid[i]) / (loss[i + 1] - loss[i])
+              for i in range(len(loss) - 1) if loss[i + 1] - loss[i] > 1e-12]
+    if len(loss) >= 2 and np.ptp(loss) > 1e-12:
+        slopes.append(float(np.polyfit(loss, fid, 1)[0]))
+    slopes = [s for s in slopes if np.isfinite(s) and s > 0.0]
+    if not slopes:
+        return None
+    return (min(slopes), max(slopes))
+
+
+def _c4(n: int) -> float:
+    """``E[s] / sigma`` for n iid normal draws — the Bessel-corrected sample sd
+    is still biased LOW, badly so at small n (0.798 at n=2, 0.886 at n=3), so
+    dividing by this is what makes ``sigma_hat`` unbiased."""
+    return math.sqrt(2.0 / (n - 1)) * math.exp(
+        math.lgamma(n / 2.0) - math.lgamma((n - 1) / 2.0))
+
+
+# 5-95% central span of ``sigma_hat / sigma`` at n replicas. Exact: sigma_hat
+# ~ sigma * chi_{n-1} / (c4 * sqrt(n-1)), so these are chi quantiles, not
+# simulation estimates (cross-checked against 3e6 draws, agreeing to 3dp; the
+# n=2 pair is verifiable by hand -- sigma_hat = |Z| / c4(2), so the span is
+# [z_0.525, z_0.975] / 0.79788 = [0.0627, 1.9600] / 0.79788).
+_SIGMA_HAT_SPAN = {
+    2: (0.079, 2.456), 3: (0.256, 1.953), 4: (0.372, 1.752),
+    5: (0.448, 1.638), 6: (0.503, 1.564), 7: (0.544, 1.510),
+    8: (0.577, 1.469),
+}
+
+
+def _noise_fid_stats(budget_dir: str) -> Optional[Dict[str, object]]:
+    """Same-arm replica FID noise, as an UNBIASED SD rather than a range.
+
+    ``sweep_budget_probe.sh`` reruns the baseline arm at SEED+1/+2 into
+    ``equalflops/noise_<seed>/`` precisely so arm-to-arm differences can be
+    compared against resampling noise. The crossover gate needs it because a
+    recovered per-image gain smaller than the floor cannot be spent.
+
+    DELIBERATE DIVERGENCE from ``analyze_teacache_sweeps.py:168`` ``_spread``,
+    which uses ``max - min``. That is not a bug there and it is not copied
+    here: the expected range GROWS with the replica count
+    (``E[range] = d2(n) * sigma``, d2 = 1.13 / 1.69 / 2.06 / 2.33 at
+    n = 2 / 3 / 4 / 5), so a floor built from it silently TIGHTENS as replicas
+    are added — adding three replicas roughly doubles the floor at unchanged
+    true noise, and a gain that cleared the floor at n=2 can fail at n=5 purely
+    because the estimator changed. ``sigma_hat`` is n-invariant, so the floor
+    means the same thing at every replica count.
+
+    THIS DOES MOVE THE FLOOR, in the LOOSENING direction. The two SD estimators
+    ``range / d2(n)`` and ``s / c4(n)`` coincide exactly at n=2, so the choice
+    between them is immaterial there — but the previous code used the raw RANGE
+    as if it were an sd, and the range overstates sigma by d2(2) = 1.128. The
+    real two-replica case (FID spread 2.4) therefore goes 2*2.4 = 4.80 FID ->
+    2*2.127 = 4.25 FID: the floor drops by 11.4% of its old value (that is
+    1 - 1/d2(2), fixed at n=2 regardless of the spread; stated the other way
+    round the old floor was 12.8% higher). No observed verdict flips, but
+    for a magnitude reason rather than an algebraic one: the largest gain any
+    real budget recovered is 0.284 FID (k8) and 0.171 FID (k6), 15-28x below
+    either floor. A future gain landing in [4.25, 4.80] would pass now and
+    would have failed before.
+
+    The estimator's own uncertainty is reported by the renderer, because at n=2
+    it is enormous and a reader must not treat the floor as a precise number.
+    """
+    fids = []
+    for path in sorted(glob.glob(os.path.join(
+            budget_dir, "equalflops", "noise_*", "results.json"))):
+        agg = (_load(path) or {}).get("aggregate") or {}
+        fid = agg.get("fid")
+        if fid is not None and not math.isnan(float(fid)):
+            fids.append(float(fid))
+    return _noise_stats_from_fids(fids)
+
+
+def _noise_stats_from_fids(fids: List[float]) -> Optional[Dict[str, object]]:
+    """The statistics half of ``_noise_fid_stats``, split out so the estimator
+    is testable without a directory tree on disk."""
+    if len(fids) < 2:
+        return None
+    n = len(fids)
+    mean = sum(fids) / n
+    sd = math.sqrt(sum((f - mean) ** 2 for f in fids) / (n - 1))
+    c4 = _c4(n)
+    lo, hi = _SIGMA_HAT_SPAN.get(n, (0.60, 1.40))
+    sigma_hat = sd / c4
+    return {"n": n, "fids": list(fids), "range": max(fids) - min(fids),
+            "sd": sd, "c4": c4, "sigma_hat": sigma_hat,
+            "rel_sd": math.sqrt(1.0 / c4 ** 2 - 1.0),
+            # Inverted to a band on the TRUE sigma: sigma_hat/sigma in [lo,hi]
+            # means sigma in sigma_hat/[hi,lo]. That is the decision-relevant
+            # direction — how much the floor itself could be off.
+            "true_lo": sigma_hat / hi, "true_hi": sigma_hat / lo,
+            "span_exact": n in _SIGMA_HAT_SPAN}
+
+
+def _noise_floor_fid(noise: Optional[Dict[str, object]]) -> Tuple[float, bool]:
+    """(floor, measured) — ``2 * sigma_hat`` when replicas exist, else the
+    ``2 * _FALLBACK_FID_FLOOR`` heuristic. One place so gate and renderer can
+    never disagree about which floor was applied."""
+    if noise is None:
+        return 2.0 * _FALLBACK_FID_FLOOR, False
+    return 2.0 * float(noise["sigma_hat"]), True
+
+
+def _batch_oracle_gain(D: np.ndarray, idxs: List[int],
+                       batch_size: int, start_index: int
+                       ) -> Optional[Dict[str, object]]:
+    """Per-batch oracle gain: the ceiling the REAL decision granularity leaves.
+
+    The bandit decides once per batch, not once per image (``run_dit.py``:
+    ``trajectory_id = covr_trajectory_offset + batch_start // bs``, one
+    ``apply_strategy`` per trajectory). ``[d]``'s per-image oracle gain is
+    therefore not what a per-trajectory bandit could capture; this computes the
+    per-batch analogue. Rows are grouped by global_idx
+    (``(idx - start_index) // batch_size``), never by row position, because
+    ``common`` is a set intersection that can have holes — a hole must not
+    shift later rows into the wrong batch.
+
+    Per-batch oracle gain = (mean over ALL rows of the globally best single
+    arm's column) - (row-count-weighted mean over batches of each batch's own
+    best-mean-cost arm). Returns None when grouping is impossible or
+    degenerate (<= 1 batch, or a single batch where the gain is 0 by
+    construction).
+    """
+    n = D.shape[0]
+    best_single = float(D.mean(axis=0).min())
+    batches: List[Tuple[List[int], float]] = []
+    by_batch: Dict[int, List[int]] = {}
+    for i, k in enumerate(idxs):
+        b = (int(k) - start_index) // batch_size
+        by_batch.setdefault(b, []).append(i)
+    for b in sorted(by_batch):
+        rows = by_batch[b]
+        batches.append((rows, float(D[rows].mean(axis=0).min())))
+    if len(batches) < 2:
+        return None
+    gain = best_single - sum(len(r) * g for r, g in batches) / n
+    sizes = [len(r) for r, _ in batches]
+    return {"batches": len(batches), "gain": gain,
+            "best_single": best_single, "per_batch": batches,
+            "batch_sizes": sizes,
+            "min_batch": min(sizes), "max_batch": max(sizes)}
+
+
+def _decision_batch_size(results: Dict[str, dict], flag_batch: Optional[int]
+                         ) -> Tuple[Optional[Dict[str, object]], Optional[str]]:
+    """Recover the bandit's real decision granularity from the arm configs.
+
+    ``run_dit.py`` writes ``batch_size`` and ``generation_start_index`` into
+    every results.json ``config``. Both must agree across ALL arms — on
+    disagreement [e] is skipped with a message naming the disagreement rather
+    than guessing. When the key is absent entirely, ``flag_batch`` (the
+    ``--decision-batch-size`` fallback) supplies the batch size and the result
+    is flagged ``assumed_bs`` so the renderer labels it as assumed; an absent
+    ``generation_start_index`` falls back to 0 and is flagged ``assumed_start``.
+    Returns (info, None) or (None, skip_reason).
+    """
+    bs_vals, si_vals = [], []
+    for res in results.values():
+        cfg = res.get("config") or {}
+        if isinstance(cfg.get("batch_size"), int):
+            bs_vals.append(int(cfg["batch_size"]))
+        if isinstance(cfg.get("generation_start_index"), int):
+            si_vals.append(int(cfg["generation_start_index"]))
+    if len(set(bs_vals)) > 1:
+        return None, (f"arms disagree on batch_size ({sorted(set(bs_vals))}) "
+                      f"— refusing to guess")
+    if len(set(si_vals)) > 1:
+        return None, (f"arms disagree on generation_start_index "
+                      f"({sorted(set(si_vals))}) — refusing to guess")
+    assumed_bs = not bs_vals
+    if bs_vals:
+        bs = bs_vals[0]
+    elif flag_batch is not None:
+        bs = int(flag_batch)
+    else:
+        return None, ("no batch_size recorded in arm configs and no "
+                      "--decision-batch-size fallback given")
+    return {"batch_size": bs, "generation_start_index": si_vals[0] if si_vals else 0,
+            "assumed_bs": assumed_bs, "assumed_start": not si_vals}, None
+
+
+def _gate(row: Dict[str, object]) -> Dict[str, object]:
+    """The three-part verdict gate, computed once so renderer and main agree.
+
+    ``p <= 0.05`` alone is not enough, and the reason is structural rather than
+    a matter of taste. Permuting the train rows destroys the feature->cost
+    relation, so every arm's least squares collapses to its own mean, the argmin
+    becomes the globally best arm, and the permuted benefit is EXACTLY zero.
+    Measured mass of the null at |benefit| <= 1e-12: 0.56-0.60. With most of the
+    null pinned at zero, "p <= 0.05" is very nearly the same statement as
+    "benefit > 0" and carries almost no information about effect size.
+
+    So the gate also requires magnitude, calibrated two ways (300-400 trials,
+    n=500). Share of the oracle gain the rule recovers when it passes at p<=0.05:
+
+      world                        pass rate   median frac when passing
+      no crossover, noise feats        0.007            0.67%
+      no crossover, high noise         0.048            1.58%
+      weak crossover (0.2)             0.102            1.31%
+      REAL crossover (0.8)             0.990           20.90%
+
+    A real crossover shows up ~20x larger than the false positives, so a 5%
+    relative floor separates them: it costs 0.963 power on the real interaction
+    while cutting the high-noise false-positive rate from 0.048 to 0.003.
+
+    The absolute floor is the physical one: convert the recovered benefit to FID
+    with ``_loss_to_fid_slopes`` (max slope, most generous) and require it to
+    clear ``2 * sigma_hat`` of the same-arm replica FIDs — the standing
+    2x-noise rule this project applies to every other arm-spread claim, with the
+    noise measured as an UNBIASED SD instead of a range so the floor does not
+    tighten as replicas are added (see ``_noise_fid_stats``).
+    """
+    oos = row.get("oos") or {}
+    frac = oos.get("reg_frac")
+    out: Dict[str, object] = {
+        "frac_ok": None, "p_ok": None, "rel_ok": None, "abs_ok": None,
+        "gain_fid_lo": None, "gain_fid_hi": None, "floor_fid": None,
+        "pass": False, "reason": None,
+    }
+    if oos.get("skip") or frac is None or (isinstance(frac, float)
+                                           and math.isnan(frac)):
+        out["reason"] = "no out-of-sample result"
+        return out
+    out["frac_ok"] = bool(frac > 0.0)
+    out["p_ok"] = bool(oos.get("reg_p", 1.0) <= 0.05)
+    out["rel_ok"] = bool(frac > _REL_FLOOR)
+
+    slopes = row.get("fid_per_loss")
+    noise = row.get("noise_fid")
+    floor, measured = _noise_floor_fid(noise)
+    out["floor_fid"] = floor
+    out["floor_measured"] = measured
+    out["floor_replicas"] = int(noise["n"]) if noise else 0
+    if slopes is not None:
+        benefit = float(oos.get("reg_benefit", 0.0))
+        out["gain_fid_lo"] = benefit * slopes[0]
+        out["gain_fid_hi"] = benefit * slopes[1]
+        out["abs_ok"] = bool(out["gain_fid_hi"] > floor)
+    # --- [e] veto: the bandit decides per BATCH, so a per-image gain the
+    # batch granularity cannot monetize is NOT utilizable even if all three
+    # [d] checks pass. The per-batch oracle is the omniscient ceiling for a
+    # per-trajectory bandit; if even that sits below the absolute floor, the
+    # crossover is not capturable at this granularity. A gain of 0 or less is
+    # the strongest possible veto — the batch decision recovers nothing. ---
+    out["granularity_ok"] = None
+    if (not row.get("granularity_skip")
+            and row.get("granularity_bs") is not None
+            and row.get("granularity") is not None
+            and slopes is not None):
+        gain_batch = float(row["granularity"]["gain"])
+        fid_batch = gain_batch * slopes[1]
+        out["granularity_ok"] = bool(fid_batch > floor)
+        out["granularity_fid_hi"] = fid_batch
+        out["granularity_bs"] = row["granularity_bs"]["batch_size"]
+    checks = [out["frac_ok"], out["p_ok"], out["rel_ok"]]
+    if out["abs_ok"] is not None:
+        checks.append(out["abs_ok"])
+    out["pass"] = all(bool(c) for c in checks)
+    if out["granularity_ok"] is False:
+        out["pass"] = False
+        out["reason"] = (f"per-image crossover not capturable at the bandit's "
+                         f"bs={out.get('granularity_bs')}: the per-batch oracle "
+                         f"gain is {out.get('granularity_fid_hi', 0.0):.3f} FID, "
+                         f"below the same {floor:.2f} FID absolute floor — the "
+                         f"bandit decides once per batch, not per image")
+    elif not out["pass"]:
+        failed = []
+        if not out["frac_ok"]:
+            failed.append("recovers no positive share")
+        elif not out["p_ok"]:
+            failed.append("not significant against the permutation null")
+        if out["frac_ok"] and not out["rel_ok"]:
+            failed.append(f"share {frac * 100:.2f}% is inside the "
+                          f"false-positive band (floor {_REL_FLOOR * 100:.0f}%)")
+        if out["abs_ok"] is False:
+            failed.append(f"gain <= {out['gain_fid_hi']:.3f} FID is below "
+                          f"2x the same-arm noise sd ({floor:.2f} FID)")
+        out["reason"] = "; ".join(failed) or "magnitude below the floor"
+    return out
+
+
 # --------------------------------------------------------------------------
 # Per-budget analysis
 # --------------------------------------------------------------------------
 
-def _analyze_budget(budget_dir: str, ref_imgs: Dict[int, np.ndarray],
-                    metric: str, device: str, args
-                    ) -> Dict[str, object]:
+def _acquire_budget_payload(budget_dir: str,
+                            ref_imgs: Dict[int, np.ndarray],
+                            metric: str, device: str) -> Dict[str, object]:
+    """Acquisition: everything that touches PNGs, results.json, or the metric
+    extractor. Produces a plain payload that ``_analyze_from_payload`` reduces
+    to a row.
+
+    Splitting acquisition from statistics is the correctness mechanism behind
+    --dump/--from-dump: both the live path and the offline path feed the SAME
+    payload through the SAME statistics code, so byte-identical output is
+    structural, not a coincidence. Nothing here reads ``args`` — the gate
+    parameters all live in the statistics half, which is what keeps
+    ``--max-perm``/``--oos-perm``/``--perm-seed``/``--floor-ratio``/
+    ``--decision-batch-size`` live under --from-dump.
+    """
     budget = int(os.path.basename(budget_dir)[1:])
     manifest = _load(os.path.join(budget_dir, "manifest.json"))
     num_steps = int((manifest or {}).get("num_steps", 0))
@@ -674,46 +1035,53 @@ def _analyze_budget(budget_dir: str, ref_imgs: Dict[int, np.ndarray],
         results[label] = _load(os.path.join(adir, "results.json")) or {}
         arm_imgs[label] = _load_images(os.path.join(adir, "generated"))
 
-    row: Dict[str, object] = {
+    payload: Dict[str, object] = {
         "budget": budget,
         "num_steps": num_steps,
         "labels": labels,
-        "valid": None,
+        "metric": metric,
+        "metric_desc": _metric_desc(metric, device),
+        # the raw results dicts, not the resolved decision info:
+        # _decision_batch_size must run in the STATISTICS half so
+        # --decision-batch-size still takes effect offline (results.json is
+        # not available under --from-dump).
+        "arm_results": {label: results[label] for label in labels},
         "skip": None,
     }
     if not labels:
-        row["skip"] = "no forced-arm runs"
-        return row
+        payload["skip"] = "no forced-arm runs"
+        return payload
 
     common = set(ref_imgs)
     for label in labels:
         common &= set(arm_imgs[label])
     common = sorted(common)
     if len(common) < 2:
-        row["skip"] = f"only {len(common)} images shared with reference (need >=2)"
-        return row
+        payload["skip"] = (f"only {len(common)} images shared with reference "
+                           "(need >=2)")
+        return payload
 
-    metric_desc = _metric_desc(metric, device)
     ref_al = np.stack([ref_imgs[k] for k in common])
     n = len(common)
     n_arm = len(labels)
+    payload["common"] = list(common)
 
     # Per-arm uint8 stacks, aligned to `common`, shared by every metric below.
     arm_stacks = [np.stack([arm_imgs[label][k] for k in common])
                   for label in labels]
 
     # loss matrix in the primary metric's units (smaller = better everywhere)
-    row["pixel_mse_crosscheck"] = None
+    payload["pixel_mse_crosscheck"] = None
     if metric in _BATCHED:
         try:
             D = _distance_matrix(metric, device, ref_al, arm_stacks)
         except Exception as exc:
-            row["skip"] = (f"{metric} extractor failed at analysis time "
-                           f"({type(exc).__name__}: {exc})")
-            return row
+            payload["skip"] = (f"{metric} extractor failed at analysis time "
+                               f"({type(exc).__name__}: {exc})")
+            return payload
         if not np.isfinite(D).all():
-            row["skip"] = f"{metric} produced non-finite values"
-            return row
+            payload["skip"] = f"{metric} produced non-finite values"
+            return payload
     elif metric == "pixel_mse":
         D = np.empty((n, n_arm))
         for j, arm_al in enumerate(arm_stacks):
@@ -726,9 +1094,9 @@ def _analyze_budget(budget_dir: str, ref_imgs: Dict[int, np.ndarray],
             at = torch.from_numpy(
                 arm_stacks[0][0].transpose(2, 0, 1).astype(np.float32) / 255.0)
             chk = float(compute_pixel_mse(at, rt))
-            row["pixel_mse_crosscheck"] = abs(chk - D[0, 0])
+            payload["pixel_mse_crosscheck"] = abs(chk - D[0, 0])
         except Exception:
-            row["pixel_mse_crosscheck"] = None
+            payload["pixel_mse_crosscheck"] = None
     else:
         fn, _ = _make_distance(metric, device)
         D = np.empty((n, n_arm))
@@ -736,41 +1104,96 @@ def _analyze_budget(budget_dir: str, ref_imgs: Dict[int, np.ndarray],
             for i, k in enumerate(common):
                 D[i, j] = fn(ref_imgs[k], arm_imgs[label][k])
         if np.isnan(D).any():
-            row["skip"] = "LPIPS produced NaN (model load failed)"
-            return row
+            payload["skip"] = "LPIPS produced NaN (model load failed)"
+            return payload
+    payload["D"] = D
 
-    # [b]'s quantization floor is ALWAYS in pixel-MSE units: it asks whether the
-    # arm IMAGES differ by more than 8-bit rounding, which is a property of the
-    # PNGs and not of whatever metric ranks them. For a reference-free metric it
-    # therefore answers "do the images differ above rounding", not "does the
-    # score differ above rounding" — stated explicitly in the rendering.
+    # [b]'s quantization floor is ALWAYS in pixel-MSE units: it asks whether
+    # the arm IMAGES differ by more than 8-bit rounding, which is a property
+    # of the PNGs and not of whatever metric ranks them. For a reference-free
+    # metric it therefore answers "do the images differ above rounding", not
+    # "does the score differ above rounding" — stated explicitly in the
+    # rendering. Computed here (needs the images); compared against _FLOOR in
+    # the statistics half.
     if metric == "pixel_mse":
         D_pmse = D
     else:
         D_pmse = np.empty((n, n_arm))
         for j, arm_al in enumerate(arm_stacks):
             D_pmse[:, j] = _pixel_mse_vectorized(ref_al, arm_al)
+    payload["D_pmse"] = D_pmse
 
-    fids: Dict[str, Optional[float]] = {
+    payload["fids"] = {
         label: (results[label].get("aggregate") or {}).get("fid")
         for label in labels}
-    is_means: Dict[str, Optional[float]] = {
+    payload["is_means"] = {
         label: (results[label].get("aggregate") or {}).get("is_mean")
         for label in labels}
-    row["fids"] = fids
-    row["is_means"] = is_means
+
+    # direct arm-vs-arm pixel MSE (6 pairs for 4 arms)
+    pair_mses = []
+    for a in range(n_arm):
+        for b in range(a + 1, n_arm):
+            pair_mses.append(float(_pixel_mse_vectorized(
+                arm_stacks[a], arm_stacks[b]).mean()))
+    payload["pair_mses"] = pair_mses
+
+    # exogenous features from the REFERENCE image only (see _out_of_sample)
+    payload["feat"] = _image_features(ref_imgs, common)
+    # same-arm replica FID noise; reads noise_* results.json off disk
+    payload["noise_fid"] = _noise_fid_stats(budget_dir)
+    return payload
+
+
+def _analyze_from_payload(payload: Dict[str, object], args
+                          ) -> Dict[str, object]:
+    """PURE statistics on an acquisition payload: sections [a] [b] [c] [d] [e]
+    and every ``row[...]`` key the renderers read. No PNGs, no results.json,
+    no metric extractor.
+
+    The rng construction and the null call order live HERE, which is what
+    makes the same ``--perm-seed`` produce the same nulls on the live path and
+    under --from-dump. A skipped budget is carried as payload["skip"] and
+    returns a minimal row, so the dump round-trips SKIPPED lines instead of
+    dropping the budget.
+    """
+    row: Dict[str, object] = {
+        "budget": payload["budget"],
+        "num_steps": payload["num_steps"],
+        "labels": payload["labels"],
+        "valid": None,
+        "skip": payload.get("skip"),
+    }
+    if payload.get("skip"):
+        return row
+
+    metric = str(payload["metric"])
+    labels = row["labels"]
+    D = np.asarray(payload["D"])
+    D_pmse = np.asarray(payload["D_pmse"])
+    common = list(payload["common"])
+    n = len(common)
+    n_arm = len(labels)
+
     row["metric"] = metric
     row["reference_free"] = metric in _REFERENCE_FREE
-    row["metric_desc"] = metric_desc
+    row["metric_desc"] = payload["metric_desc"]
+    row["pixel_mse_crosscheck"] = payload.get("pixel_mse_crosscheck")
+    fids = payload["fids"]
+    is_means = payload["is_means"]
+    row["fids"] = fids
+    row["is_means"] = is_means
     row["n_images"] = n
-    row["mean_dist"] = {label: float(D[:, j].mean()) for j, label in enumerate(labels)}
+    row["mean_dist"] = {label: float(D[:, j].mean())
+                        for j, label in enumerate(labels)}
     row["argmin_counts"] = {label: int((D.argmin(axis=1) == j).sum())
                             for j, label in enumerate(labels)}
 
     # --- (a) validity: mean per-image loss must rank arms like FID ---
     dist_vals = [float(D[:, j].mean()) for j in range(n_arm)]
     fid_vals = [fids[label] for label in labels]
-    if any(v is None or (isinstance(v, float) and math.isnan(v)) for v in fid_vals):
+    if any(v is None or (isinstance(v, float) and math.isnan(v))
+           for v in fid_vals):
         # Leave ``valid`` at None so the renderer prints a SKIPPED line instead
         # of trying to build the [a] table: it would call float() on the missing
         # FID and read row["spearman"], neither of which exists here.
@@ -806,7 +1229,7 @@ def _analyze_budget(budget_dir: str, ref_imgs: Dict[int, np.ndarray],
         row["skip"] = "mean per-image loss does not rank arms like FID"
         return row
 
-    # --- (b) crossover ---
+    # --- (c) crossover ---
     rng = np.random.RandomState(args.perm_seed)
     benefit, best_single, oracle = _benefit(D)
     null_a, p_a = _null_within_image(D, args.max_perm, rng)
@@ -824,23 +1247,44 @@ def _analyze_budget(budget_dir: str, ref_imgs: Dict[int, np.ndarray],
     row["null_r_mean"] = float(null_r.mean())
     row["null_r_std"] = float(null_r.std())
     row["null_r_p"] = p_r
-    row["oos"] = _out_of_sample(D, common, _image_features(ref_imgs, common),
+    row["oos"] = _out_of_sample(D, common, np.asarray(payload["feat"]),
                                 args.oos_perm, rng)
+    # --- [e] granularity: the bandit decides per BATCH, not per image ---
+    bs_info, bs_reason = _decision_batch_size(
+        payload["arm_results"], getattr(args, "decision_batch_size", None))
+    row["granularity_skip"] = bs_reason
+    row["granularity_bs"] = bs_info
+    if bs_info is not None:
+        row["granularity"] = _batch_oracle_gain(
+            D, common, bs_info["batch_size"], bs_info["generation_start_index"])
+    else:
+        row["granularity"] = None
+    # The gate needs the recovered benefit in FID units, and the FID scale that
+    # the per-image loss maps onto is only knowable from the arms themselves.
+    row["fid_per_loss"] = _loss_to_fid_slopes(
+        dist_vals, [float(v) for v in fid_vals])  # type: ignore[arg-type]
+    row["noise_fid"] = payload.get("noise_fid")
 
-    # --- (c) quantization floor (always in pixel-MSE units) ---
+    # --- (b) quantization floor (always in pixel-MSE units) ---
     spread = D_pmse.max(axis=1) - D_pmse.min(axis=1)
     mean_spread = float(spread.mean())
-    # direct arm-vs-arm pixel MSE (6 pairs for 4 arms)
-    pair_mses = []
-    for a in range(n_arm):
-        for b in range(a + 1, n_arm):
-            pair_mses.append(float(_pixel_mse_vectorized(
-                arm_stacks[a], arm_stacks[b]).mean()))
+    pair_mses = [float(v) for v in np.atleast_1d(payload.get("pair_mses"))
+                 ] if payload.get("pair_mses") is not None else []
     row["floor_ratio"] = mean_spread / _FLOOR
     row["mean_spread_pmse"] = mean_spread
-    row["mean_arm_arm_pmse"] = float(np.mean(pair_mses)) if pair_mses else None
+    row["mean_arm_arm_pmse"] = (float(np.mean(pair_mses)) if pair_mses
+                                else None)
     row["near_floor_frac"] = float((spread <= 5.0 * _FLOOR).mean())
     return row
+
+
+def _analyze_budget(budget_dir: str, ref_imgs: Dict[int, np.ndarray],
+                    metric: str, device: str, args
+                    ) -> Dict[str, object]:
+    """Acquire then analyze in one call — the live path. Kept for the tests
+    that build synthetic probe trees and call it directly."""
+    return _analyze_from_payload(
+        _acquire_budget_payload(budget_dir, ref_imgs, metric, device), args)
 
 
 # --------------------------------------------------------------------------
@@ -1028,13 +1472,316 @@ def _render_budget(row: Dict[str, object], floor_thresh: float) -> List[str]:
                    "information about which arm wins' and its negative frac as "
                    "'label transfer cannot monetize it' — the two are not in "
                    "conflict, and only the cost regression above gates.")
-        out.append("    => VERDICT GATE: crossover " +
-                   ("UTILIZABLE out-of-sample" if oos["reg_frac"] > 0.0
-                    and oos["reg_p"] <= 0.05
-                    else "NOT utilizable — the cost regression recovers no "
-                         "positive share of the oracle gain at p<=0.05, which "
-                         "is what pure measurement noise looks like"))
+        out.extend(_render_gate(row))
+
+    # --- [e] granularity: what the real decision granularity can capture ---
+    out.extend(_render_granularity(row))
     return out
+
+
+def _render_gate(row: Dict[str, object]) -> List[str]:
+    """Print the gate's three checks and what each one is protecting against."""
+    g = _gate(row)
+    oos = row["oos"]  # type: ignore[index]
+    frac = float(oos["reg_frac"])  # type: ignore[index]
+    out: List[str] = []
+    out.append("    gate check 1/3 SIGN+SIGNIFICANCE: "
+               f"frac={frac * 100:.2f}% p={oos['reg_p']:.4g} -> "  # type: ignore[index]
+               + ("pass" if g["frac_ok"] and g["p_ok"] else "FAIL"))
+    out.append("      p alone is weak evidence here BY CONSTRUCTION: permuting "
+               "the train rows destroys feature->cost, every arm's fit collapses "
+               "to its own mean, the argmin becomes the globally best arm and the "
+               "permuted benefit is EXACTLY 0. Measured null mass at |benefit| "
+               "<= 1e-12: 0.56-0.60. So p<=0.05 is nearly the same statement as "
+               "frac>0 and says almost nothing about size. Hence checks 2 and 3.")
+    out.append(f"    gate check 2/3 RELATIVE SIZE: frac={frac * 100:.2f}% vs "
+               f"floor {_REL_FLOOR * 100:.0f}% of the oracle gain -> "
+               + ("pass" if g["rel_ok"] else "FAIL"))
+    out.append("      calibration (300-400 trials, n=500): constructed worlds "
+               "with NO crossover that still reach p<=0.05 report a median "
+               "0.67% (noise features) to 1.58% (high noise) recovered share; a "
+               "REAL crossover reports ~21%, about 20x larger. The 5% floor "
+               "keeps 0.963 power on the real interaction while cutting the "
+               "high-noise false-positive rate from 0.048 to 0.003.")
+    if g["abs_ok"] is None:
+        out.append("    gate check 3/3 ABSOLUTE SIZE: not evaluable (no usable "
+                   "loss->FID slope from the arm table)")
+    else:
+        slopes = row["fid_per_loss"]  # type: ignore[index]
+        out.append(f"    gate check 3/3 ABSOLUTE SIZE: recovered gain "
+                   f"{g['gain_fid_lo']:.3f}..{g['gain_fid_hi']:.3f} FID "
+                   f"(loss->FID slope {slopes[0]:.1f}..{slopes[1]:.1f} from this "  # type: ignore[index]
+                   f"budget's own arm table) vs floor {g['floor_fid']:.2f} FID -> "
+                   + ("pass" if g["abs_ok"] else "FAIL"))
+        out.append("      the floor is 2x the "
+                   + ("MEASURED same-arm replica FID noise sd"
+                      if g.get("floor_measured")
+                      else f"heuristic {_FALLBACK_FID_FLOOR:.1f} FID sd (no "
+                           "noise_* replicas found for this budget)")
+                   + " — the same 2x-noise-floor rule this project applies to "
+                     "every other arm-spread claim, applied to the per-image "
+                     "gain. A gain smaller than resampling noise cannot be spent "
+                     "even if it is real.")
+        out.extend(_render_noise_estimator(row))
+    if g["pass"]:
+        out.append("    => VERDICT GATE: crossover UTILIZABLE out-of-sample "
+                   "(all three checks pass)")
+    else:
+        out.append(f"    => VERDICT GATE: crossover NOT utilizable — "
+                   f"{g['reason']}")
+    return out
+
+
+def _render_noise_estimator(row: Dict[str, object]) -> List[str]:
+    """Print how the floor was estimated, from how many replicas, and how
+    uncertain that estimate is.
+
+    A floor is a threshold a verdict turns on, so a reader must be able to see
+    that at 2 replicas the floor is barely an estimate at all: sigma_hat has a
+    75.6% relative sd and a 5-95% span of [0.08 sigma, 2.46 sigma]. Inverted,
+    the real 2.4-FID-spread run's floor of 4.25 FID carries a 5-95% band of
+    roughly [1.7, 54] FID. Printing the number without that band invites
+    treating 4.25 as precise.
+    """
+    noise = row.get("noise_fid")
+    if not noise:
+        return ["      floor source: NO same-arm replicas for this budget — "
+                f"using the heuristic {_FALLBACK_FID_FLOOR:.1f} FID sd. Run "
+                "noise_* replicas (sweep_budget_probe.sh already does at "
+                "SEED+1/+2) to measure it."]
+    n = int(noise["n"])
+    sig = float(noise["sigma_hat"])
+    out = [f"      floor source: {n} same-arm replica FIDs "
+           f"[{', '.join(f'{f:.2f}' for f in noise['fids'])}] -> "  # type: ignore[union-attr]
+           f"sd {float(noise['sd']):.3f} / c4({n})={float(noise['c4']):.4f} = "
+           f"sigma_hat {sig:.3f} FID, floor = 2 x sigma_hat = {2 * sig:.2f} FID"]
+    out.append(f"      estimator uncertainty at n={n}: sigma_hat has "
+               f"{float(noise['rel_sd']) * 100:.1f}% relative sd; the true "
+               f"noise sd is plausibly {float(noise['true_lo']):.2f}.."
+               f"{float(noise['true_hi']):.2f} FID (5-95%"
+               + ("" if noise.get("span_exact") else ", span EXTRAPOLATED "
+                  "beyond the tabulated n")
+               + f"), i.e. the floor itself is {2 * float(noise['true_lo']):.2f}"
+                 f"..{2 * float(noise['true_hi']):.2f} FID. Treat a verdict "
+                 "that only just clears it as undecided, and add replicas.")
+    if n == 2:
+        out.append("      at n=2 the two SD estimators coincide (range/d2(2) == "
+                   "s/c4(2) == |f1-f2|/1.12838); what changed is that the "
+                   "floor no longer uses the raw RANGE as an sd, which "
+                   "overstated it by 1.128x. This budget's floor is therefore "
+                   f"{2 * sig:.2f} rather than "
+                   f"{2 * float(noise['range']):.2f} FID — LOOSER, not "
+                   "tighter: 11.4% lower than the old floor (exactly "
+                   "1 - 1/d2(2) at any n=2, so the ratio is fixed).")
+    else:
+        out.append(f"      NOTE: the range would give {float(noise['range']):.3f}"
+                   f" FID here (floor {2 * float(noise['range']):.2f}); sigma_hat "
+                   f"is used instead because E[range] grows with n, so a "
+                   f"range-based floor tightens as replicas are added while the "
+                   f"true noise is unchanged. analyze_teacache_sweeps.py:168 "
+                   f"still uses the range — a deliberate divergence, not drift.")
+    return out
+
+
+def _render_granularity(row: Dict[str, object]) -> List[str]:
+    """Print [e]: the per-batch ceiling at the bandit's REAL granularity."""
+    out: List[str] = []
+    if row.get("granularity_skip"):
+        out.append("  [e] granularity: SKIPPED — "
+                   f"{row['granularity_skip']}")
+        return out
+    info = row.get("granularity_bs") or {}
+    bs = info.get("batch_size")
+    start = info.get("generation_start_index")
+    if bs is None:
+        out.append("  [e] granularity: SKIPPED — no decision granularity "
+                   "recoverable")
+        return out
+    assumed = []
+    if info.get("assumed_bs"):
+        assumed.append("batch_size ASSUMED from --decision-batch-size "
+                       "(not recorded in arm configs)")
+    if info.get("assumed_start"):
+        assumed.append("generation_start_index ASSUMED 0 (not recorded in arm "
+                       "configs)")
+    out.append(f"  [e] granularity — per-BATCH oracle at bs={bs} "
+               f"(bandit decides once per batch, not per image; "
+               f"generation_start_index={start})")
+    for note in assumed:
+        out.append(f"    [ASSUMED] {note}")
+    g = row.get("granularity")
+    if g is None:
+        out.append("    per-batch oracle gain: n/a (fewer than 2 batches in "
+                   f"the shared set; {row.get('n_images')} shared images at "
+                   f"bs={bs} yield ~{row.get('n_images', 0) // bs} bandit "
+                   "decisions)")
+        return out
+    sizes = g["batch_sizes"]
+    size_s = f"{min(sizes)}..{max(sizes)}"
+    if min(sizes) != max(sizes):
+        size_s += f" (rows/batch vary: {','.join(str(s) for s in sizes[:8])}"
+        if len(sizes) > 8:
+            size_s += ",..."
+        size_s += ")"
+    out.append(f"    batches: {g['batches']} (rows per batch: {size_s})")
+    gain_bs1 = float(row.get("benefit", float("nan")))
+    ratio_s = ""
+    if g["gain"] > 1e-12 and gain_bs1 == gain_bs1 and gain_bs1 > 0:
+        ratio_s = f" (ratio to bs=1: {gain_bs1 / g['gain']:.1f}x)"
+    out.append(f"    per-batch oracle gain (loss units): {g['gain']:.4g} "
+               f"vs bs=1 per-image gain {gain_bs1:.4g}{ratio_s} — "
+               f"at bs=1 the two are identical; the gap is the headroom the "
+               f"batch decision cannot spend")
+    slopes = row.get("fid_per_loss")
+    floor, measured = _noise_floor_fid(row.get("noise_fid"))
+    if slopes is not None:
+        fid_hi = g["gain"] * slopes[1]
+        out.append(f"    per-batch gain in FID (max slope "
+                   f"{slopes[0]:.1f}..{slopes[1]:.1f}): {fid_hi:.3f} FID vs "
+                   f"the {'MEASURED' if measured else 'heuristic'} "
+                   f"floor {floor:.2f} FID -> "
+                   + ("ABOVE" if fid_hi > floor else "BELOW")
+                   + " — a per-image crossover below the floor cannot be "
+                     "captured at this granularity")
+    else:
+        out.append("    per-batch gain in FID: not evaluable (no loss->FID "
+                   "slope from the arm table)")
+    out.append("    NOTE: n=500 at bs=32 yields ~16 bandit decisions, i.e. "
+               "~16 reward samples — not 500. Per-batch oracle is the "
+               "OMNISCIENT ceiling; a real bandit gets strictly less.")
+    return out
+
+
+# --------------------------------------------------------------------------
+# Dump / offline re-analysis (--dump / --from-dump)
+# --------------------------------------------------------------------------
+
+_DUMP_KEYS = ("D", "D_pmse", "common", "feat", "pair_mses")
+_JSON_KEYS = ("budget", "num_steps", "labels", "metric", "metric_desc",
+              "arm_results", "skip", "pixel_mse_crosscheck", "fids",
+              "is_means", "noise_fid")
+
+
+def _dump_payload(payload: Dict[str, object], dump_dir: str) -> None:
+    """Persist one budget's payload as DIR/k<K>.npz + k<K>.json.
+
+    np.savez_compressed for the arrays, JSON for the scalars/dicts/strings.
+    Images are never dumped — the payload holds only derived arrays, which is
+    exactly what makes --from-dump GPU-free.
+    """
+    os.makedirs(dump_dir, exist_ok=True)
+    tag = f"k{payload['budget']}"
+    arrays = {}
+    for key in _DUMP_KEYS:
+        if key in payload:
+            arrays[key] = np.asarray(payload[key])
+    np.savez_compressed(os.path.join(dump_dir, tag + ".npz"), **arrays)
+    scalars = {key: payload[key] for key in _JSON_KEYS if key in payload}
+    with open(os.path.join(dump_dir, tag + ".json"), "w",
+              encoding="utf-8") as fh:
+        json.dump(scalars, fh, indent=2, sort_keys=True)
+
+
+def _load_payload(dump_dir: str, budget: int) -> Optional[Dict[str, object]]:
+    """Load one budget's payload back from DIR/k<K>.npz + k<K>.json; None when
+    the pair is missing or corrupt. The loader never touches PNGs."""
+    tag = f"k{budget}"
+    npz_path = os.path.join(dump_dir, tag + ".npz")
+    json_path = os.path.join(dump_dir, tag + ".json")
+    if not (os.path.isfile(npz_path) and os.path.isfile(json_path)):
+        return None
+    try:
+        with open(json_path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        with np.load(npz_path, allow_pickle=False) as z:
+            for key in _DUMP_KEYS:
+                if key in z:
+                    payload[key] = z[key]
+    except (OSError, ValueError, json.JSONDecodeError, KeyError):
+        return None
+    if not isinstance(payload, dict) or "budget" not in payload:
+        return None
+    return payload
+
+
+def _dump_all(probe: str, dump_dir: str, ref_fid: Optional[float],
+              ref_config: dict, metric: str, budgets: List[Tuple[int, str]],
+              payloads: List[Dict[str, object]],
+              ref_dir: str = "", reference_missing: bool = False) -> None:
+    """Write per-budget k<K>.npz/.json plus manifest.json.
+
+    The manifest freezes the metric, the reference FID and config, the source
+    probe_dir, the budget list, the analyzing script's argv, and an ISO
+    timestamp. --from-dump uses it to reject a dump whose metric disagrees
+    with an explicit --metric, and to reproduce the reference-FID lines and
+    the budget ordering without the probe tree.
+
+    ``ref_dir`` / ``reference_missing`` are recorded because the live path
+    prints a REFERENCE MISSING block naming that directory and the
+    RECOMMENDATION branches on it. Without them a dump taken from a probe with
+    no reference would re-analyze to different text than the run that produced
+    it, which is the one thing --from-dump promises not to do.
+    """
+    os.makedirs(dump_dir, exist_ok=True)
+    for payload in payloads:
+        _dump_payload(payload, dump_dir)
+    manifest = {
+        "metric": metric,
+        "metric_desc": str(payloads[0]["metric_desc"]) if payloads else None,
+        "reference_free": metric in _REFERENCE_FREE,
+        "reference_fid": ref_fid,
+        "reference_config": ref_config,
+        "reference_dir": ref_dir,
+        "reference_missing": bool(reference_missing),
+        "probe_dir": probe,
+        "budgets": [int(b) for b, _ in budgets],
+        "argv": list(sys.argv),
+        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    with open(os.path.join(dump_dir, "manifest.json"), "w",
+              encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2, sort_keys=True)
+    print(f"  dump: {os.path.abspath(dump_dir)}/ "
+          f"(k<K>.npz + k<K>.json + manifest.json; no images)")
+
+
+def _load_all(dump_dir: str, probe: str, metric_choice: str, args
+              ) -> Tuple[Optional[dict], List[Tuple[int, str]],
+                         List[Dict[str, object]]]:
+    """Load a dump; (manifest, budgets, payloads). Returns (None, [], []) on
+    refusal so main() can return 1 without emitting a partial verdict."""
+    manifest = _load(os.path.join(dump_dir, "manifest.json"))
+    if not manifest:
+        print(f"  ERROR: {os.path.join(dump_dir, 'manifest.json')} is missing "
+              f"or unreadable — nothing to re-analyze.")
+        return None, [], []
+    if not os.path.isdir(probe):
+        print(f"  [WARN] source probe dir {probe} is not accessible; the "
+              f"reference-FID block and binding block are printed from the "
+              f"manifest instead.")
+    dump_metric = str(manifest.get("metric") or "pixel_mse")
+    if metric_choice not in (None, "auto", dump_metric):
+        print(f"  ERROR: --metric {metric_choice} disagrees with the dump's "
+              f"frozen metric {dump_metric} (manifest.json). Re-dump with "
+              f"--metric {metric_choice} or drop --metric to adopt the "
+              f"dump's metric.")
+        return None, [], []
+    budgets = [(int(b), os.path.join(dump_dir, f"k{b}"))
+               for b in (manifest.get("budgets") or [])]
+    payloads = []
+    for b, _ in budgets:
+        payload = _load_payload(dump_dir, b)
+        if payload is None:
+            print(f"  ERROR: dump file pair k{b}.npz/k{b}.json is missing or "
+                  f"corrupt — cannot reproduce a verdict for every budget.")
+            return None, [], []
+        if str(payload.get("metric") or "") != dump_metric:
+            print(f"  ERROR: k{b} payload metric {payload.get('metric')!r} "
+                  f"disagrees with manifest metric {dump_metric!r} — the dump "
+                  f"is inconsistent; re-dump it.")
+            return None, [], []
+        payloads.append(payload)
+    return manifest, budgets, payloads
 
 
 # --------------------------------------------------------------------------
@@ -1068,6 +1815,22 @@ def main() -> int:
     ap.add_argument("--perm-seed", type=int, default=0)
     ap.add_argument("--floor-ratio", type=float, default=5.0,
                     help="arm spread / floor below this = quantization-limited")
+    ap.add_argument("--decision-batch-size", type=int, default=None,
+                    help="fallback batch size for [e] granularity when the arm "
+                         "results.json configs do not record batch_size "
+                         "(results are then labelled as assumed)")
+    ap.add_argument("--dump", metavar="DIR", default=None,
+                    help="persist every budget's acquisition payload "
+                         "(k<K>.npz + k<K>.json + manifest.json) to DIR so the "
+                         "verdict can be reproduced without the probe tree. "
+                         "Mutually exclusive with --from-dump.")
+    ap.add_argument("--from-dump", metavar="DIR", default=None,
+                    help="reproduce the verdict OFFLINE from a --dump DIR: no "
+                         "PNG loading, no Inception, no results.json. The "
+                         "metric is frozen by the dump (an explicit --metric "
+                         "disagreeing with it is an error); the gate "
+                         "parameters --max-perm --oos-perm --perm-seed "
+                         "--floor-ratio --decision-batch-size stay live.")
     args = ap.parse_args()
 
     if args.device == "auto":
@@ -1078,11 +1841,70 @@ def main() -> int:
             args.device = "cpu"
 
     probe = args.probe_dir
-    ref_dir = os.path.join(probe, "reference")
-    ref_fid, ref_config, ref_imgs = _load_reference(ref_dir)
+
+    if args.dump and args.from_dump:
+        print("  ERROR: --dump and --from-dump are mutually exclusive — "
+              "produce a dump OR re-analyze one, not both.")
+        return 1
 
     print("== COVR per-image crossover verdict ==")
     print(f"  probe dir: {probe}")
+
+    # --- offline path: no PNGs, no Inception, no results.json ---
+    if args.from_dump:
+        if args.metric != "auto":
+            metric_choice = args.metric
+        else:
+            metric_choice = None
+        manifest, budgets, payloads = _load_all(args.from_dump, probe,
+                                                metric_choice, args)
+        if manifest is None:
+            return 1
+        metric = str(manifest["metric"])
+        metric_desc = str(manifest.get("metric_desc")
+                          or _metric_desc(metric, args.device))
+        ref_fid = manifest.get("reference_fid")
+        ref_config = manifest.get("reference_config") or {}
+        print(f"  offline re-analysis of dump: {args.from_dump}")
+        print(f"  source probe (per manifest): {manifest.get('probe_dir')}")
+        if manifest.get("reference_missing"):
+            print("  REFERENCE MISSING: no generated PNGs under "
+                  f"{manifest.get('reference_dir')}/generated/. Re-run the "
+                  "sweep with REFERENCE=1 (or point REFERENCE_DIR at an "
+                  "existing full-compute reference). Per-image crossover "
+                  "cannot be established without it.")
+        print(f"  metric: {metric_desc}  (frozen by the dump; an explicit "
+              f"--metric that disagrees is refused)")
+        # Both of the next two blocks exist on the live path too. They are
+        # repeated here rather than skipped because --from-dump promises
+        # byte-identical verdict text: omitting them would silently diverge for
+        # every reference-free dump, and for every dump taken from a probe whose
+        # reference was missing (where the RECOMMENDATION branch differs).
+        if metric in _REFERENCE_FREE:
+            print("  note: reference-free applies to the LOSS only. The "
+                  "reference run is still required — [b]'s quantization floor "
+                  "and [d]'s exogenous 1NN features both come from the "
+                  "reference image, and arms are still paired to it by "
+                  "global_idx.")
+        if ref_fid is not None:
+            print(f"  reference FID: {_fmt(ref_fid, '.2f')}"
+                  f"  (config: seed={ref_config.get('seed')} "
+                  f"num_steps={ref_config.get('num_steps')} "
+                  f"n_prompts={ref_config.get('n_prompts')})")
+        rows: List[Dict[str, object]] = []
+        for _, bdir in budgets:
+            row = _analyze_from_payload(_load_payload(args.from_dump,
+                                                      int(os.path.basename(bdir)[1:])),
+                                        args)
+            rows.append(row)
+            for line in _render_budget(row, args.floor_ratio):
+                print(line)
+        _render_tail(rows, ref_fid, args,
+                     reference_missing=bool(manifest.get("reference_missing")))
+        return 0
+
+    ref_dir = os.path.join(probe, "reference")
+    ref_fid, ref_config, ref_imgs = _load_reference(ref_dir)
     print(f"  reference dir: {ref_dir}")
 
     if not ref_imgs:
@@ -1114,12 +1936,30 @@ def main() -> int:
         return 0
 
     rows: List[Dict[str, object]] = []
+    payloads: List[Dict[str, object]] = []
     for _, bdir in budgets:
-        row = _analyze_budget(bdir, ref_imgs, metric, args.device, args)
+        payload = _acquire_budget_payload(bdir, ref_imgs, metric, args.device)
+        payloads.append(payload)
+        row = _analyze_from_payload(payload, args)
         rows.append(row)
         for line in _render_budget(row, args.floor_ratio):
             print(line)
 
+    if args.dump:
+        _dump_all(probe, args.dump, ref_fid, ref_config, metric,
+                  budgets, payloads, ref_dir=ref_dir,
+                  reference_missing=not ref_imgs)
+
+    _render_tail(rows, ref_fid, args, reference_missing=not ref_imgs)
+    return 0
+
+
+def _render_tail(rows: List[Dict[str, object]],
+                 ref_fid: Optional[float], args,
+                 reference_missing: bool = False) -> None:
+    """Everything after the per-budget blocks (binding / per-class /
+    recommendation). Shared by the live path and --from-dump so both print
+    byte-identical tails."""
     # ---- cross-budget: does the harshest budget actually bind? ----
     print("")
     print("== budget binding vs the full-compute reference ==")
@@ -1172,9 +2012,10 @@ def main() -> int:
     print("")
     print("== RECOMMENDATION ==")
     usable = [r for r in rows if not r.get("skip") and r.get("valid")]
+    metric = rows[0]["metric"] if rows else None
     if not rows:
         print("  INSUFFICIENT EVIDENCE: no budget data.")
-    elif not ref_imgs:
+    elif reference_missing and not usable:
         print("  REFERENCE MISSING: re-run the sweep with REFERENCE=1 (or set "
               "REFERENCE_DIR) so every arm's PNG can be paired against the "
               "full-compute output for the same (seed, global_idx). Without it "
@@ -1238,15 +2079,21 @@ def main() -> int:
         # The transfer feature must not come from D: a D-derived one declared
         # pure noise utilizable 99% of the time at n=500. See _out_of_sample.
         gap = [r for r in clean if r["benefit"] > 1e-12]
-        util = [r for r in clean
-                if r["oos"].get("reg_frac", 0.0) > 0.0
-                and r["oos"].get("reg_p", 1.0) <= 0.05]
+        util = [r for r in clean if _gate(r)["pass"]]
+        # Passed sign+significance but failed a magnitude floor. This is the
+        # single most likely outcome at this N and it must NOT be reported as
+        # "utilizable": the permutation null is mostly a point mass at exactly 0,
+        # so p<=0.05 is nearly equivalent to frac>0. See _gate.
+        marginal = [r for r in clean
+                    if r not in util
+                    and _gate(r)["frac_ok"] and _gate(r)["p_ok"]]
         # Significant p with a NEGATIVE frac on the label-transfer diagnostic:
         # the features do carry information about which arm wins, but label
         # transfer cannot monetize it. Worth naming, because it is not the same
         # thing as "pure noise" and a reader would otherwise lump them together.
         informative = [r for r in clean
                        if r not in util
+                       and r not in marginal
                        and r["oos"].get("nn_p", 1.0) <= 0.05]
         if quant_limited:
             print(f"  QUANTIZATION-LIMITED at "
@@ -1282,8 +2129,7 @@ def main() -> int:
             print("  NO UTILIZABLE CROSSOVER at "
                   + ", ".join(f"k{r['budget']}" for r in gap)
                   + ": the per-image oracle does beat the best single arm "
-                    "in-sample, but the out-of-sample cost regression recovers "
-                    "no positive share of that gain (reg_frac<=0 or p>0.05). An "
+                    "in-sample, but no budget clears the out-of-sample gate. An "
                     "in-sample gap of this size is exactly what independent "
                     "per-image measurement noise produces — taking the min over "
                     "4 noisy columns always looks better than any one column. "
@@ -1292,28 +2138,59 @@ def main() -> int:
                     "ways forward: stronger per-image features, or more images "
                     "per arm to shrink the per-image noise the oracle is "
                     "harvesting.")
-            if informative:
-                print("  BUT NOT PURE NOISE EITHER at "
-                      + ", ".join(f"k{r['budget']}" for r in informative)
-                      + ": the label-transfer diagnostic reached p<=0.05 there "
-                        "while recovering a negative share. Its permutation null "
-                        "shuffles the winner labels, so a significant p means "
-                        "the reference features DO predict which arm wins — what "
-                        "fails is acting on that prediction by committing to a "
-                        "single per-image winner. Pure iid noise produces this "
-                        "pattern 2.3% of the time; a real crossover at this "
-                        "noise level produces it 96.7% of the time. So the "
-                        "structure is likely there and too weak to pay for at "
-                        "n=500 with these 3 features. The cheap next move is "
-                        "more images per arm (shrinks the per-image noise the "
-                        "oracle harvests) or richer exogenous features, NOT a "
-                        "bandit run.")
         else:
             print("  NO CROSSOVER FOUND at any budget with a measurable signal: "
                   "the per-image oracle does not even beat the best single arm "
                   "in-sample. One arm is effectively best everywhere -> pick it "
                   "OFFLINE; a per-trajectory bandit has nothing to discover "
                   "here.")
+        # Addenda, printed under whichever verdict fired above: a budget can be
+        # marginal or label-transfer-informative independently of whether the
+        # in-sample gap branch was the one that ran.
+        for r in marginal:
+            g = _gate(r)
+            print(f"  MARGINAL, NOT UTILIZABLE at k{r['budget']}: the cost "
+                  f"regression recovered "
+                  f"{float(r['oos']['reg_frac']) * 100:.2f}% of the oracle "
+                  f"gain at p={r['oos']['reg_p']:.4g} — positive and "
+                  f"significant, but {g['reason']}. Read the p with care: "
+                  "permuting the train rows makes every arm's fit collapse "
+                  "to its own mean, so the permuted benefit is EXACTLY 0 for "
+                  "0.56-0.60 of the null draws, and p<=0.05 is nearly the "
+                  "same statement as frac>0. Constructed worlds with NO "
+                  "crossover that reach p<=0.05 report a median 0.67%-1.58% "
+                  "share; a real crossover reports ~21%. This share is in "
+                  "the former band. DO NOT spend bandit budget on it.")
+        vetoed = [r for r in clean
+                  if _gate(r).get("granularity_ok") is False]
+        for r in vetoed:
+            print(f"  [e] VETOED at k{r['budget']}: per-image crossover is not "
+                  f"capturable at the bandit's batch granularity — "
+                  f"{_gate(r)['reason']}")
+        if len(marginal) > 1:
+            print("  AND THE TWO PROXIES DISAGREE: more than one budget is "
+                  "marginal, and a per-image structure that is real should "
+                  "not appear at one budget under one proxy and a different "
+                  "budget under another. Run both --metric inception and "
+                  "--metric inception_conf and compare WHICH budget each "
+                  "one flags; if they disagree, that is direct evidence the "
+                  "flag is sampling noise rather than structure.")
+        if informative:
+            print("  BUT NOT PURE NOISE EITHER at "
+                  + ", ".join(f"k{r['budget']}" for r in informative)
+                  + ": the label-transfer diagnostic reached p<=0.05 there "
+                    "while recovering a negative share. Its permutation null "
+                    "shuffles the winner labels, so a significant p means "
+                    "the reference features DO predict which arm wins — what "
+                    "fails is acting on that prediction by committing to a "
+                    "single per-image winner. Pure iid noise produces this "
+                    "pattern 2.3% of the time; a real crossover at this "
+                    "noise level produces it 96.7% of the time. So the "
+                    "structure is likely there and too weak to pay for at "
+                    "n=500 with these 3 features. The cheap next move is "
+                    "more images per arm (shrinks the per-image noise the "
+                    "oracle harvests) or richer exogenous features, NOT a "
+                    "bandit run.")
     return 0
 
 

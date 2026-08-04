@@ -35,6 +35,30 @@
 #   REFERENCE (1|0, default 1)  REFERENCE_DIR (default <OUT_DIR>/reference)
 #   IMG_SAVE_LIMIT (default N_PROMPTS = save every image; per-image crossover
 #       analysis needs the full set, the old default of 50 is not enough)
+#   NOISE_MODE (latent|seed, default seed)  NOISE_REPLICAS (2)  NOISE_ARM (auto)
+#   SKIP_ARMS (0|1)  SKIP_NOISE (0|1) — reuse what is already on disk
+#
+# WHICH NOISE THE FLOOR MEASURES (NOISE_MODE) — this decides what the floor is
+# a valid comparison FOR, so it is not a cosmetic knob:
+#   seed   (default, legacy) reruns the arm at SEED+1..+R. --seed feeds
+#       ImageNetDataset(n, seed)'s shuffle (dataset/imagenet.py:137-140), so
+#       each replica draws a DIFFERENT set of N images and classes. The
+#       resulting sd therefore mixes latent-sampling noise with
+#       which-images-were-drawn noise, and at N=500 the latter can dominate.
+#       That is the right floor for "would this arm ranking survive a different
+#       dataset draw", which is what analyze_teacache_sweeps.py's global
+#       arm-FID spread verdict asks.
+#   latent reruns the arm at the SAME --seed with --latent-seed-offset 1..R, so
+#       every replica generates the SAME N images and classes from INDEPENDENT
+#       latents (utils.latent_seed_for_index gives disjoint seed sets, stride
+#       1e6). That is the right floor for analyze_crossover.py's [d], which
+#       asks whether arms flip ON THE SAME IMAGE — pairing is by global_idx, so
+#       the image draw is held fixed by construction and must not be
+#       re-randomized by the floor it is compared against.
+#   The two modes write to different dirs (noise_<seed> vs noise_lat<r>) but all
+#   three analyzers glob noise_*, so the script REMOVES the other mode's dirs
+#   before writing: pooling both into one sd would silently average two
+#   different noise sources.
 #
 # Per-image crossover (COVR hypothesis for the bandit decision):
 #   Global FID cannot tell "one arm is best for every image" (pick it offline,
@@ -92,6 +116,13 @@ SENTINEL_RATE="${SENTINEL_RATE:-1.0}"
 SENTINEL_HORIZON="${SENTINEL_HORIZON:-10}"
 SESSION_ID="${SESSION_ID:-}"
 
+# --- noise floor: WHICH noise the floor measures (see header) ---
+NOISE_MODE="${NOISE_MODE:-seed}"       # latent|seed
+NOISE_REPLICAS="${NOISE_REPLICAS:-2}"  # replicas per budget
+NOISE_ARM="${NOISE_ARM:-}"             # arm to replicate (default: manifest baseline)
+SKIP_ARMS="${SKIP_ARMS:-0}"            # 1 = do not rerun the 4 forced arms
+SKIP_NOISE="${SKIP_NOISE:-0}"          # 1 = do not rerun the noise replicas
+
 # --- full-compute reference + per-image PNG saving (see header note) ---
 REFERENCE="${REFERENCE:-1}"            # 1|0 — run the full-compute reference
 REFERENCE_DIR="${REFERENCE_DIR:-}"     # existing reference dir to reuse (default: OUT_DIR/reference)
@@ -123,6 +154,25 @@ then
   exit 2
 fi
 
+case "${NOISE_MODE}" in
+  latent|seed) ;;
+  *)
+    echo "NOISE_MODE must be 'latent' or 'seed' (got '${NOISE_MODE}')" >&2
+    exit 2
+    ;;
+esac
+if ! python - "$NOISE_REPLICAS" <<'PY' >/dev/null
+import sys
+assert int(sys.argv[1]) >= 0, "NOISE_REPLICAS must be >= 0"
+PY
+then
+  exit 2
+fi
+if [ "${SKIP_ARMS}" = "1" ] && [ "${SKIP_NOISE}" = "1" ]; then
+  echo "SKIP_ARMS=1 and SKIP_NOISE=1 leaves nothing to run" >&2
+  exit 2
+fi
+
 if [ "${REFERENCE}" != "0" ] && [ "${REFERENCE}" != "1" ]; then
   echo "REFERENCE must be 0 or 1 (got '${REFERENCE}')" >&2
   exit 2
@@ -139,8 +189,9 @@ if [ -z "${REFERENCE_DIR}" ]; then
   REFERENCE_DIR="${OUT_DIR}/reference"
 fi
 
-run_arm() {  # run_arm <out> <manifest> <arm> <seed> <session-id>
+run_arm() {  # run_arm <out> <manifest> <arm> <seed> <session-id> [latent-offset]
   local out="$1" manifest="$2" arm="$3" seed="$4" session_id="$5"
+  local lat_offset="${6:-0}"
   rm -rf "${out}"
   python main.py --model dit --task c2i --dataset imagenet \
       --method teacache --metrics fid is latency flops speed \
@@ -150,6 +201,7 @@ run_arm() {  # run_arm <out> <manifest> <arm> <seed> <session-id>
       --covr-sentinel-rate "${SENTINEL_RATE}" \
       --covr-sentinel-horizon "${SENTINEL_HORIZON}" \
       --seed "${seed}" --num_steps "${NUM_STEPS}" --n_prompts "${N_PROMPTS}" \
+      --latent-seed-offset "${lat_offset}" \
       --guidance_scale "${GUIDANCE}" --batch_size "${BATCH_SIZE}" \
       --img_save_limit "${IMG_SAVE_LIMIT}" \
       --output_dir "${out}"
@@ -166,17 +218,29 @@ run_reference() {  # run_reference <out>  — full compute, shared cross-budget 
 }
 
 # ---- cost / disk statement BEFORE any GPU spend ----
-python - "$BUDGETS" "$NUM_STEPS" "$N_PROMPTS" "$IMG_SAVE_LIMIT" "$REFERENCE" <<'PY'
+python - "$BUDGETS" "$NUM_STEPS" "$N_PROMPTS" "$IMG_SAVE_LIMIT" "$REFERENCE" \
+        "$NOISE_REPLICAS" "$SKIP_ARMS" "$SKIP_NOISE" "$NOISE_MODE" <<'PY'
 import sys
 budgets = [int(k) for k in sys.argv[1].split(",") if k.strip()]
 num_steps, n_prompts, img_limit = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
 reference = sys.argv[5] == "1"
-arm_runs = 6 * len(budgets)                 # 4 arms + 2 noise replicas per budget
-arm_units = sum(6 * k for k in budgets)     # each run costs K full forwards/trajectory
+replicas = int(sys.argv[6])
+skip_arms, skip_noise = sys.argv[7] == "1", sys.argv[8] == "1"
+noise_mode = sys.argv[9]
+n_arms = 0 if skip_arms else 4            # build_budget_manifest emits 4 arms
+n_noise = 0 if skip_noise else replicas
+per_budget = n_arms + n_noise
+arm_runs = per_budget * len(budgets)
+arm_units = sum(per_budget * k for k in budgets)  # each run costs K forwards/traj
 ref_units = num_steps if reference else 0
 mean_k = sum(budgets) / len(budgets)
 print("--- cost / disk budget (before any GPU spend) ---")
-print(f"  arm runs: {arm_runs} (4 arms + 2 noise per budget, K={budgets})")
+print(f"  arm runs: {arm_runs} ({n_arms} arms + {n_noise} noise[{noise_mode}] "
+      f"per budget, K={budgets})")
+if skip_arms:
+    print("    SKIP_ARMS=1 -> the 4 forced arms are REUSED from disk, not rerun")
+if skip_noise:
+    print("    SKIP_NOISE=1 -> existing noise_* dirs are REUSED, not rerun")
 print(f"  forward-units per trajectory: arms={arm_units}, reference={ref_units}"
       f"{'' if reference else ' (REFERENCE=0)'}, total={arm_units + ref_units}")
 if reference:
@@ -280,20 +344,44 @@ PY
 
   echo ""
   echo "--- [K=${K}] forcing each equal-FLOPs arm ---"
-  for arm in "${ARMS[@]}"; do
-    echo "  arm=${arm}"
-    run_arm "${BK}/equalflops/arm_${arm}" "${MANIFEST}" "${arm}" "${SEED}" \
-        "${BUDGET_SESSION}"
-  done
+  if [ "${SKIP_ARMS}" = "1" ]; then
+    echo "  SKIP_ARMS=1 -> reusing existing arm_* dirs"
+  else
+    for arm in "${ARMS[@]}"; do
+      echo "  arm=${arm}"
+      run_arm "${BK}/equalflops/arm_${arm}" "${MANIFEST}" "${arm}" "${SEED}" \
+          "${BUDGET_SESSION}" 0
+    done
+  fi
 
   echo ""
-  echo "--- [K=${K}] noise floor: arm=${BASE} at seeds +1/+2 ---"
-  for delta in 1 2; do
-    s=$(( SEED + delta ))
-    echo "  seed=${s}"
-    run_arm "${BK}/equalflops/noise_${s}" "${MANIFEST}" "${BASE}" "${s}" \
-        "covr-probe-$(date +%Y%m%d-%H%M%S)-k${K}-seed${s}"
-  done
+  NOISE_ARM_ID="${NOISE_ARM:-${BASE}}"
+  echo "--- [K=${K}] noise floor: arm=${NOISE_ARM_ID} mode=${NOISE_MODE} x${NOISE_REPLICAS} ---"
+  # One mode's replicas at a time: all three analyzers glob noise_*, so leaving
+  # the other mode's dirs behind would pool two DIFFERENT noise sources into one
+  # sd. Stale dirs of the mode not being run are removed.
+  if [ "${SKIP_NOISE}" = "1" ]; then
+    echo "  SKIP_NOISE=1 -> keeping existing noise_* dirs untouched"
+  else
+    if [ "${NOISE_MODE}" = "latent" ]; then
+      rm -rf "${BK}"/equalflops/noise_[0-9]*
+      for r in $(seq 1 "${NOISE_REPLICAS}"); do
+        echo "  latent-seed-offset=${r} (same seed=${SEED} -> same 500 images/classes)"
+        run_arm "${BK}/equalflops/noise_lat${r}" "${MANIFEST}" \
+            "${NOISE_ARM_ID}" "${SEED}" \
+            "covr-probe-$(date +%Y%m%d-%H%M%S)-k${K}-seed${SEED}-lat${r}" "${r}"
+      done
+    else
+      rm -rf "${BK}"/equalflops/noise_lat*
+      for r in $(seq 1 "${NOISE_REPLICAS}"); do
+        s=$(( SEED + r ))
+        echo "  seed=${s} (shifts the image pool as well as the latents)"
+        run_arm "${BK}/equalflops/noise_${s}" "${MANIFEST}" \
+            "${NOISE_ARM_ID}" "${s}" \
+            "covr-probe-$(date +%Y%m%d-%H%M%S)-k${K}-seed${s}" 0
+      done
+    fi
+  fi
 
   echo ""
   echo "--- [K=${K}] verdict ---"

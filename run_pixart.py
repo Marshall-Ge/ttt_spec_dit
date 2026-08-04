@@ -33,7 +33,10 @@ from config import (
     PIXART_REPO, HF_CACHE_DIR, COCO_DIR, IMAGENET_DIR, OUTPUT_DIR,
     DEFAULT_REL_L1_THRESH, DEFAULT_NUM_STEPS, load_coefficients,
 )
-from utils import CudaTimer, decode_latent, save_image, pil_to_tensor, ensure_real_299
+from utils import (
+    CudaTimer, decode_latent, save_image, pil_to_tensor, ensure_real_299,
+    latent_seed_for_index,
+)
 
 from models.pixart import PixArtTransformer2D, set_vfl_step_info
 from verification_feedback_loop.lora_adapter import (
@@ -1263,7 +1266,11 @@ def run_c2i(args) -> Dict:
             else:
                 gen_input = data[1]  # caption text
             batch_inputs.append(gen_input)
-            batch_seeds.append(100000 + idx)
+            # Same-image replicate runs need distinct latent draws per image;
+            # latent_seed_for_index keeps offset=0 bit-identical to the
+            # legacy `100000 + idx` formula.
+            batch_seeds.append(latent_seed_for_index(
+                idx, int(getattr(args, "latent_seed_offset", 0))))
 
         # Reset accelerator state
         if args.method == "teacache" and teacache_state is not None:
@@ -1427,6 +1434,7 @@ def run_c2i(args) -> Dict:
             "task": "c2i",
             "dataset": dataset_name,
             "seed": args.seed,
+            "latent_seed_offset": int(getattr(args, "latent_seed_offset", 0)),
             "method": args.method,
             "n_prompts": n,
             "batch_size": args.batch_size,
