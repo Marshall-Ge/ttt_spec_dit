@@ -1900,7 +1900,8 @@ def main() -> int:
             for line in _render_budget(row, args.floor_ratio):
                 print(line)
         _render_tail(rows, ref_fid, args,
-                     reference_missing=bool(manifest.get("reference_missing")))
+                     reference_missing=bool(manifest.get("reference_missing")),
+                     metric=metric)
         return 0
 
     ref_dir = os.path.join(probe, "reference")
@@ -1950,17 +1951,25 @@ def main() -> int:
                   budgets, payloads, ref_dir=ref_dir,
                   reference_missing=not ref_imgs)
 
-    _render_tail(rows, ref_fid, args, reference_missing=not ref_imgs)
+    _render_tail(rows, ref_fid, args, reference_missing=not ref_imgs,
+                 metric=metric)
     return 0
 
 
 def _render_tail(rows: List[Dict[str, object]],
                  ref_fid: Optional[float], args,
-                 reference_missing: bool = False) -> None:
+                 reference_missing: bool = False,
+                 metric: Optional[str] = None) -> None:
     """Everything after the per-budget blocks (binding / per-class /
     recommendation). Shared by the live path and --from-dump so both print
     byte-identical tails."""
-    # ---- cross-budget: does the harshest budget actually bind? ----
+    # Resolve metric: prefer the argument, then the first non-skipped row,
+    # then any row, so crashed early budgets don't hide what was measured.
+    if metric is None:
+        for r in rows:
+            if "metric" in r:
+                metric = str(r["metric"])
+                break
     print("")
     print("== budget binding vs the full-compute reference ==")
     if ref_fid is not None:
@@ -2012,7 +2021,6 @@ def _render_tail(rows: List[Dict[str, object]],
     print("")
     print("== RECOMMENDATION ==")
     usable = [r for r in rows if not r.get("skip") and r.get("valid")]
-    metric = rows[0]["metric"] if rows else None
     if not rows:
         print("  INSUFFICIENT EVIDENCE: no budget data.")
     elif reference_missing and not usable:
