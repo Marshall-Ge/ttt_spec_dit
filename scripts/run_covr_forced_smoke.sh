@@ -33,7 +33,7 @@ COMMON_ARGS=(
   --guidance_scale "${GUIDANCE}"
 )
 
-echo "[1/4] Probing COVR runtime version identity"
+echo "[1/5] Probing COVR runtime version identity"
 python main.py "${COMMON_ARGS[@]}" \
   --metrics latency \
   --n_prompts 1 --batch_size 1 \
@@ -53,7 +53,7 @@ PY
 )"
 echo "      version_key=${VERSION_KEY}"
 
-echo "[2/4] Building external TeaCache strategy manifest"
+echo "[2/5] Building external TeaCache strategy manifest"
 python scripts/build_budget_manifest.py \
   --output "${MANIFEST}" \
   --method teacache \
@@ -63,7 +63,7 @@ python scripts/build_budget_manifest.py \
   --baseline-arm "${STRATEGY_ID}" \
   --version-key "${VERSION_KEY}"
 
-echo "[3/4] Validating strategy ID"
+echo "[3/5] Validating strategy ID"
 python - "${MANIFEST}" "${STRATEGY_ID}" <<'PY'
 import json
 import sys
@@ -83,7 +83,7 @@ print(f"      params={selected['params']}")
 print(f"      available={', '.join(ids)}")
 PY
 
-echo "[4/4] Running forced COVR strategy"
+echo "[4/5] Running forced COVR strategy"
 python main.py "${COMMON_ARGS[@]}" \
   --metrics latency flops speed \
   --n_prompts "${N_PROMPTS}" --batch_size "${BATCH_SIZE}" \
@@ -91,12 +91,7 @@ python main.py "${COMMON_ARGS[@]}" \
   --covr-force-strategy-id "${STRATEGY_ID}" \
   --output_dir "${RUN_DIR}"
 
-echo "Done"
-echo "  manifest: ${MANIFEST}"
-echo "  strategy: ${STRATEGY_ID}"
-echo "  results:  ${RUN_DIR}/results.json"
-if [[ -e "${RUN_DIR}/covr/template_bandit_state.json" ]]; then
-  echo "WARNING: forced run created a bandit state file" >&2
-else
-  echo "  bandit state: not created (forced mode)"
-fi
+echo "[5/5] Validating forced COVR results"
+python scripts/check_covr_forced_smoke.py "${ROOT}" \
+  --manifest "${MANIFEST}" \
+  --strategy-id "${STRATEGY_ID}"
