@@ -57,6 +57,7 @@
 │   ├── covr_runtime.py        # COVR runtime 边界 (可选插件): COVRMode/COVRRuntimeConfig/
 │   │                          #   COVRRuntime facade + Forced/ExperimentalBandit backend + recorder
 │   │                          #   Phase 1 仅 DiT 非 TTT 主去噪循环; 禁用时不构造任何对象
+│   ├── covr_viability.py      # Opt-in batch=1 causal-prefix scalar recorder (JSONL)
 │   └── covr_bandit.py         # ConservativeTemplateBandit (EXPERIMENTAL, 语义冻结) + manifests
 ├── verification_feedback_loop/    # VFL 子系统 (三层架构, 详见 §12)
 │   ├── __init__.py            # 导出所有公共符号
@@ -89,6 +90,8 @@
     ├── check_covr_forced_smoke.py # 检查 forced smoke 的结果与 schema
     ├── run_covr_bandit_resume_smoke.sh # experimental bandit 首段+恢复段 smoke
     ├── check_covr_bandit_resume_smoke.py # 检查 state 连续性/resume window/schema
+    ├── run_covr_v2_viability_probe.sh # batch=1 causal-prefix OOS viability probe
+    ├── analyze_covr_v2_viability.py # machine-readable OOS headroom gate
     └── calibrate_teacache.py  # TeaCache 多项式系数标定脚本
 ```
 
@@ -374,6 +377,19 @@ python run_ttt_benchmark.py --help
 # Session 3 持续推理 (单类 N 图, γ 课表)
 python continual_inference_runner.py --help
 ```
+
+### COVR-v2 TeaCache viability probe
+
+```bash
+# 默认 128 图、batch=1、K=8、共同前缀 3；自动生成 manifest、四个 forced arms、full reference 和 OOS report
+bash scripts/run_covr_v2_viability_probe.sh
+```
+
+该 probe 只记录 TeaCache forced mask 的 shared-prefix causal scalar features，并在
+`viability_report.json` 中做 global-index parity OOS policy 选择。`recommendation=PASS`
+只表示存在值得进入确认实验的逐图 headroom；它不是 adaptive COVR 的 FID/IS 结论。
+若通过，后续仍需使用多个 latent offsets、paired FID/IS 和预先冻结的 noise-floor
+判据完成 500 图级确认；`STOP` 或 `INSUFFICIENT_DATA` 时不要扩大 GPU 实验。
 
 ## 11. TTT (Test-Time Training) 实现细节
 

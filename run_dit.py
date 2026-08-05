@@ -61,6 +61,7 @@ from accelerators.teacache import (
     teacache_init, teacache_step, teacache_reset,
     teacache_stats,
 )
+from accelerators.covr_viability import COVRViabilityRecorder
 from accelerators.speca import SpecACache, SpecAState, speca_init
 from accelerators.strategy_dispatch import apply_strategy
 from accelerators.registry import get_adapter, is_registered
@@ -651,6 +652,8 @@ class DiTGenerator:
                  ddim_steps: Optional[int] = None,
                  covr_trajectory: Optional[
                      COVRTrajectoryAssignment] = None,
+                 viability_recorder: Optional[
+                     COVRViabilityRecorder] = None,
                  ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Generate image(s).
 
@@ -708,6 +711,7 @@ class DiTGenerator:
             teacache_state=teacache_state,
             cache_dic=cache_dic, current=current,
             covr_trajectory=covr_trajectory,
+            viability_recorder=viability_recorder,
         )
         if covr_profiler is not None:
             covr_profiler.stop_gpu(denoise_token)
@@ -740,6 +744,8 @@ class DiTGenerator:
                        current: Optional[SpecAState],
                        covr_trajectory: Optional[
                            COVRTrajectoryAssignment] = None,
+                       viability_recorder: Optional[
+                           COVRViabilityRecorder] = None,
                        ) -> torch.Tensor:
         """Single denoising loop with method dispatch.
 
@@ -1050,6 +1056,14 @@ class DiTGenerator:
                         model="dit",
                     )
 
+            if (viability_recorder is not None
+                    and step_idx < viability_recorder.prefix_steps):
+                viability_recorder.record_step(
+                    step_idx=step_idx,
+                    timestep=int(timestep_value),
+                    latent_input=latent_input,
+                    noise_pred=noise_pred,
+                )
             latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
             if (sentinel_reference_latent is not None and
                     covr_sentinel_start_idx is not None and
@@ -1827,6 +1841,26 @@ def run_c2i(args) -> Dict:
     os.makedirs(gen_dir, exist_ok=True)
 
     total_images = n
+    viability_recorder = None
+    viability_output = getattr(args, "covr_viability_output", None)
+    if viability_output:
+        if covr_forced_strategy is None or covr_forced_manifest_strategy is None:
+            raise ValueError(
+                "COVR viability probe requires a forced strategy manifest")
+        viability_recorder = COVRViabilityRecorder(
+            viability_output,
+            prefix_steps=int(getattr(args, "covr_viability_prefix_steps", 3)),
+            run_identity={
+                "model": "dit",
+                "method": args.method,
+                "num_steps": int(args.num_steps),
+                "dataset_start_index": int(dataset_start_index),
+                "latent_seed_offset": int(getattr(
+                    args, "latent_seed_offset", 0)),
+                "session_id": str(getattr(args, "covr_session_id", "") or ""),
+                "manifest_hash": covr_forced_manifest_strategy.manifest_hash,
+            },
+        )
     bs = args.batch_size
     print(f"\n[4] Generating {total_images} images ({args.method}, "
           f"{n} prompts in batches of ≤{bs})...")
@@ -2027,6 +2061,17 @@ def run_c2i(args) -> Dict:
         if vfl_buf is not None:
             set_vfl_sample_id(batch_start)
 
+        if viability_recorder is not None:
+            viability_recorder.begin_trajectory(
+                global_idx=batch_absolute_indices[0],
+                latent_seed=batch_seeds[0],
+                strategy_id=covr_forced_strategy.strategy_id,
+                manifest_hash=covr_forced_manifest_strategy.manifest_hash,
+                refresh_mask=covr_forced_strategy.refresh_mask,
+                batch_size=actual_bs,
+                sample_id=str(batch_absolute_indices[0]),
+            )
+
         # Generate
         covr_feedback_sink = (
             covr_trajectory.feedback_sink
@@ -2058,7 +2103,10 @@ def run_c2i(args) -> Dict:
                 current=speca_current,
                 ddim_steps=ddim_steps,
                 covr_trajectory=covr_trajectory,
+                viability_recorder=viability_recorder,
             )
+        if viability_recorder is not None:
+            viability_recorder.end_trajectory()
 
         # Pending safety observations are converted at the batch boundary
         # (tensors are still on the accelerator); the runtime materializes
@@ -2541,6 +2589,13 @@ def run_c2i(args) -> Dict:
         print(
             f"  COVR action audits: {covr_summary['events']} batch-step contexts, "
             f"{covr_summary['samples']} sample labels")
+
+    if viability_recorder is not None:
+        viability_recorder.close()
+        print(
+            f"  COVR viability probe: {viability_recorder.record_count} "
+            f"prefix records across {viability_recorder.trajectory_count} trajectories "
+            f"-> {viability_recorder.output_path}")
 
     if covr_bandit is not None and covr_runtime is not None:
         bandit_summary = covr_agg["covr_template_bandit"]

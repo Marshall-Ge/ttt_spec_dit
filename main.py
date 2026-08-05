@@ -172,6 +172,10 @@ Examples:
     parser.add_argument("--covr-force-strategy-id", type=str, default=None,
                         help="Evaluate one manifest strategy without bandit state; "
                              "replaces --covr-force-template-id")
+    parser.add_argument("--covr-viability-output", type=str, default=None,
+                        help="Opt-in per-image causal TeaCache viability JSONL")
+    parser.add_argument("--covr-viability-prefix-steps", type=int, default=3,
+                        help="Shared forced-mask prefix recorded by viability probe")
     parser.add_argument("--covr-bandit-state", type=str, default=None,
                         help="Explicit COVR template-bandit state to resume/save")
     parser.add_argument("--covr-bandit-epsilon", type=float, default=0.1,
@@ -495,6 +499,30 @@ def validate_args(args):
     if args.covr_max_events is not None and args.covr_max_events <= 0:
         print("[ERROR] --covr-max-events must be positive.")
         return False
+
+    if args.covr_viability_output is not None:
+        force_id = (args.covr_force_strategy_id
+                    or args.covr_force_template_id)
+        manifest = args.covr_strategy_manifest or args.covr_template_manifest
+        errors = []
+        if (args.model, args.task, args.dataset) != ("dit", "c2i", "imagenet"):
+            errors.append("viability probe requires DiT c2i ImageNet")
+        if args.method != "teacache":
+            errors.append("viability probe requires --method teacache")
+        if args.ttt:
+            errors.append("viability probe cannot be combined with --ttt")
+        if args.batch_size != 1:
+            errors.append("viability probe requires --batch_size 1")
+        if not manifest or not force_id:
+            errors.append("viability probe requires a forced strategy manifest and ID")
+        if args.covr_strategy_bandit or args.covr_template_bandit:
+            errors.append("viability probe cannot use the adaptive bandit")
+        if args.covr_viability_prefix_steps <= 0:
+            errors.append("viability prefix steps must be positive")
+        if errors:
+            for error in errors:
+                print(f"[ERROR] {error}.")
+            return False
 
     # Metrics: warn about unknown, but don't remove yet (pipelines filter)
     unknown = set(args.metrics) - ALL_METRICS
