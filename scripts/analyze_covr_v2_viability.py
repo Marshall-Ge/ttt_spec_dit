@@ -1042,7 +1042,7 @@ def main() -> int:
     except (OSError, ValueError, KeyError) as exc:
         print(f"VIABILITY ERROR: {exc}")
         return 2
-    print(json.dumps(report, indent=2, sort_keys=True))
+    print(json.dumps(report, indent=2, sort_keys=True, cls=_NumpyEncoder))
     return 0 if report.get("recommendation") == "PASS" else 1
 
 
