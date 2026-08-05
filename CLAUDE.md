@@ -87,6 +87,8 @@
     ├── run_full_smoke.sh      # 完整冒烟测试
     ├── run_covr_forced_smoke.sh # 一键生成 manifest 并执行 forced COVR smoke
     ├── check_covr_forced_smoke.py # 检查 forced smoke 的结果与 schema
+    ├── run_covr_bandit_resume_smoke.sh # experimental bandit 首段+恢复段 smoke
+    ├── check_covr_bandit_resume_smoke.py # 检查 state 连续性/resume window/schema
     └── calibrate_teacache.py  # TeaCache 多项式系数标定脚本
 ```
 
@@ -341,6 +343,9 @@ bash scripts/run_covr_forced_smoke.sh uniform
 
 # 检查已完成的 forced COVR smoke（不重新跑 GPU）
 python scripts/check_covr_forced_smoke.py /tmp/covr_forced_smoke
+
+# experimental bandit 持久化/恢复 smoke（默认 2+2 张；不评估自适应有效性）
+bash scripts/run_covr_bandit_resume_smoke.sh
 
 # 全 20 组合 benchmark
 N_PROMPTS=50 bash scripts/run.sh
