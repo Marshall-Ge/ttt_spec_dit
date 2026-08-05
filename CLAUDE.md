@@ -386,7 +386,8 @@ bash scripts/run_covr_v2_viability_probe.sh
 ```
 
 该 probe 只记录 TeaCache forced mask 的 shared-prefix causal scalar features，并在
-`viability_report.json` 中做 global-index parity OOS policy 选择。`recommendation=PASS`
+`viability_report.json` 中做 global-index parity OOS policy 选择；默认使用 JPEG 保存
+probe/reference 图像以降低磁盘占用。`recommendation=PASS`
 只表示存在值得进入确认实验的逐图 headroom；它不是 adaptive COVR 的 FID/IS 结论。
 若通过，后续仍需使用多个 latent offsets、paired FID/IS 和预先冻结的 noise-floor
 判据完成 500 图级确认；`STOP` 或 `INSUFFICIENT_DATA` 时不要扩大 GPU 实验。

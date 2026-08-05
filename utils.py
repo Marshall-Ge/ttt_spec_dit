@@ -116,7 +116,7 @@ def pil_to_tensor(pil_image: Image.Image) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 def save_image(tensor: torch.Tensor, path: str):
-    """Save [3,H,W] or [B,3,H,W] float [0,1] tensor as PNG. Batched → saves first image."""
+    """Save a [3,H,W] or [B,3,H,W] float [0,1] tensor by path extension."""
     if tensor.dim() == 4:
         tensor = tensor[0]
     arr = (tensor.cpu().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)

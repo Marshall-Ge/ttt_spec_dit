@@ -176,6 +176,9 @@ Examples:
                         help="Opt-in per-image causal TeaCache viability JSONL")
     parser.add_argument("--covr-viability-prefix-steps", type=int, default=3,
                         help="Shared forced-mask prefix recorded by viability probe")
+    parser.add_argument("--covr-viability-image-format", type=str,
+                        choices=["png", "jpeg"], default=None,
+                        help="Image format for probe artifacts (default: png)")
     parser.add_argument("--covr-bandit-state", type=str, default=None,
                         help="Explicit COVR template-bandit state to resume/save")
     parser.add_argument("--covr-bandit-epsilon", type=float, default=0.1,

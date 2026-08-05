@@ -2281,7 +2281,11 @@ def run_c2i(args) -> Dict:
             if global_idx - generation_start_index < img_limit:
                 # Extract class name from dataset prompt
                 cls_name = ds[idx][1].replace("a photo of a ", "").replace(" ", "_")
-                out_path = os.path.join(gen_dir, f"{global_idx:06d}_{cls_name}.png")
+                image_format = getattr(
+                    args, "covr_viability_image_format", None)
+                extension = ".jpg" if image_format == "jpeg" else ".png"
+                out_path = os.path.join(
+                    gen_dir, f"{global_idx:06d}_{cls_name}{extension}")
                 save_image(img[b:b+1], out_path)
             # Feed to FID/IS directly (resize from memory, no extra disk round-trip)
             if need_fid_is:

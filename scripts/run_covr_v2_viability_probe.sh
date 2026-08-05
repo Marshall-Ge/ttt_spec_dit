@@ -31,6 +31,7 @@ COMMON_ARGS=(
   --guidance_scale "${GUIDANCE}"
   --batch_size 1
   --img_save_limit "${IMG_SAVE_LIMIT}"
+  --covr-viability-image-format jpeg
 )
 
 if [[ ! -f "${MANIFEST}" ]]; then

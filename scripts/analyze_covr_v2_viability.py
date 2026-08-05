@@ -40,7 +40,10 @@ def _read_jsonl(path: str) -> List[Mapping[str, object]]:
 
 def _image_map(directory: str) -> Dict[int, str]:
     result: Dict[int, str] = {}
-    for path in sorted(glob.glob(os.path.join(directory, "*.png"))):
+    paths = []
+    for pattern in ("*.png", "*.jpg", "*.jpeg"):
+        paths.extend(glob.glob(os.path.join(directory, pattern)))
+    for path in sorted(paths):
         match = _INDEX_RE.match(os.path.basename(path))
         if match is None:
             continue
