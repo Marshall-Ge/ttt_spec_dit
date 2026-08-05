@@ -569,6 +569,7 @@ class COVRRuntime:
 
     def aggregate(self, *, wall_times: Optional[Sequence[float]] = None,
                   forced_template: Optional[Any] = None,
+                  forced_strategy: Optional[AccelerationStrategy] = None,
                   forced_manifest: Optional[Any] = None,
                   speca_probe_full_blocks: Optional[int] = None,
                   state_path: Optional[str] = None,
@@ -623,6 +624,17 @@ class COVRRuntime:
                 "refresh_count": forced_template.refresh_count,
                 "modeled_full_block_equivalents": (
                     forced_template.modeled_full_block_equivalents),
+                "probe_full_blocks": int(speca_probe_full_blocks or 0),
+            }
+        elif forced_strategy is not None:
+            payload["covr_forced_template"] = {
+                "template_id": forced_strategy.strategy_id,
+                "manifest_hash": (
+                    forced_manifest.manifest_hash
+                    if forced_manifest is not None else ""),
+                "refresh_count": forced_strategy.refresh_count,
+                "modeled_full_block_equivalents": (
+                    forced_strategy.modeled_flops),
                 "probe_full_blocks": int(speca_probe_full_blocks or 0),
             }
         # Sentinel reward telemetry (bandit and forced modes).

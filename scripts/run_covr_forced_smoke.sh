@@ -87,6 +87,7 @@ echo "[4/5] Running forced COVR strategy"
 python main.py "${COMMON_ARGS[@]}" \
   --metrics latency flops speed \
   --n_prompts "${N_PROMPTS}" --batch_size "${BATCH_SIZE}" \
+  --covr-profile-stages \
   --covr-strategy-manifest "${MANIFEST}" \
   --covr-force-strategy-id "${STRATEGY_ID}" \
   --output_dir "${RUN_DIR}"

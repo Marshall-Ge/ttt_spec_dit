@@ -2512,7 +2512,11 @@ def run_c2i(args) -> Dict:
     if covr_runtime is not None:
         covr_agg = covr_runtime.aggregate(
             forced_template=covr_forced_template,
-            forced_manifest=covr_forced_manifest,
+            forced_strategy=covr_forced_strategy,
+            forced_manifest=(
+                covr_forced_manifest
+                if covr_forced_manifest is not None
+                else covr_forced_manifest_strategy),
             speca_probe_full_blocks=speca_totals["probe_full_blocks"],
             state_path=covr_bandit_state_path,
             dataset_start_index=dataset_start_index,
@@ -2554,7 +2558,10 @@ def run_c2i(args) -> Dict:
         covr_config.update(covr_runtime.config_payload(
             covr_forced_template_id=(
                 covr_forced_template.template_id
-                if covr_forced_template is not None else None),
+                if covr_forced_template is not None
+                else (
+                    covr_forced_strategy.strategy_id
+                    if covr_forced_strategy is not None else None)),
             covr_session_id=covr_session_id,
             covr_version_key=(
                 covr_version.key if covr_version is not None else None),

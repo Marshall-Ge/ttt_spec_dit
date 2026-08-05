@@ -257,6 +257,31 @@ def test_runtime_config_distinguishes_modes(tmp_path, overrides, expected):
     assert config.mode is expected
 
 
+def test_runtime_aggregate_serializes_generic_forced_strategy(tmp_path):
+    manifest_path = tmp_path / "manifest.json"
+    manifest = _strategy_manifest(manifest_path, version_key="runtime-version")
+    config = build_covr_runtime_config(
+        _runtime_args(
+            covr_force_strategy_id="uniform",
+            covr_strategy_manifest=str(manifest_path),
+        ),
+        str(tmp_path),
+    )
+    assert config is not None
+    runtime = COVRRuntime.create(config)
+
+    payload = runtime.aggregate(
+        forced_strategy=manifest.strategies[0],
+        forced_manifest=manifest,
+    )
+
+    forced = payload["covr_forced_template"]
+    assert forced["template_id"] == "uniform"
+    assert forced["refresh_count"] == 2
+    assert forced["modeled_full_block_equivalents"] == 2.0
+    assert forced["manifest_hash"] == manifest.manifest_hash
+
+
 def test_strategy_manifest_version_key_is_checked_for_forced_and_bandit(tmp_path):
     path = tmp_path / "manifest.json"
     _strategy_manifest(path, version_key="manifest-version")
