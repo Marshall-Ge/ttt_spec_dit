@@ -24,12 +24,13 @@ The gating recommendation is PASS / STOP / INSUFFICIENT_DATA. Exit codes:
 from __future__ import annotations
 
 import argparse
+import functools
 import glob
 import json
 import math
 import os
 import re
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image
@@ -81,6 +82,33 @@ def _mse(path: str, reference: str) -> float:
         raise ValueError(
             f"image shape mismatch: {path}={image.shape}, reference={target.shape}")
     return float(np.mean((image - target) ** 2))
+
+
+_LPIPS_MODEL = None
+
+
+def _get_lpips() -> object:
+    global _LPIPS_MODEL
+    if _LPIPS_MODEL is None:
+        try:
+            import lpips  # type: ignore[import-untyped]
+        except ImportError:
+            raise RuntimeError(
+                "LPIPS outcome requires 'lpips' package.  Install with: "
+                "pip install lpips")
+        _LPIPS_MODEL = lpips.LPIPS(net="alex", verbose=False)
+    return _LPIPS_MODEL
+
+
+def _lpips(path: str, reference: str, lpips_model: object) -> float:
+    import torch
+    image = (np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 127.5) - 1.0
+    target = (np.asarray(Image.open(reference).convert("RGB"), dtype=np.float32) / 127.5) - 1.0
+    t_img = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0)
+    t_ref = torch.from_numpy(target).permute(2, 0, 1).unsqueeze(0)
+    with torch.no_grad():
+        result = float(lpips_model(t_img, t_ref).item())
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -695,6 +723,8 @@ def analyze(
     min_policy_gain: float = 1e-7,
     permutations: int = 200,
     seed: int = 0,
+    outcome: str = "mse",
+    lpips_gpu: bool = False,
 ) -> Dict[str, object]:
     # ---- Load arms ----
     arms: Dict[str, Dict[int, Tuple[Dict[str, float], Mapping[str, object]]]] = {}
@@ -734,8 +764,23 @@ def analyze(
     missing = [i for i in indices_list if i not in reference_images]
     if missing:
         raise ValueError(f"reference is missing {len(missing)} global indices")
+
+    # ---- Per-image loss metric ----
+    _loss_fn: Callable[[str, str], float]
+    _outcome_label: str
+    if outcome == "lpips":
+        import torch
+        _lpips_model = _get_lpips()
+        if lpips_gpu and torch.cuda.is_available():
+            _lpips_model = _lpips_model.cuda()
+        _loss_fn = functools.partial(_lpips, lpips_model=_lpips_model)
+        _outcome_label = "lpips_to_full_reference"
+    else:
+        _loss_fn = _mse
+        _outcome_label = "pixel_mse_to_full_reference"
+
     losses = np.asarray([
-        [_mse(image_maps[name][i], reference_images[i]) for name in names]
+        [_loss_fn(image_maps[name][i], reference_images[i]) for name in names]
         for i in indices_list
     ], dtype=np.float64)
     if not np.isfinite(losses).all():
@@ -956,7 +1001,7 @@ def analyze(
         "capturability": None,
         "permutation_p_value": None,
         "permutations": 0,
-        "outcome": "pixel_mse_to_full_reference",
+        "outcome": _outcome_label,
         "recommendation": recommendation,
         "reason": reason,
         # --- v2 extensions ---
@@ -1022,6 +1067,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--min-policy-gain", type=float, default=1e-7)
     parser.add_argument("--permutations", type=int, default=200)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--outcome", choices=["mse", "lpips"], default="mse",
+                        help="Per-image loss metric (default: mse)")
+    parser.add_argument("--lpips-gpu", action="store_true", default=False,
+                        help="Use GPU for LPIPS computation")
     return parser.parse_args()
 
 
