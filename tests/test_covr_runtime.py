@@ -168,6 +168,12 @@ def test_profile_stage_accumulation_accepts_plain_dicts():
     assert counts == {"image_save_metrics": 2}
 
 
+def test_runner_binds_manifest_loader_for_forced_dispatch():
+    import run_dit
+
+    assert callable(run_dit.load_strategy_manifest)
+
+
 def test_observe_runtime_uses_single_trajectory_context(tmp_path):
     config = build_covr_runtime_config(
         _runtime_args(method="baseline", covr_profile_stages=True),

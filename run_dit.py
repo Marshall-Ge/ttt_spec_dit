@@ -78,6 +78,7 @@ from accelerators.covr_runtime import (
     COVRRuntime,
     COVRTrajectoryAssignment,
     build_covr_runtime_config,
+    load_strategy_manifest,
 )
 from models.ttt_plugin import (
     SessionAdaLNModulator, ttt_state_init, ttt_reset_for_image,
