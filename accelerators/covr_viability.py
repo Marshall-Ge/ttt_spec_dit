@@ -18,6 +18,7 @@ import torch
 
 
 SCHEMA_VERSION = 1
+BOUNDARY_SCHEMA_VERSION = 2  # rows that carry an optional "boundary" key
 
 
 def _mask_hash(refresh_mask: Sequence[bool]) -> str:
@@ -156,6 +157,7 @@ class COVRViabilityRecorder:
         timestep: int,
         latent_input: torch.Tensor,
         noise_pred: torch.Tensor,
+        boundary: Optional[Dict[str, Any]] = None,
     ) -> None:
         if self._active is None:
             raise RuntimeError("begin_trajectory must precede record_step")
@@ -169,8 +171,9 @@ class COVRViabilityRecorder:
         features = extract_prefix_features(
             latent_input, noise_pred, self._active["batch_size"]
         )
-        record = {
-            "schema_version": SCHEMA_VERSION,
+        row_schema = SCHEMA_VERSION
+        record: Dict[str, Any] = {
+            "schema_version": row_schema,
             "feature_source": "causal_prefix",
             **self.run_identity,
             **self._active,
@@ -178,6 +181,22 @@ class COVRViabilityRecorder:
             "timestep": int(timestep),
             "features": features,
         }
+        if boundary is not None:
+            # Validate boundary scalars before writing.
+            if not isinstance(boundary, dict):
+                raise ValueError("boundary must be a plain dict of scalars")
+            for key, value in boundary.items():
+                if not isinstance(key, str):
+                    raise ValueError(f"boundary key {key!r} is not a string")
+                if not isinstance(value, (int, float)):
+                    raise ValueError(f"boundary value {key}={value!r} is not a scalar")
+                if isinstance(value, float) and not math.isfinite(value):
+                    # NaN is tolerated (step 0 missing predecessor), but
+                    # inf is illegal.
+                    if math.isinf(value):
+                        raise ValueError(f"boundary value {key} is infinite")
+            record["boundary"] = dict(boundary)
+            record["schema_version"] = BOUNDARY_SCHEMA_VERSION
         self._file.write(json.dumps(record, sort_keys=True) + "\n")
         self._file.flush()
         self.record_count += 1
@@ -212,5 +231,6 @@ class COVRViabilityRecorder:
 __all__ = [
     "COVRViabilityRecorder",
     "SCHEMA_VERSION",
+    "BOUNDARY_SCHEMA_VERSION",
     "extract_prefix_features",
 ]

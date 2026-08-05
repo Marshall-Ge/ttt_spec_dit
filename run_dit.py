@@ -58,8 +58,8 @@ from verification_feedback_loop.lora_adapter import (
     _swap_lora_weights, _load_state_into_wrappers,
 )
 from accelerators.teacache import (
-    teacache_init, teacache_step, teacache_reset,
-    teacache_stats,
+    teacache_boundary_snapshot, teacache_init, teacache_step,
+    teacache_reset, teacache_stats,
 )
 from accelerators.covr_viability import COVRViabilityRecorder
 from accelerators.speca import SpecACache, SpecAState, speca_init
@@ -1058,11 +1058,15 @@ class DiTGenerator:
 
             if (viability_recorder is not None
                     and step_idx < viability_recorder.prefix_steps):
+                boundary = None
+                if teacache_state is not None:
+                    boundary = teacache_boundary_snapshot(teacache_state)
                 viability_recorder.record_step(
                     step_idx=step_idx,
                     timestep=int(timestep_value),
                     latent_input=latent_input,
                     noise_pred=noise_pred,
+                    boundary=boundary,
                 )
             latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
             if (sentinel_reference_latent is not None and
@@ -1843,23 +1847,29 @@ def run_c2i(args) -> Dict:
     total_images = n
     viability_recorder = None
     viability_output = getattr(args, "covr_viability_output", None)
+    _use_boundary_telemetry = bool(getattr(
+        args, "covr_viability_boundary_telemetry", False))
     if viability_output:
         if covr_forced_strategy is None or covr_forced_manifest_strategy is None:
             raise ValueError(
                 "COVR viability probe requires a forced strategy manifest")
+        run_identity = {
+            "model": "dit",
+            "method": args.method,
+            "num_steps": int(args.num_steps),
+            "dataset_start_index": int(dataset_start_index),
+            "latent_seed_offset": int(getattr(
+                args, "latent_seed_offset", 0)),
+            "session_id": str(getattr(args, "covr_session_id", "") or ""),
+            "manifest_hash": covr_forced_manifest_strategy.manifest_hash,
+            "boundary_telemetry": bool(_use_boundary_telemetry),
+            "image_format": str(getattr(
+                args, "covr_viability_image_format", None) or "png"),
+        }
         viability_recorder = COVRViabilityRecorder(
             viability_output,
-            prefix_steps=int(getattr(args, "covr_viability_prefix_steps", 3)),
-            run_identity={
-                "model": "dit",
-                "method": args.method,
-                "num_steps": int(args.num_steps),
-                "dataset_start_index": int(dataset_start_index),
-                "latent_seed_offset": int(getattr(
-                    args, "latent_seed_offset", 0)),
-                "session_id": str(getattr(args, "covr_session_id", "") or ""),
-                "manifest_hash": covr_forced_manifest_strategy.manifest_hash,
-            },
+            prefix_steps=prefix_steps,
+            run_identity=run_identity,
         )
     bs = args.batch_size
     print(f"\n[4] Generating {total_images} images ({args.method}, "
@@ -1992,6 +2002,8 @@ def run_c2i(args) -> Dict:
                     "num_steps": args.num_steps,
                     "coefficients": _load_dit_coefficients(args.coef_path)
                     if args.coef_path else _load_dit_coefficients(),
+                    **({"probe_prefix_steps": prefix_steps}
+                       if _use_boundary_telemetry else {}),
                 },
             )
             # Unpack whatever the selected adapter produced; untouched state
@@ -2023,6 +2035,8 @@ def run_c2i(args) -> Dict:
                     "num_steps": args.num_steps,
                     "coefficients": _load_dit_coefficients(args.coef_path)
                     if args.coef_path else _load_dit_coefficients(),
+                    **({"probe_prefix_steps": prefix_steps}
+                       if _use_boundary_telemetry else {}),
                 },
             )
             # Unpack whatever the selected adapter produced; untouched state

@@ -17,9 +17,21 @@ State dict keys (created by ``teacache_init``):
   - cnt, accumulated, previous_modulated_input, previous_residual
   - decisions, accum_history, raw_diff_history, rescaled_diff_history
   - num_steps, rel_l1_thresh, coefficients, rescale_func, refresh_mask
+  - boundary_probe (dict, optional) — opt-in telemetry for COVR-v2 viability
+
+Boundary probe lifecycle (opt-in, decision-neutral):
+  - ``teacache_init(probe_prefix_steps=N)`` → ``state["boundary_probe"]`` dict
+  - ``teacache_decide`` writes per-step causal scalars (modulation distances,
+    shadow accumulator, cached residual norms) into the probe without changing
+    decisions or the real accumulator.
+  - ``teacache_reset`` clears the per-trajectory probe rows but keeps config.
+  - ``teacache_boundary_snapshot(state)`` → last probe row dict or None.
+  - When ``probe_prefix_steps`` is None (default), no probe key is created
+    and no telemetry is computed — the hot path is unchanged.
 """
 
 import json
+import math
 import os
 from typing import Dict, List, Optional, Tuple
 
@@ -87,6 +99,7 @@ def teacache_init(
     rel_l1_thresh: float = 0.25,
     coefficients: Optional[List[float]] = None,
     refresh_mask: Optional[Tuple[bool, ...]] = None,
+    probe_prefix_steps: Optional[int] = None,
 ) -> Dict:
     """Allocate TeaCache state dict.
 
@@ -108,6 +121,13 @@ def teacache_init(
         Must have length ``num_steps``, contain only booleans, and refresh
         the first step (no residual is cached yet at step 0). ``None`` (the
         default) keeps the original dynamic-threshold behaviour.
+    probe_prefix_steps : int, optional
+        Opt-in boundary telemetry for COVR-v2 viability. When not None,
+        creates ``state["boundary_probe"]`` and records causal scalars
+        (modulation distances, shadow accumulator, cached residual norms)
+        on the first ``probe_prefix_steps`` forced-schedule steps. Does not
+        alter decisions, the real accumulator, or any history list. Default
+        ``None`` keeps the hot path byte-identical to the no-probe path.
 
     Returns
     -------
@@ -128,7 +148,7 @@ def teacache_init(
         if not validated_mask[0]:
             raise ValueError("refresh_mask must refresh the first step")
 
-    return {
+    state = {
         # ---- config (immutable per generation) ----
         "num_steps": num_steps,
         "rel_l1_thresh": rel_l1_thresh,
@@ -148,6 +168,19 @@ def teacache_init(
         "raw_diff_history": [],
         "rescaled_diff_history": [],
     }
+
+    if probe_prefix_steps is not None:
+        if probe_prefix_steps <= 0:
+            raise ValueError("probe_prefix_steps must be positive")
+        if validated_mask is None:
+            raise ValueError("boundary probe requires a forced refresh_mask")
+        state["boundary_probe"] = {
+            "rows": [],
+            "shadow_accum": 0.0,
+            "prefix_steps": int(probe_prefix_steps),
+        }
+
+    return state
 
 
 def teacache_decide(state: Dict, modulated_input: torch.Tensor,
@@ -194,6 +227,81 @@ def teacache_decide(state: Dict, modulated_input: torch.Tensor,
         state["decisions"].append("calc" if should_calc else "skip")
         state["previous_modulated_input"] = modulated_input.detach()
         state["last_raw_diff"] = 0.0
+
+        # ---- Boundary telemetry (opt-in, decision-neutral) ----
+        # Runs only when the COVR-v2 viability probe is active.  Records
+        # causal scalars that the static dynamic-threshold path would have
+        # computed at this point — modulation distances, shadow accumulator,
+        # and cached-residual norms.  Never mutates state["accumulated"],
+        # decision lists, or the forced return value.
+        probe = state.get("boundary_probe")
+        if probe is not None and cnt < probe["prefix_steps"]:
+            row = {"cnt": int(cnt),
+                   "timestep_bucket": int(timestep_bucket),
+                   "step_frac": float(cnt / max(num_steps - 1, 1))}
+            if cnt == 0:
+                # No predecessor — all diff/residual fields are missing.
+                row["raw_diff"] = float("nan")
+                row["rescaled"] = float("nan")
+                row["shadow_accum_before"] = 0.0
+                row["shadow_accum_after"] = 0.0
+                row["dynamic_would_calc"] = True  # cnt==0 always calc in dynamic
+                row["prev_mod_l1"] = float("nan")
+                row["prev_mod_l2"] = float("nan")
+                row["prev_residual_l1"] = float("nan")
+                row["prev_residual_l2"] = float("nan")
+                row["residual_modulated_ratio"] = float("nan")
+            else:
+                prev = state["previous_modulated_input"]
+                if prev is not None and modulated_input is not None:
+                    raw_diff = float(
+                        ((modulated_input - prev).abs().mean()
+                         / prev.abs().mean().clamp_min(1e-8))
+                        .detach().float().cpu().item())
+                    if not math.isfinite(raw_diff):
+                        raw_diff = float("nan")
+                else:
+                    raw_diff = float("nan")
+                rescaled = (
+                    max(0.0, float(state["rescale_func"](raw_diff)))
+                    if math.isfinite(raw_diff) else float("nan"))
+                shadow_before = probe["shadow_accum"]
+                shadow_after = shadow_before + rescaled if math.isfinite(rescaled) else shadow_before
+                dynamic_would_calc = (
+                    True if cnt == num_steps - 1
+                    else (shadow_after >= state["rel_l1_thresh"]))
+                if dynamic_would_calc:
+                    shadow_after = 0.0
+
+                row["raw_diff"] = raw_diff
+                row["rescaled"] = rescaled
+                row["shadow_accum_before"] = shadow_before
+                row["shadow_accum_after"] = shadow_after
+                row["dynamic_would_calc"] = dynamic_would_calc
+                # previous_modulated_input statistics
+                row["prev_mod_l1"] = float(
+                    prev.detach().float().abs().mean().cpu().item())
+                row["prev_mod_l2"] = float(
+                    prev.detach().float().square().mean().sqrt().cpu().item())
+                # previous_residual (cached at end of step cnt-1's calc)
+                res = state.get("previous_residual")
+                if res is not None:
+                    res_f = res.detach().float()
+                    row["prev_residual_l1"] = float(res_f.abs().mean().cpu().item())
+                    row["prev_residual_l2"] = float(
+                        res_f.square().mean().sqrt().cpu().item())
+                    row["residual_modulated_ratio"] = (
+                        row["prev_residual_l1"] / row["prev_mod_l1"]
+                        if row["prev_mod_l1"] > 1e-12 else float("nan"))
+                else:
+                    row["prev_residual_l1"] = float("nan")
+                    row["prev_residual_l2"] = float("nan")
+                    row["residual_modulated_ratio"] = float("nan")
+
+                probe["shadow_accum"] = shadow_after
+
+            probe["rows"].append(row)
+
         return should_calc, 0.0
 
     # Rescale: always use offline poly4 (RLS-based online rescale was removed —
@@ -264,6 +372,24 @@ def teacache_reset(state: Dict) -> None:
     state["accum_history"] = []
     state["raw_diff_history"] = []
     state["rescaled_diff_history"] = []
+    probe = state.get("boundary_probe")
+    if probe is not None:
+        probe["rows"] = []
+        probe["shadow_accum"] = 0.0
+
+
+def teacache_boundary_snapshot(state: Dict) -> Optional[Dict]:
+    """Return the last probe row dict, or None if the probe is absent.
+
+    The caller (``run_dit.py`` viability hook) reads this immediately after
+    the transformer forward but before ``scheduler.step``, so the row was
+    populated by the ``teacache_decide`` call at the top of the block stack.
+    All scalars are host-native floats; no tensors remain.
+    """
+    probe = state.get("boundary_probe")
+    if probe is None or not probe["rows"]:
+        return None
+    return probe["rows"][-1]
 
 
 # ===========================================================================
