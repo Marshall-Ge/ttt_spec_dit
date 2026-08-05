@@ -156,6 +156,18 @@ def test_explicit_bandit_state_path_is_the_resume_source(tmp_path):
     assert config.resume_state_path == state_path
 
 
+def test_profile_stage_accumulation_accepts_plain_dicts():
+    from run_dit import _record_profile_stage
+
+    totals = {}
+    counts = {}
+    _record_profile_stage(totals, counts, "image_save_metrics", 0.25)
+    _record_profile_stage(totals, counts, "image_save_metrics", 0.75)
+
+    assert totals == {"image_save_metrics": 1.0}
+    assert counts == {"image_save_metrics": 2}
+
+
 def test_observe_runtime_uses_single_trajectory_context(tmp_path):
     config = build_covr_runtime_config(
         _runtime_args(method="baseline", covr_profile_stages=True),

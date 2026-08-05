@@ -1240,6 +1240,14 @@ class DiTGenerator:
 # TTT plugin setup helper
 # ===========================================================================
 
+def _record_profile_stage(
+        totals: Dict[str, float], counts: Dict[str, int],
+        stage: str, elapsed_s: float) -> None:
+    """Accumulate a profiler stage in either dict or defaultdict mappings."""
+    totals[stage] = totals.get(stage, 0.0) + float(elapsed_s)
+    counts[stage] = counts.get(stage, 0) + 1
+
+
 def _setup_ttt(generator: "DiTGenerator", args):
     """Create TTT plugin and state for the full c2i pipeline."""
     transformer = generator.transformer
@@ -2322,9 +2330,12 @@ def run_c2i(args) -> Dict:
                     "covr_sentinel_start_idx": covr_sentinel_start_idx,
                 } if covr_assignment is not None else {}),
             })
-        profile_stage_totals["image_save_metrics"] += (
-            time.perf_counter() - postprocess_start)
-        profile_stage_counts["image_save_metrics"] += 1
+        _record_profile_stage(
+            profile_stage_totals,
+            profile_stage_counts,
+            "image_save_metrics",
+            time.perf_counter() - postprocess_start,
+        )
 
         # Phase 2: 推理循环内不再调用任何训练方法。后台线程独立轮询
         # buffer, 在数据足够时自行触发训练。这里只做 event / anchor
