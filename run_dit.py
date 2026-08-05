@@ -1849,6 +1849,7 @@ def run_c2i(args) -> Dict:
     viability_output = getattr(args, "covr_viability_output", None)
     _use_boundary_telemetry = bool(getattr(
         args, "covr_viability_boundary_telemetry", False))
+    prefix_steps = int(getattr(args, "covr_viability_prefix_steps", 3))
     if viability_output:
         if covr_forced_strategy is None or covr_forced_manifest_strategy is None:
             raise ValueError(
