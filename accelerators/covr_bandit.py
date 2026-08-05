@@ -1,5 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Equal-FLOPs trajectory template selection for SpecA."""
+"""Equal-FLOPs trajectory template selection for SpecA.
+
+EXPERIMENTAL: ``ConservativeTemplateBandit`` (and the strategy-bandit
+variant built on ``StrategyManifest``) is an adaptive policy backend used
+only through the optional COVR runtime boundary. Its selection/prior/state
+semantics are frozen for the runtime extraction; algorithmic changes are
+out of scope for the runtime plugin and must be validated separately.
+"""
 
 from __future__ import annotations
 

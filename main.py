@@ -2,6 +2,10 @@
 import argparse
 import sys
 
+from accelerators.covr_runtime import (
+    covr_requested,
+    validate_covr_capabilities,
+)
 from config import *
 
 # ---------------------------------------------------------------------------
@@ -148,18 +152,26 @@ Examples:
     parser.add_argument("--covr-base-model-version", type=str, default=None,
                         help="Base model version recorded in COVR event metadata")
     parser.add_argument("--covr-template-bandit", action="store_true", default=False,
-                        help="Select one equal-FLOPs refresh template per SpecA trajectory")
+                        help="Select one equal-FLOPs refresh template per SpecA "
+                             "trajectory (deprecated alias of "
+                             "--covr-strategy-bandit)")
     parser.add_argument("--covr-template-manifest", type=str, default=None,
                         help="Equal-FLOPs COVR template manifest")
     parser.add_argument("--covr-force-template-id", type=str, default=None,
-                        help="Evaluate one manifest template without bandit state")
+                        help="Evaluate one manifest template without bandit state "
+                             "(deprecated alias of --covr-force-strategy-id)")
     # Method-agnostic COVR strategy-bandit (replaces template-bandit for non-SpecA)
     parser.add_argument("--covr-strategy-manifest", type=str, default=None,
-                        help="Method-agnostic strategy manifest (works with any accelerator)")
+                        help="Method-agnostic strategy manifest (works with any "
+                             "accelerator); replaces --covr-template-manifest")
     parser.add_argument("--covr-strategy-bandit", action="store_true", default=False,
-                        help="Select one strategy per trajectory (method-agnostic)")
+                        help="Select one strategy per trajectory (method-agnostic). "
+                             "EXPERIMENTAL: adaptive backend of the COVR runtime "
+                             "boundary — semantics are frozen; changes must be "
+                             "validated separately.")
     parser.add_argument("--covr-force-strategy-id", type=str, default=None,
-                        help="Evaluate one manifest strategy without bandit state")
+                        help="Evaluate one manifest strategy without bandit state; "
+                             "replaces --covr-force-template-id")
     parser.add_argument("--covr-bandit-state", type=str, default=None,
                         help="Explicit COVR template-bandit state to resume/save")
     parser.add_argument("--covr-bandit-epsilon", type=float, default=0.1,
@@ -327,6 +339,13 @@ def validate_args(args):
     if suffix_blocks > 0 and args.compute_controller == "none":
         print("[ERROR] suffix recompute requires --compute-controller probe_correct.")
         return False
+
+    if covr_requested(args):
+        try:
+            validate_covr_capabilities(args)
+        except ValueError as exc:
+            print(f"[ERROR] {exc}.")
+            return False
 
     if args.covr_shadow:
         if args.model != "dit" or args.method != "speca":

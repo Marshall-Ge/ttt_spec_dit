@@ -121,6 +121,11 @@ def test_latent_seed_offset_persisted_in_dit_config(monkeypatch, tmp_path):
 
     import run_dit
 
+    def _unexpected_covr_profiler(*args, **kwargs):
+        raise AssertionError("disabled COVR path constructed a profiler")
+
+    monkeypatch.setattr(
+        run_dit, "_GenerationProfiler", _unexpected_covr_profiler)
     calls = []
 
     # Fake the ImageNet dataset so the test needs no real data on disk.
@@ -212,6 +217,14 @@ def test_latent_seed_offset_persisted_in_dit_config(monkeypatch, tmp_path):
     results = run_dit.run_c2i(args)
     config = results["config"]
     assert config["latent_seed_offset"] == 1
+    assert config["covr_shadow"] is False
+    assert config["covr_template_bandit"] is False
+    assert config["covr_force_template_id"] is None
+    assert config["covr_session_id"] is None
+    assert config["covr_version_key"] is None
+    assert config["covr_profile_stages"] is False
+    assert not any(
+        key.startswith("covr_") for key in results["aggregate"])
     # The same (image, draw) cell seeds actually handed to the generator.
     assert calls[0] == [latent_seed_for_index(0, 1)]
     assert calls[1] == [latent_seed_for_index(1, 1)]

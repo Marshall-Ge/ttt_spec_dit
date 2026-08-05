@@ -53,6 +53,22 @@ from .covr_bandit import (
     TimestepSafetyPrior,
     TimestepSafetyTable,
 )
+from .covr_runtime import (
+    COVRCapabilities,
+    COVRMode,
+    COVRPolicyBackend,
+    COVRRunState,
+    COVRRuntime,
+    COVRRuntimeConfig,
+    COVRTrajectoryAssignment,
+    COVRTrajectoryFeedback,
+    ExperimentalBanditBackend,
+    ForcedStrategyBackend,
+    build_covr_runtime_config,
+    covr_requested,
+    load_strategy_manifest,
+    validate_covr_capabilities,
+)
 from .registry import (
     AcceleratorAdapter,
     SpecAAdapter,

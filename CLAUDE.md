@@ -31,6 +31,7 @@
 ├── main.py                    # CLI 入口: parse_args() + validate_args() → 分发到 run_dit/run_pixart
 ├── utils.py                   # CudaTimer, VAE decode, save_image, ensure_real_299()
 ├── run_dit.py                 # DiTGenerator + run_c2i(args) — DiT 编排器/采样入口，集成 TTT/VFL
+├── run_dit_shared.py          # 纯生命周期辅助: _GenerationProfiler + _covr_* canonical JSON / resume / sentinel (被 run_dit 与 COVR runtime 共享)
 ├── run_pixart.py              # PixArtGenerator + run_t2i/run_c2i — 集成 VFL（无 TTT）
 ├── dit_coef.json              # DiT TeaCache 标定系数 (poly4, 50 步标定)
 ├── pixart_coef.json           # PixArt TeaCache 标定系数
@@ -51,8 +52,12 @@
 │   ├── speca.py               # SpecA: speca_init, speca_cal_type, taylor_cache_init,
 │   │                          #   derivative_approximation, taylor_formula, cache_step_dit/pixart,
 │   │                          #   compute_error_gate (cosine/l1/l2/relative_l1/relative_l2)
-│   └── teacache.py            # TeaCache: teacache_init/decide/cache_residual/apply_residual/step/reset
-│                              #   + compute_modulated_input(_dit) — 调制信号提取
+│   ├── teacache.py            # TeaCache: teacache_init/decide/cache_residual/apply_residual/step/reset
+│   │                          #   + compute_modulated_input(_dit) — 调制信号提取
+│   ├── covr_runtime.py        # COVR runtime 边界 (可选插件): COVRMode/COVRRuntimeConfig/
+│   │                          #   COVRRuntime facade + Forced/ExperimentalBandit backend + recorder
+│   │                          #   Phase 1 仅 DiT 非 TTT 主去噪循环; 禁用时不构造任何对象
+│   └── covr_bandit.py         # ConservativeTemplateBandit (EXPERIMENTAL, 语义冻结) + manifests
 ├── verification_feedback_loop/    # VFL 子系统 (三层架构, 详见 §12)
 │   ├── __init__.py            # 导出所有公共符号
 │   ├── config.py              # VFLConfig: accept_sample_rate, buffer_capacity_per_stratum, loRA_rank...
@@ -80,6 +85,7 @@
 └── scripts/
     ├── run.sh                 # 20 combo benchmark 脚本
     ├── run_full_smoke.sh      # 完整冒烟测试
+    ├── run_covr_forced_smoke.sh # 一键生成 manifest 并执行 forced COVR smoke
     └── calibrate_teacache.py  # TeaCache 多项式系数标定脚本
 ```
 
@@ -329,6 +335,9 @@ python main.py --model dit --task c2i --dataset imagenet \
     --seed 42 --num_steps 50 --n_prompts 80 \
     --guidance_scale 4.5 --batch_size 32
 
+# 一键生成 version-key/manifest 并执行 forced COVR smoke
+bash scripts/run_covr_forced_smoke.sh uniform
+
 # 全 20 组合 benchmark
 N_PROMPTS=50 bash scripts/run.sh
 
@@ -482,3 +491,15 @@ use_ttt = use_teacache and ttt_state is not None    # 必须叠加在 TeaCache �
 ### 12.6 L3 canary 发布现状
 
 `EvalGate` 定义了双闸门，但 `run_dit.py` 主流程中**未实际调用 `EvalGate.evaluate()`** 自动发布——当前 checkpoint 自动加载 (`find_latest_checkpoint()`) 但跳过 gate 验证。完整 canary 自动发布流程仅在 `verification_feedback_loop/demo_e2e.py` 中实现，是参考代码。生产化时需要补这个环节。
+
+## 13. COVR runtime 边界（可选插件）
+
+**边界原则**：`accelerators/covr_runtime.py` 是 COVR 的 runtime facade（可选插件）。禁用时 `build_covr_runtime_config()` 返回 None，run_dit 路径不构造任何 COVR 对象、不产生 aggregate.covr_* 字段、不改变普通加速决策/前向计数。
+
+- **Phase 1 范围**：仅 DiT 非 TTT 主去噪循环。PixArt / TTT 在 `validate_covr_capabilities` 提前失败（main.py 校验层）。
+- **Runtime 职责**：初始化（version/resume/backend/recorder）、trajectory begin/end（sentinel 选择、assignment、feedback 物化、bandit update/persist）、adapter FLOPs、aggregate/config payload。
+- **采样循环职责**：保持 tensor 计算在 run_dit；terminal/H-step/safety/audit 反馈仍写在 loop 内（写入 `COVRTrajectoryAssignment.feedback`）。
+- **纯辅助**：`run_dit_shared.py` 持有 `_GenerationProfiler` + `_covr_*` canonical JSON / resume / sentinel 纯函数；run_dit 从其中 import 并保持历史 `_covr_*` 名称可导入（scripts/tests 依赖）。
+- **StrategyManifest version_key 对称校验**：forced 与 bandit 两个 mode 都走 `load_strategy_manifest`（错误消息含 "runtime"）。
+- **Bandit 标记 EXPERIMENTAL**：`ConservativeTemplateBandit` 语义冻结，未做算法改动；`--covr-strategy-bandit` help 已标注。
+- **VFL 独立**：VFL 是旁路观测/校准，不参与 forward；COVR runtime 与其互不依赖，既有有效组合不变。
