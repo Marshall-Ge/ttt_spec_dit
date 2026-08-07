@@ -102,10 +102,11 @@ def _get_lpips() -> object:
 
 def _lpips(path: str, reference: str, lpips_model: object) -> float:
     import torch
+    device = next(lpips_model.parameters()).device
     image = (np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 127.5) - 1.0
     target = (np.asarray(Image.open(reference).convert("RGB"), dtype=np.float32) / 127.5) - 1.0
-    t_img = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0)
-    t_ref = torch.from_numpy(target).permute(2, 0, 1).unsqueeze(0)
+    t_img = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).to(device)
+    t_ref = torch.from_numpy(target).permute(2, 0, 1).unsqueeze(0).to(device)
     with torch.no_grad():
         result = float(lpips_model(t_img, t_ref).item())
     return result
