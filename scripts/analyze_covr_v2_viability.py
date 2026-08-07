@@ -1087,6 +1087,8 @@ def main() -> int:
             min_policy_gain=args.min_policy_gain,
             permutations=args.permutations,
             seed=args.seed,
+            outcome=args.outcome,
+            lpips_gpu=args.lpips_gpu,
         )
     except (OSError, ValueError, KeyError) as exc:
         print(f"VIABILITY ERROR: {exc}")
