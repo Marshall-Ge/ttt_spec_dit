@@ -45,6 +45,7 @@ _INDEX_RE = re.compile(r"^(\d+)(?:_|\.)")
 
 def _read_jsonl(path: str) -> List[Mapping[str, object]]:
     rows = []
+    seen = set()
     with open(path, encoding="utf-8") as handle:
         for line_no, line in enumerate(handle, 1):
             if not line.strip():
@@ -55,6 +56,10 @@ def _read_jsonl(path: str) -> List[Mapping[str, object]]:
                 raise ValueError(f"invalid JSONL at {path}:{line_no}: {exc}") from exc
             if not isinstance(row, dict):
                 raise ValueError(f"JSONL row at {path}:{line_no} is not an object")
+            key = (int(row.get("global_idx", -1)), int(row.get("step_idx", -1)))
+            if key in seen:
+                continue
+            seen.add(key)
             rows.append(row)
     return rows
 

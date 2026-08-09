@@ -101,7 +101,7 @@ class COVRViabilityRecorder:
         self.prefix_steps = int(prefix_steps)
         self.run_identity = dict(run_identity or {})
         os.makedirs(os.path.dirname(self.output_path) or ".", exist_ok=True)
-        self._file = open(self.output_path, "a", encoding="utf-8")
+        self._file = open(self.output_path, "w", encoding="utf-8")
         self._active: Optional[Dict[str, Any]] = None
         self._next_step = 0
         self.record_count = 0
