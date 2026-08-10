@@ -186,6 +186,10 @@ Examples:
                         help="Explicit COVR template-bandit state to resume/save")
     parser.add_argument("--covr-bandit-epsilon", type=float, default=0.1,
                         help="Template-bandit exploration probability")
+    parser.add_argument(
+        "--covr-bandit-prior-penalty", type=float, default=0.0,
+        help="Initial alternative-arm penalty in log1p(loss) space. "
+             "Default 0 removes the historical prior lock-in.")
     parser.add_argument("--covr-safety-sample-rate", type=float, default=0.1,
                         help="Action-independent one-step safety audit rate")
     parser.add_argument("--covr-safety-chain-threshold", type=int, default=5,

@@ -21,6 +21,7 @@ from run_dit import (
     _covr_scheduler_config_json,
     _covr_scheduler_pair,
     _covr_shadow_full,
+    _covr_teacache_terminal_skip,
     _dataset_generation_window,
     _load_forced_covr_template,
 )
@@ -109,6 +110,35 @@ def test_shadow_full_explicitly_bypasses_all_acceleration_state():
     assert kwargs["current"] is None
     assert kwargs["cache_dic"] is None
     assert kwargs["teacache_state"] is None
+
+
+def test_teacache_terminal_skip_isolates_state_and_forces_current_skip():
+    transformer = RecordingTransformer()
+    state = {
+        "num_steps": 3,
+        "cnt": 2,
+        "refresh_mask": None,
+        "decisions": ["calc", "skip"],
+        "accum_history": [0.0, 0.1],
+        "raw_diff_history": [0.0, 0.1],
+        "rescaled_diff_history": [0.0, 0.1],
+        "boundary_probe": {"rows": [{"step": 1}], "shadow_accum": 0.1},
+    }
+
+    result = _covr_teacache_terminal_skip(
+        transformer, torch.zeros(2, 1), torch.tensor([10, 10]),
+        torch.tensor([1, 1000]), 4.5, state)
+
+    assert torch.equal(result, torch.ones(2, 1))
+    mode, kwargs = transformer.calls[-1]
+    assert mode == "cfg"
+    shadow = kwargs["teacache_state"]
+    assert shadow["refresh_mask"] == (True, True, False)
+    shadow["decisions"].append("skip")
+    shadow["boundary_probe"]["rows"].append({"step": 2})
+    assert state["decisions"] == ["calc", "skip"]
+    assert state["boundary_probe"]["rows"] == [{"step": 1}]
+    assert state["refresh_mask"] is None
 
 
 def test_scheduler_alphas_use_actual_next_step_and_final_alpha():

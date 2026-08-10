@@ -52,6 +52,8 @@ def _runtime_args(**overrides):
         "covr_force_strategy_id": None,
         "covr_bandit_state": None,
         "covr_bandit_epsilon": 0.1,
+        "covr_bandit_prior_penalty": 0.0,
+        "batch_size": 1,
         "covr_safety_sample_rate": 0.1,
         "covr_safety_chain_threshold": 0,
         "covr_sentinel_rate": 0.05,
@@ -255,6 +257,47 @@ def test_runtime_config_distinguishes_modes(tmp_path, overrides, expected):
 
     assert config is not None
     assert config.mode is expected
+
+
+def test_runtime_config_threads_bandit_prior_penalty(tmp_path):
+    config = build_covr_runtime_config(
+        _runtime_args(
+            covr_strategy_bandit=True,
+            covr_strategy_manifest="manifest.json",
+            covr_bandit_prior_penalty=2.5e-5,
+        ),
+        str(tmp_path),
+    )
+
+    assert config is not None
+    assert config.bandit_prior_penalty == pytest.approx(2.5e-5)
+
+
+@pytest.mark.parametrize("batch_size", [0, 2, 32])
+def test_strategy_bandit_requires_one_image_per_trajectory(
+        tmp_path, batch_size):
+    with pytest.raises(ValueError, match="requires --batch_size 1"):
+        build_covr_runtime_config(
+            _runtime_args(
+                covr_strategy_bandit=True,
+                covr_strategy_manifest="manifest.json",
+                batch_size=batch_size,
+            ),
+            str(tmp_path),
+        )
+
+
+@pytest.mark.parametrize("penalty", [-1.0, float("inf"), float("nan")])
+def test_strategy_bandit_rejects_invalid_prior_penalty(tmp_path, penalty):
+    with pytest.raises(ValueError, match="prior-penalty"):
+        build_covr_runtime_config(
+            _runtime_args(
+                covr_strategy_bandit=True,
+                covr_strategy_manifest="manifest.json",
+                covr_bandit_prior_penalty=penalty,
+            ),
+            str(tmp_path),
+        )
 
 
 def test_runtime_aggregate_serializes_generic_forced_strategy(tmp_path):
@@ -1226,6 +1269,7 @@ def test_config_payload_golden_keys(tmp_path):
         "covr_session_id": "sess-1",
         "covr_version_key": "abc123",
         "covr_profile_stages": True,
+        "covr_bandit_prior_penalty": 0.0,
     }
 
     # Forced runtime flips the bandit flag off, shadow on.

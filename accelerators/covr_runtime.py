@@ -11,6 +11,7 @@ early in ``validate_covr_capabilities``. VFL is independent and unchanged.
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -100,6 +101,7 @@ class COVRRuntimeConfig:
     sentinel_rate: float
     sentinel_horizon: int
     seed: int
+    bandit_prior_penalty: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -397,11 +399,13 @@ class COVRRuntime:
         if isinstance(manifest, StrategyManifest):
             bandit = ConservativeTemplateBandit.from_strategies(
                 manifest, session_id=session_id, epsilon=epsilon, seed=seed,
-                run_identity=run_identity)
+                run_identity=run_identity,
+                alternative_prior_penalty=self.config.bandit_prior_penalty)
         else:
             bandit = ConservativeTemplateBandit(
                 manifest, session_id=session_id, epsilon=epsilon, seed=seed,
-                run_identity=run_identity)
+                run_identity=run_identity,
+                alternative_prior_penalty=self.config.bandit_prior_penalty)
         return ExperimentalBanditBackend(bandit=bandit, state_path=state_path)
 
     def configure_forced_backend(
@@ -794,6 +798,7 @@ class COVRRuntime:
             "covr_session_id": covr_session_id,
             "covr_version_key": covr_version_key,
             "covr_profile_stages": bool(self.config.profile_stages),
+            "covr_bandit_prior_penalty": self.config.bandit_prior_penalty,
         }
 
     # ------------------------------------------------------------------
@@ -1097,6 +1102,17 @@ def validate_covr_capabilities(args: Any) -> None:
             or getattr(args, "covr_force_template_id", None)) and method != "speca":
         raise ValueError(
             "legacy COVR template modes require --method speca")
+    if (getattr(args, "covr_strategy_bandit", False)
+            or getattr(args, "covr_template_bandit", False)):
+        if int(getattr(args, "batch_size", 1)) != 1:
+            raise ValueError(
+                "COVR strategy bandit requires --batch_size 1 so each "
+                "trajectory is one image")
+        prior_penalty = float(
+            getattr(args, "covr_bandit_prior_penalty", 0.0))
+        if not math.isfinite(prior_penalty) or prior_penalty < 0.0:
+            raise ValueError(
+                "--covr-bandit-prior-penalty must be finite and non-negative")
 
 
 def _resolve_mode(args: Any) -> COVRMode:
@@ -1165,6 +1181,8 @@ def build_covr_runtime_config(
         sentinel_rate=float(getattr(args, "covr_sentinel_rate", 0.0)),
         sentinel_horizon=int(getattr(args, "covr_sentinel_horizon", 0)),
         seed=int(getattr(args, "seed", 0)),
+        bandit_prior_penalty=float(
+            getattr(args, "covr_bandit_prior_penalty", 0.0)),
     )
 
 

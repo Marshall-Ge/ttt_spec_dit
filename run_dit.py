@@ -269,6 +269,39 @@ def _covr_shadow_full(transformer, latent_input, timestep, class_labels,
     )[0]
 
 
+def _covr_teacache_terminal_skip(
+        transformer, latent_input, timestep, class_labels, guidance_scale,
+        teacache_state):
+    """Evaluate one isolated forced-skip candidate from the stale residual."""
+    shadow_state = dict(teacache_state)
+    for key, value in teacache_state.items():
+        if isinstance(value, list):
+            shadow_state[key] = list(value)
+    boundary_probe = teacache_state.get("boundary_probe")
+    if boundary_probe is not None:
+        shadow_state["boundary_probe"] = dict(boundary_probe)
+        shadow_state["boundary_probe"]["rows"] = list(
+            boundary_probe.get("rows", ()))
+
+    num_steps = int(shadow_state["num_steps"])
+    cnt = int(shadow_state["cnt"])
+    refresh_mask = [True] * num_steps
+    refresh_mask[cnt] = False
+    shadow_state["refresh_mask"] = tuple(refresh_mask)
+
+    if guidance_scale > 1.0:
+        return transformer.forward_with_cfg(
+            latent_input, timestep,
+            current=None, cache_dic=None, teacache_state=shadow_state,
+            class_labels=class_labels, cfg_scale=guidance_scale,
+        )
+    return transformer(
+        latent_input, timestep=timestep,
+        current=None, cache_dic=None, teacache_state=shadow_state,
+        class_labels=class_labels, return_dict=False,
+    )[0]
+
+
 def _covr_full_rollout(transformer, scheduler, timesteps, start_idx: int,
                        horizon: int, latents, class_labels, guidance_scale,
                        in_channels: int):
@@ -857,6 +890,28 @@ class DiTGenerator:
                     covr_feedback_sink.get("terminal_full_steps", 0)
                     + covr_sentinel_horizon)
             latent_input = scheduler.scale_model_input(latents, t)
+            terminal_teacache_skip = None
+            if (method == "teacache" and teacache_state is not None
+                    and covr_sentinel_selected
+                    and covr_sentinel_start_idx is None
+                    and step_idx == len(timesteps) - 1
+                    and covr_terminal_reward_active
+                    and covr_feedback_sink is not None):
+                refresh_mask = teacache_state.get("refresh_mask")
+                cnt = int(teacache_state["cnt"])
+                terminal_will_calc = (
+                    refresh_mask is None or bool(refresh_mask[cnt]))
+                if terminal_will_calc:
+                    terminal_token = (
+                        covr_profiler.start_gpu(
+                            "terminal_fidelity_shadow_full", required=True)
+                        if covr_profiler is not None else None)
+                    terminal_teacache_skip = _covr_teacache_terminal_skip(
+                        transformer, latent_input, current_t, class_labels,
+                        guidance_scale, teacache_state)
+                    if covr_profiler is not None:
+                        covr_profiler.stop_gpu(terminal_token)
+
             # --------------- method dispatch ---------------
             if method == "teacache":
                 if guidance_scale > 1.0:
@@ -920,14 +975,12 @@ class DiTGenerator:
             if out_channels // 2 == in_channels:
                 noise_pred = noise_pred[:, :in_channels]
 
-            # Terminal fidelity for bandit reward: compare template vs full
-            # forward at the LAST denoising step. Costs 1 extra forward pass
-            # per sentinel trajectory (vs 50 for full baseline comparison).
-            # Method-agnostic: any refresh-mask accelerator (SpecA Taylor
-            # cache OR forced-schedule TeaCache residual cache) qualifies.
-            # noise_pred at the final step is well-defined whether that step
-            # recomputed or reused the cache — comparing it to the full
-            # forward is exactly the counterfactual the bandit rewards.
+            # Terminal fidelity for bandit reward at the last denoising step.
+            # A TeaCache arm whose last step recomputes is paired with the
+            # isolated forced-skip candidate captured above; otherwise one
+            # full shadow forward supplies the counterfactual. This avoids the
+            # degenerate full-vs-full zero reward of dynamic threshold arms.
+            # Other accelerators retain the candidate-vs-full shadow path.
             # Whether this method exposes that reward is the adapter's call.
             # (``covr_terminal_reward_active`` is the loop-level gate: in
             # bandit mode it duplicates the old local adapter check, and in
@@ -944,25 +997,37 @@ class DiTGenerator:
                     and step_idx == len(timesteps) - 1
                     and _terminal_reward_active
                     and covr_feedback_sink is not None):
-                terminal_token = (
-                    covr_profiler.start_gpu(
-                        "terminal_fidelity_shadow_full", required=True)
-                    if covr_profiler is not None else None)
-                terminal_full = _covr_shadow_full(
-                    transformer, latent_input, current_t,
-                    class_labels, guidance_scale)
-                t_out = int(getattr(transformer.config, "out_channels"))
-                if t_out // 2 == in_channels:
-                    terminal_full = terminal_full[:, :in_channels]
+                terminal_token = None
+                terminal_approx = noise_pred
+                terminal_full_steps = 0
+                if terminal_teacache_skip is not None:
+                    terminal_approx = terminal_teacache_skip
+                    t_out = int(getattr(transformer.config, "out_channels"))
+                    if t_out // 2 == in_channels:
+                        terminal_approx = terminal_approx[:, :in_channels]
+                    terminal_full = noise_pred
+                else:
+                    terminal_token = (
+                        covr_profiler.start_gpu(
+                            "terminal_fidelity_shadow_full", required=True)
+                        if covr_profiler is not None else None)
+                    terminal_full = _covr_shadow_full(
+                        transformer, latent_input, current_t,
+                        class_labels, guidance_scale)
+                    t_out = int(getattr(transformer.config, "out_channels"))
+                    if t_out // 2 == in_channels:
+                        terminal_full = terminal_full[:, :in_channels]
+                    terminal_full_steps = 1
                 x_prev_approx, x_prev_full = _covr_scheduler_pair(
-                    scheduler, noise_pred, terminal_full, t, latents)
+                    scheduler, terminal_approx, terminal_full, t, latents)
                 covr_feedback_sink["terminal_fidelity_loss_tensor"] = F.mse_loss(
                     x_prev_approx[:base_bs].float(),
                     x_prev_full[:base_bs].float(),
                 )
                 covr_feedback_sink["terminal_full_steps"] = (
-                    covr_feedback_sink.get("terminal_full_steps", 0) + 1)
-                if covr_profiler is not None:
+                    covr_feedback_sink.get("terminal_full_steps", 0)
+                    + terminal_full_steps)
+                if covr_profiler is not None and terminal_token is not None:
                     covr_profiler.stop_gpu(terminal_token)
 
             if (covr_recorder is not None and covr_recorder.enabled

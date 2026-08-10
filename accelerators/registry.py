@@ -163,14 +163,17 @@ class TeaCacheAdapter(AcceleratorAdapter):
 
         kwargs = dict(base_kwargs or {})
         refresh_mask = strategy.refresh_mask
+        rel_l1_thresh = strategy.params.get("rel_l1_thresh")
+        if refresh_mask is not None and rel_l1_thresh is not None:
+            raise ValueError(
+                "TeaCache strategy cannot combine refresh_mask and "
+                "rel_l1_thresh: a forced mask bypasses threshold decisions")
         if refresh_mask is not None:
             # Forced-schedule (equal-FLOPs COVR arm): the mask drives the
             # per-step calc/skip decision, bypassing the dynamic threshold.
             kwargs["refresh_mask"] = refresh_mask
-        else:
-            rel_l1_thresh = strategy.params.get("rel_l1_thresh")
-            if rel_l1_thresh is not None:
-                kwargs["rel_l1_thresh"] = rel_l1_thresh
+        elif rel_l1_thresh is not None:
+            kwargs["rel_l1_thresh"] = rel_l1_thresh
         return {"teacache_state": teacache_init(**kwargs)}
 
     def terminal_reward_active(self, states):

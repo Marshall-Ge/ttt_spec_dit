@@ -102,13 +102,39 @@ def _max_taylor_gap(mask: Tuple[bool, ...]) -> int:
     return worst
 
 
+def _float_token(value: float) -> str:
+    return format(value, "g").replace("-", "m").replace(".", "p")
+
+
+def _parse_threshold_arm(value: str, parser) -> Tuple[float, float]:
+    try:
+        threshold_text, skip_rate_text = value.split(":", 1)
+        threshold = float(threshold_text)
+        expected_skip_rate = float(skip_rate_text)
+    except (TypeError, ValueError):
+        parser.error(
+            "--threshold-arm must use THRESHOLD:EXPECTED_SKIP_RATE")
+    if threshold <= 0.0:
+        parser.error("threshold values must be positive")
+    if not 0.0 <= expected_skip_rate < 1.0:
+        parser.error("expected skip rates must be in [0, 1)")
+    return threshold, expected_skip_rate
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Build an equal-FLOPs mask manifest at any refresh budget")
+        description="Build TeaCache threshold and/or fixed-mask strategy arms")
     ap.add_argument("--output", required=True, help="manifest json path")
     ap.add_argument("--num-steps", type=int, default=50)
-    ap.add_argument("--refresh-count", type=int, required=True,
-                    help="calc steps per trajectory (identical across arms)")
+    ap.add_argument("--refresh-count", type=int, default=None,
+                    help="legacy single fixed-mask calc budget")
+    ap.add_argument("--refresh-counts", type=int, nargs="*", default=[],
+                    help="fixed-mask calc budgets; emits four patterns per budget")
+    ap.add_argument(
+        "--threshold-arm", action="append", default=[],
+        metavar="THRESHOLD:EXPECTED_SKIP_RATE",
+        help="dynamic TeaCache arm and its calibrated expected skip rate; "
+             "repeat for multiple thresholds")
     ap.add_argument("--method", default="teacache",
                     help="registered accelerator method for every arm")
     ap.add_argument("--mandatory-prefix", type=int, default=3,
@@ -117,47 +143,102 @@ def main() -> int:
                     help="reject arms exceeding this cache gap (default: "
                          "report only — the constraint is often infeasible "
                          "at aggressive budgets)")
-    ap.add_argument("--baseline-arm", default="uniform",
-                    help="arm id used as the bandit's conservative baseline")
+    ap.add_argument(
+        "--baseline-arm", default=None,
+        help="conservative baseline arm (default: uniform for legacy masks, "
+             "threshold 0.25 when present, otherwise the first arm)")
     ap.add_argument("--version-key", default=None)
     args = ap.parse_args()
 
-    ns, k = args.num_steps, args.refresh_count
-    if not 1 <= k <= ns:
-        ap.error(f"--refresh-count must be in [1, {ns}]")
+    ns = args.num_steps
+    refresh_counts = []
+    if args.refresh_count is not None:
+        refresh_counts.append(args.refresh_count)
+    refresh_counts.extend(args.refresh_counts)
+    refresh_counts = list(dict.fromkeys(refresh_counts))
+    threshold_arms = [
+        _parse_threshold_arm(value, ap) for value in args.threshold_arm
+    ]
+    if not refresh_counts and not threshold_arms:
+        ap.error("provide --refresh-count/--refresh-counts or --threshold-arm")
+    if threshold_arms and args.method != "teacache":
+        ap.error("--threshold-arm requires --method teacache")
+    for k in refresh_counts:
+        if not 1 <= k <= ns:
+            ap.error(f"refresh counts must be in [1, {ns}]")
 
     strategies: List[AccelerationStrategy] = []
-    print(f"equal-FLOPs arms at calc={k}/{ns}, method={args.method}:")
-    for name, steps in _layouts(ns, k, args.mandatory_prefix):
-        calc = _fill_to(steps, k, ns)
-        mask = tuple(i in set(calc) for i in range(ns))
-        assert sum(mask) == k and mask[0], (name, sum(mask), mask[0])
-        gap = _max_taylor_gap(mask)
-        if args.max_taylor_gap is not None and gap > args.max_taylor_gap:
-            print(f"  {name:<14} SKIPPED (max cache gap {gap} > "
-                  f"{args.max_taylor_gap})")
-            continue
-        print(f"  {name:<14} max_gap={gap:>2}  calc at {calc}")
+    for threshold, expected_skip_rate in threshold_arms:
+        arm_id = f"threshold_{_float_token(threshold)}"
+        expected_calc_count = max(2.0, ns * (1.0 - expected_skip_rate))
+        print(
+            f"dynamic arm {arm_id:<18} threshold={threshold:g}  "
+            f"expected_skip={expected_skip_rate:.3f}  "
+            f"expected_calc={expected_calc_count:.2f}/{ns}")
         strategies.append(AccelerationStrategy(
-            strategy_id=name,
-            method=args.method,
-            params={"refresh_mask": list(mask), "num_steps": ns},
-            modeled_flops=float(k),
-            source=f"budget_manifest_k{k}",
+            strategy_id=arm_id,
+            method="teacache",
+            params={
+                "rel_l1_thresh": threshold,
+                "expected_skip_rate": expected_skip_rate,
+                "num_steps": ns,
+            },
+            modeled_flops=expected_calc_count,
+            source="teacache_threshold_manifest",
         ))
+
+    mixed_ids = bool(threshold_arms) or len(refresh_counts) > 1
+    for k in refresh_counts:
+        print(f"fixed-mask arms at calc={k}/{ns}, method={args.method}:")
+        for name, steps in _layouts(ns, k, args.mandatory_prefix):
+            calc = _fill_to(steps, k, ns)
+            mask = tuple(i in set(calc) for i in range(ns))
+            assert sum(mask) == k and mask[0], (name, sum(mask), mask[0])
+            gap = _max_taylor_gap(mask)
+            arm_id = f"pattern_{name}_k{k}" if mixed_ids else name
+            if args.max_taylor_gap is not None and gap > args.max_taylor_gap:
+                print(f"  {arm_id:<24} SKIPPED (max cache gap {gap} > "
+                      f"{args.max_taylor_gap})")
+                continue
+            print(f"  {arm_id:<24} max_gap={gap:>2}  calc at {calc}")
+            strategies.append(AccelerationStrategy(
+                strategy_id=arm_id,
+                method=args.method,
+                params={
+                    "refresh_mask": list(mask),
+                    "refresh_count": k,
+                    "num_steps": ns,
+                },
+                modeled_flops=float(k),
+                source=f"budget_manifest_k{k}",
+            ))
 
     ids = [s.strategy_id for s in strategies]
     if not ids:
         print("[FATAL] every arm was rejected — relax --max-taylor-gap",
               file=sys.stderr)
         return 1
-    baseline = args.baseline_arm if args.baseline_arm in ids else ids[0]
+    if args.baseline_arm is not None:
+        if args.baseline_arm not in ids:
+            ap.error(f"--baseline-arm is not present: {args.baseline_arm}")
+        baseline = args.baseline_arm
+    elif not mixed_ids and "uniform" in ids:
+        baseline = "uniform"
+    elif "threshold_0p25" in ids:
+        baseline = "threshold_0p25"
+    else:
+        baseline = ids[0]
+
+    default_version = f"strategy-n{ns}-{args.method}"
+    source_groups = [f"synthetic_budget_k{k}" for k in refresh_counts]
+    if threshold_arms:
+        source_groups.insert(0, "teacache_thresholds")
     manifest = StrategyManifest(
-        version_key=args.version_key or f"budget-k{k}-n{ns}-{args.method}",
+        version_key=args.version_key or default_version,
         num_steps=ns,
         baseline_strategy_id=baseline,
         strategies=tuple(strategies),
-        source_groups=(f"synthetic_budget_k{k}",),
+        source_groups=tuple(source_groups),
     )
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     manifest.save(args.output)

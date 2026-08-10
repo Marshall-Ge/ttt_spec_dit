@@ -292,6 +292,13 @@ def test_bandit_from_strategies_accepts_teacache():
     assert bandit.manifest is manifest
 
 
+def test_bandit_default_prior_does_not_penalize_alternative_arms():
+    bandit = ConservativeTemplateBandit.from_strategies(
+        _teacache_manifest(), "session", epsilon=0.0)
+
+    assert set(bandit.summary()["arm_log1p_loss_mean"].values()) == {0.0}
+
+
 def test_bandit_from_strategies_begin_and_end_trajectory():
     manifest = _teacache_manifest()
     bandit = ConservativeTemplateBandit.from_strategies(

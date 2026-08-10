@@ -775,7 +775,7 @@ class ConservativeTemplateBandit:
     def __init__(self, manifest: TemplateManifest, session_id: str,
                  epsilon: float = 0.1, seed: int = 0,
                  baseline_prior_count: int = 8,
-                 alternative_prior_penalty: float = 0.25,
+                 alternative_prior_penalty: float = 0.0,
                  run_identity: Optional[Mapping[str, Any]] = None):
         if not session_id:
             raise ValueError("session_id must be non-empty")
@@ -820,7 +820,7 @@ class ConservativeTemplateBandit:
         cls, manifest: StrategyManifest, session_id: str,
         epsilon: float = 0.1, seed: int = 0,
         baseline_prior_count: int = 8,
-        alternative_prior_penalty: float = 0.25,
+        alternative_prior_penalty: float = 0.0,
         run_identity: Optional[Mapping[str, Any]] = None,
     ) -> "ConservativeTemplateBandit":
         """Create a bandit from a method-agnostic StrategyManifest.

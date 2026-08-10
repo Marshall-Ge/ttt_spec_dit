@@ -128,6 +128,26 @@ def test_apply_strategy_teacache_threshold_still_works():
     assert result["teacache_state"]["refresh_mask"] is None
 
 
+def test_apply_strategy_rejects_ambiguous_teacache_arm():
+    strategy = AccelerationStrategy(
+        strategy_id="ambiguous", method="teacache",
+        params={
+            "rel_l1_thresh": 0.3,
+            "refresh_mask": [True, False, True, False, True],
+        },
+        modeled_flops=3.0,
+    )
+
+    with pytest.raises(ValueError, match="cannot combine"):
+        apply_strategy(
+            strategy,
+            teacache_init_kwargs={
+                "num_steps": 5,
+                "coefficients": [0.0, 0.0, 0.0, 1.0, 0.0],
+            },
+        )
+
+
 def test_register_adapter_rejects_empty_method():
     class _Bad(AcceleratorAdapter):
         method = ""
