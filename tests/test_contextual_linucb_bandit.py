@@ -252,3 +252,32 @@ def test_context_dim_mismatch_on_load_raises(tmp_path):
         _manifest(), "sess", context_dim=3, epsilon=0.0)
     with pytest.raises(ValueError, match="shape"):
         wrong.load_state(str(path))
+
+
+def _manifest_with_refresh_arm() -> StrategyManifest:
+    """Mixed manifest: one threshold arm + one refresh-mask arm (no threshold)."""
+    return StrategyManifest(
+        version_key="vk1",
+        num_steps=50,
+        baseline_strategy_id="baseline",
+        strategies=(
+            AccelerationStrategy(
+                "baseline", "teacache",
+                {"rel_l1_thresh": 0.25, "num_steps": 50}, 50.0),
+            AccelerationStrategy(
+                "pattern_uniform_k8", "teacache",
+                {"refresh_mask": [True] * 50, "refresh_count": 8,
+                 "num_steps": 50}, 8.0),
+        ),
+    )
+
+
+def test_mixed_manifest_rejected_at_construction():
+    # Deferred-commit cannot commit a refresh-mask arm: commit_arm drops the
+    # mask and switches onto the rel_l1_thresh dynamic path, which a mask arm
+    # has no value for. The bandit must reject mixed manifests at construction
+    # so the failure is loud at startup (not after burning GPU on the first
+    # trajectory that happens to select the mask arm).
+    with pytest.raises(ValueError, match="threshold-only"):
+        ContextualLinUCBBandit.from_strategies(
+            _manifest_with_refresh_arm(), "sess", context_dim=2)

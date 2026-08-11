@@ -58,8 +58,11 @@ LAMBDA="${COVR_EFFICIENCY_LAMBDA:-1e-3}"
 # Format: threshold:expected_skip_rate. The rates are planning estimates used
 # only as cost metadata; calibrate them from local TeaCache sweeps when possible.
 THRESHOLD_ARMS="${COVR_THRESHOLD_ARMS:-0.15:0.30 0.25:0.48 0.40:0.60 0.60:0.70 1.00:0.80}"
-REFRESH_COUNTS="${COVR_REFRESH_COUNTS:-8}"
 BASELINE_ARM="${COVR_BASELINE_ARM:-threshold_0p25}"
+# NOTE: contextual deferred-commit supports threshold arms ONLY. commit_arm
+# drops refresh_mask and switches onto the rel_l1_thresh dynamic path, so a
+# fixed-mask (refresh-count) arm cannot be committed — the bandit rejects mixed
+# manifests at construction. Do NOT add --refresh-counts here.
 
 case "${MODE}" in
   run|resume|analyze) ;;
@@ -165,7 +168,6 @@ PY
 )"
 
   read -r -a threshold_specs <<< "${THRESHOLD_ARMS}"
-  read -r -a refresh_counts <<< "${REFRESH_COUNTS}"
   manifest_args=(
     --output "${MANIFEST}"
     --method teacache
@@ -177,9 +179,6 @@ PY
   for spec in "${threshold_specs[@]}"; do
     manifest_args+=(--threshold-arm "${spec}")
   done
-  if ((${#refresh_counts[@]})); then
-    manifest_args+=(--refresh-counts "${refresh_counts[@]}")
-  fi
 
   echo "[2/3] Building TeaCache threshold and fixed-mask arms"
   python scripts/build_budget_manifest.py "${manifest_args[@]}"

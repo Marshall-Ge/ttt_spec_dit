@@ -1154,6 +1154,7 @@ class ContextualLinUCBBandit(ConservativeTemplateBandit):
         self._context_dim = int(context_dim)
         self._alpha = float(alpha)
         self._linucb = self._fresh_linucb(self._context_dim)
+        self._assert_threshold_only_strategies()
 
     @classmethod
     def from_strategies(
@@ -1197,6 +1198,7 @@ class ContextualLinUCBBandit(ConservativeTemplateBandit):
         instance._context_dim = int(context_dim)
         instance._alpha = float(alpha)
         instance._linucb = instance._fresh_linucb(instance._context_dim)
+        instance._assert_threshold_only_strategies()
         return instance
 
     def _fresh_linucb(self, context_dim: int) -> Dict[str, Dict[str, np.ndarray]]:
@@ -1205,6 +1207,25 @@ class ContextualLinUCBBandit(ConservativeTemplateBandit):
                             "b": np.zeros(context_dim)}
             for s in self._strategies
         }
+
+    def _assert_threshold_only_strategies(self) -> None:
+        """Deferred-commit requires threshold arms.
+
+        ``commit_arm`` drops ``refresh_mask`` and switches the loop onto the
+        dynamic accumulate-vs-threshold path driven by ``rel_l1_thresh``, so a
+        fixed-mask (refresh-count) arm cannot be committed. Reject mixed
+        manifests at construction so the failure is loud at startup, not after
+        burning GPU on a handful of trajectories.
+        """
+        offending = [
+            s.strategy_id for s in self._strategies
+            if "rel_l1_thresh" not in (s.params or {})]
+        if offending:
+            raise ValueError(
+                "ContextualLinUCBBandit requires threshold-only arms (each "
+                "strategy.params must carry rel_l1_thresh). Refresh-mask arms "
+                f"cannot be deferred-committed: {offending}. Rebuild the "
+                "manifest without --refresh-counts for the contextual runner.")
 
     @property
     def is_contextual(self) -> bool:
