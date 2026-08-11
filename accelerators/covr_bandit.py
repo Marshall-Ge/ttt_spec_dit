@@ -23,6 +23,10 @@ import numpy as np
 
 
 BANDIT_SCHEMA_VERSION = 1
+# Contextual (LinUCB, deferred-commit) bandit state is not interchangeable with
+# the non-contextual state: it carries per-arm (A, b) matrices and per-assignment
+# context vectors. Resume across the two must fail loudly, never silently migrate.
+CONTEXTUAL_BANDIT_SCHEMA_VERSION = 2
 STRATEGY_SCHEMA_VERSION = 2
 _LOG_EPSILON = 1e-12
 
@@ -526,10 +530,16 @@ class TemplateAssignment:
     session_id: str
     trajectory_id: int
     prequential_index: int
-    template_id: str
+    # template_id is Optional only for a deferred-commit "pending" assignment
+    # (contextual mode, before commit_arm selects the arm). A committed
+    # assignment always carries a real strategy id.
+    template_id: Optional[str]
     propensity: float
     manifest_hash: str
     sample_count: int = 0
+    # Per-trajectory context vector used by the contextual bandit. None on
+    # non-contextual assignments and on pending (pre-commit) assignments.
+    context: Optional[Sequence[float]] = None
 
     def __post_init__(self) -> None:
         if self.trajectory_id < 0 or self.prequential_index < 0:
@@ -555,6 +565,14 @@ class TemplateFeedback:
     h_step_denominator: Optional[float] = None
     terminal_fidelity_loss: Optional[float] = None
     terminal_quality_loss: Optional[float] = None
+    # Normalized measured cost (∈[0,1], fraction of vanilla FLOPs). Efficiency-
+    # aware reward only; None on legacy / quality-only feedback. Not part of the
+    # all-None guard (kept separate so v1 feedback still validates).
+    terminal_efficiency_loss: Optional[float] = None
+    # Pre-combined loss the bandit actually optimizes (terminal_fidelity +
+    # lambda*cost). Set by the runtime in efficiency-aware mode; bandit_loss
+    # prefers it so the legacy path (None) falls back to fidelity/quality/h-step.
+    combined_loss: Optional[float] = None
 
     def __post_init__(self) -> None:
         if self.trajectory_id < 0 or self.horizon <= 0:
@@ -572,6 +590,10 @@ class TemplateFeedback:
         if any(value is not None and (not math.isfinite(value) or value < 0)
                for value in values):
             raise ValueError("sentinel labels must be finite and non-negative")
+        for extra in (self.terminal_efficiency_loss, self.combined_loss):
+            if extra is not None and (not math.isfinite(extra) or extra < 0):
+                raise ValueError(
+                    "efficiency/combined labels must be finite and non-negative")
         if (self.h_step_numerator is None) != (self.h_step_denominator is None):
             raise ValueError("H-step numerator and denominator must be paired")
 
@@ -582,6 +604,8 @@ class TemplateFeedback:
 
     @property
     def bandit_loss(self) -> float:
+        if self.combined_loss is not None:
+            return self.combined_loss
         if self.terminal_quality_loss is not None:
             return self.terminal_quality_loss
         if self.terminal_fidelity_loss is not None:
@@ -953,11 +977,36 @@ class ConservativeTemplateBandit:
         return self.active_strategy.to_refresh_template()
 
     @property
+    def is_contextual(self) -> bool:
+        """Whether this bandit defers arm selection to commit_arm."""
+        return False
+
+    @property
+    def _schema_version(self) -> int:
+        """Persisted-state schema version; the contextual bandit overrides this."""
+        return BANDIT_SCHEMA_VERSION
+
+    def commit_arm(self, trajectory_id: int,
+                   context: Sequence[float]) -> TemplateAssignment:
+        """Select the arm for the active trajectory given a context vector.
+
+        Only the contextual (LinUCB, deferred-commit) bandit implements this.
+        The non-contextual bandit selects the arm in ``begin_trajectory`` and
+        raises here so a missing contextual flag fails loudly rather than
+        silently double-selecting.
+        """
+        raise NotImplementedError(
+            "commit_arm is only supported by the contextual bandit")
+
+    @property
     def active_strategy(self) -> AccelerationStrategy:
         """Return the active arm as a method-agnostic AccelerationStrategy."""
         if self._active is None:
             raise RuntimeError("no trajectory is active")
         strategy_id = self._active.template_id
+        if strategy_id is None:
+            raise RuntimeError(
+                "active arm is pending commit; no strategy is selected yet")
         if isinstance(self.manifest, StrategyManifest):
             return self.manifest.strategy_map[strategy_id]
         # TemplateManifest: look up from the internal _strategies list
@@ -1003,7 +1052,7 @@ class ConservativeTemplateBandit:
         if self._active is not None:
             raise RuntimeError("cannot persist bandit state during an active trajectory")
         return {
-            "schema_version": BANDIT_SCHEMA_VERSION,
+            "schema_version": self._schema_version,
             "session_id": self.session_id,
             "version_key": self.manifest.version_key,
             "manifest_hash": self.manifest.manifest_hash,
@@ -1036,7 +1085,7 @@ class ConservativeTemplateBandit:
             str(value.get("manifest_hash", "")),
         )
         expected = (
-            BANDIT_SCHEMA_VERSION,
+            self._schema_version,
             self.session_id,
             self.manifest.version_key,
             self.manifest.manifest_hash,
@@ -1068,3 +1117,274 @@ class ConservativeTemplateBandit:
             for feedback in value.get("feedback", [])
         ]
         self._rng.bit_generator.state = value["rng_state"]
+
+
+class ContextualLinUCBBandit(ConservativeTemplateBandit):
+    """Deferred-commit LinUCB bandit over a ``StrategyManifest``.
+
+    The non-contextual bandit selects the arm in ``begin_trajectory`` and so
+    collapses onto the globally-best arm (which, for c2i terminal fidelity, *is*
+    the baseline — gain ≈ 0 by construction). This bandit defers selection to
+    ``commit_arm``: ``begin_trajectory`` opens a *pending* trajectory (no arm),
+    the loop runs a mandatory calc prefix and extracts a context vector, then
+    ``commit_arm`` picks the arm via a per-arm linear loss model. Selection is
+    epsilon-greedy on top of LinUCB so the logged propensity stays non-degenerate
+    (IPS-estimable). ``end_trajectory`` updates the chosen arm's ``(A, b)`` with
+    the observed ``(context, loss)``.
+
+    The bandit MINIMIZES loss, so exploration uses a lower-confidence bound:
+    ``score_a(x) = theta_a.x - alpha * sqrt(x^T A_a^-1 x)`` and the greedy arm is
+    ``argmin_a score_a(x)`` (optimistic-low-loss).
+    """
+
+    def __init__(self, manifest: StrategyManifest, session_id: str,
+                 context_dim: int, epsilon: float = 0.1, seed: int = 0,
+                 alpha: float = 1.0, baseline_prior_count: int = 8,
+                 alternative_prior_penalty: float = 0.0,
+                 run_identity: Optional[Mapping[str, Any]] = None):
+        super().__init__(
+            manifest, session_id, epsilon=epsilon, seed=seed,
+            baseline_prior_count=baseline_prior_count,
+            alternative_prior_penalty=alternative_prior_penalty,
+            run_identity=run_identity)
+        if context_dim <= 0:
+            raise ValueError("context_dim must be positive")
+        if alpha < 0:
+            raise ValueError("linucb alpha must be non-negative")
+        self._context_dim = int(context_dim)
+        self._alpha = float(alpha)
+        self._linucb = self._fresh_linucb(self._context_dim)
+
+    @classmethod
+    def from_strategies(
+        cls, manifest: StrategyManifest, session_id: str, context_dim: int, *,
+        epsilon: float = 0.1, seed: int = 0, alpha: float = 1.0,
+        baseline_prior_count: int = 8, alternative_prior_penalty: float = 0.0,
+        run_identity: Optional[Mapping[str, Any]] = None,
+    ) -> "ContextualLinUCBBandit":
+        if not session_id:
+            raise ValueError("session_id must be non-empty")
+        if not 0 <= epsilon <= 1:
+            raise ValueError("epsilon must be in [0, 1]")
+        if baseline_prior_count <= 0 or alternative_prior_penalty < 0:
+            raise ValueError("invalid bandit prior configuration")
+        if context_dim <= 0:
+            raise ValueError("context_dim must be positive")
+        if alpha < 0:
+            raise ValueError("linucb alpha must be non-negative")
+        instance = cls.__new__(cls)
+        instance.manifest = manifest
+        instance.session_id = session_id
+        instance.epsilon = float(epsilon)
+        instance.seed = int(seed)
+        instance.run_identity = dict(run_identity or {})
+        instance.safety = TimestepSafetyTable(manifest)
+        instance._rng = np.random.default_rng(seed)
+        instance._strategies = list(manifest.strategies)
+        instance._arm_stats = {
+            s.strategy_id: _ArmLossStats(
+                count=(baseline_prior_count
+                       if s.strategy_id == manifest.baseline_strategy_id else 1),
+                mean=(0.0 if s.strategy_id == manifest.baseline_strategy_id
+                      else alternative_prior_penalty))
+            for s in manifest.strategies
+        }
+        instance._active = None
+        instance._pending_safety = []
+        instance._completed_trajectories = set()
+        instance.assignments = []
+        instance.feedback = []
+        instance._context_dim = int(context_dim)
+        instance._alpha = float(alpha)
+        instance._linucb = instance._fresh_linucb(instance._context_dim)
+        return instance
+
+    def _fresh_linucb(self, context_dim: int) -> Dict[str, Dict[str, np.ndarray]]:
+        return {
+            s.strategy_id: {"A": np.eye(context_dim),
+                            "b": np.zeros(context_dim)}
+            for s in self._strategies
+        }
+
+    @property
+    def is_contextual(self) -> bool:
+        return True
+
+    @property
+    def _schema_version(self) -> int:
+        return CONTEXTUAL_BANDIT_SCHEMA_VERSION
+
+    @property
+    def context_dim(self) -> int:
+        return self._context_dim
+
+    def begin_trajectory(self, trajectory_id: int,
+                         sample_count: int = 0) -> TemplateAssignment:
+        """Open a pending trajectory; the arm is chosen later by ``commit_arm``."""
+        if self._active is not None:
+            raise RuntimeError("the previous trajectory is still active")
+        if trajectory_id in self._completed_trajectories:
+            raise ValueError("trajectory has already completed")
+        if trajectory_id < 0:
+            raise ValueError("trajectory_id must be non-negative")
+        if sample_count < 0:
+            raise ValueError("sample_count must be non-negative")
+        pending = TemplateAssignment(
+            session_id=self.session_id,
+            trajectory_id=trajectory_id,
+            prequential_index=len(self._completed_trajectories),
+            template_id=None,
+            propensity=1.0,  # placeholder; the real propensity is set at commit
+            manifest_hash=self.manifest.manifest_hash,
+            sample_count=int(sample_count),
+        )
+        self._active = pending
+        self._pending_safety = []
+        # Deliberately NOT appended to self.assignments: commit_arm records the
+        # real (committed) assignment so the analyzer sees one arm per trajectory.
+        return pending
+
+    def _linucb_argmin(self, context: np.ndarray) -> str:
+        """Greedy arm = argmin of the optimistic-low-loss LCB score."""
+        best_arm: Optional[str] = None
+        best_score = math.inf
+        for strategy in self._strategies:
+            arm = strategy.strategy_id
+            matrices = self._linucb[arm]
+            theta = np.linalg.solve(matrices["A"], matrices["b"])
+            mean = float(theta @ context)
+            a_inv_x = np.linalg.solve(matrices["A"], context)
+            variance = float(context @ a_inv_x)
+            bonus = math.sqrt(max(0.0, variance))
+            score = mean - self._alpha * bonus
+            # Deterministic tie-break: manifest order (first wins on strict <).
+            if score < best_score:
+                best_score = score
+                best_arm = arm
+        assert best_arm is not None
+        return best_arm
+
+    def commit_arm(self, trajectory_id: int,
+                   context: Sequence[float]) -> TemplateAssignment:
+        if self._active is None or self._active.trajectory_id != trajectory_id:
+            raise RuntimeError("commit_arm does not match the active trajectory")
+        if self._active.template_id is not None:
+            raise RuntimeError("trajectory arm has already been committed")
+        ctx = np.asarray(context, dtype=np.float64)
+        if ctx.shape != (self._context_dim,):
+            raise ValueError(
+                f"context shape {ctx.shape} does not match context_dim "
+                f"{self._context_dim}")
+        if not np.all(np.isfinite(ctx)):
+            raise ValueError("context must be finite")
+
+        arms = [s.strategy_id for s in self._strategies]
+        greedy = self._linucb_argmin(ctx)
+        # epsilon-greedy on top of LinUCB: keeps propensity non-degenerate so the
+        # deployed contextual policy is IPS-estimable offline.
+        n_arms = len(arms)
+        probabilities = np.full(n_arms, self.epsilon / n_arms)
+        probabilities[arms.index(greedy)] += 1.0 - self.epsilon
+        selected_index = int(self._rng.choice(n_arms, p=probabilities))
+        selected = arms[selected_index]
+
+        assignment = TemplateAssignment(
+            session_id=self.session_id,
+            trajectory_id=trajectory_id,
+            prequential_index=self._active.prequential_index,
+            template_id=selected,
+            propensity=float(probabilities[selected_index]),
+            manifest_hash=self.manifest.manifest_hash,
+            sample_count=self._active.sample_count,
+            context=[float(v) for v in ctx.tolist()],
+        )
+        self._active = assignment
+        self.assignments.append(assignment)
+        return assignment
+
+    def end_trajectory(self, trajectory_id: int,
+                       feedback: Optional[TemplateFeedback] = None) -> None:
+        if self._active is None or self._active.trajectory_id != trajectory_id:
+            raise RuntimeError("trajectory close does not match the active assignment")
+        if self._active.template_id is None:
+            raise RuntimeError("cannot end a contextual trajectory before commit_arm")
+        if feedback is not None:
+            if feedback.trajectory_id != trajectory_id:
+                raise ValueError("feedback trajectory does not match assignment")
+            if feedback.template_id != self._active.template_id:
+                raise ValueError("feedback template does not match assignment")
+
+        for step_idx, numerator, denominator in self._pending_safety:
+            self.safety.observe(
+                self._active.template_id, step_idx, numerator, denominator)
+
+        if feedback is not None and self._active.context is not None:
+            ctx = np.asarray(self._active.context, dtype=np.float64)
+            arm = self._active.template_id
+            self._linucb[arm]["A"] = self._linucb[arm]["A"] + np.outer(ctx, ctx)
+            self._linucb[arm]["b"] = (
+                self._linucb[arm]["b"] + float(feedback.bandit_loss) * ctx)
+            self._arm_stats[arm].update(feedback.bandit_loss)
+            self.feedback.append(feedback)
+
+        self._completed_trajectories.add(trajectory_id)
+        self._active = None
+        self._pending_safety = []
+
+    def theta(self, arm_id: str) -> np.ndarray:
+        """Current linear loss-model estimate for an arm (analyzer diagnostic)."""
+        matrices = self._linucb[arm_id]
+        return np.linalg.solve(matrices["A"], matrices["b"])
+
+    def summary(self) -> Dict[str, Any]:
+        base = super().summary()
+        theta_norm = {
+            strategy.strategy_id: float(np.linalg.norm(self.theta(strategy.strategy_id)))
+            for strategy in self._strategies
+        }
+        base.update({
+            "contextual": True,
+            "context_dim": self._context_dim,
+            "linucb_alpha": self._alpha,
+            "linucb_theta_norm": theta_norm,
+        })
+        return base
+
+    def state_dict(self) -> Dict[str, Any]:
+        payload = super().state_dict()
+        payload["context_dim"] = self._context_dim
+        payload["linucb_alpha"] = self._alpha
+        payload["linucb"] = {
+            arm: {"A": matrices["A"].tolist(),
+                  "b": matrices["b"].tolist()}
+            for arm, matrices in self._linucb.items()
+        }
+        return payload
+
+    def load_state(self, path: str) -> None:
+        super().load_state(path)  # identity gate (contextual schema version) + base restore
+        with open(path, "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+        linucb_payload = value.get("linucb", {})
+        restored: Dict[str, Dict[str, np.ndarray]] = {}
+        for strategy in self._strategies:
+            arm = strategy.strategy_id
+            entry = linucb_payload.get(arm)
+            if entry is None:
+                # Arm present in manifest but absent in persisted state (e.g.
+                # manifest grew): fall back to the uninformative prior.
+                restored[arm] = {"A": np.eye(self._context_dim),
+                                 "b": np.zeros(self._context_dim)}
+                continue
+            a_matrix = np.asarray(entry["A"], dtype=np.float64)
+            b_vector = np.asarray(entry["b"], dtype=np.float64)
+            if a_matrix.shape != (self._context_dim, self._context_dim):
+                raise ValueError(
+                    f"persisted A for {arm} has shape {a_matrix.shape}")
+            if b_vector.shape != (self._context_dim,):
+                raise ValueError(
+                    f"persisted b for {arm} has shape {b_vector.shape}")
+            restored[arm] = {"A": a_matrix, "b": b_vector}
+        if set(restored) != {s.strategy_id for s in self._strategies}:
+            raise ValueError("persisted linucb arm set does not match the manifest")
+        self._linucb = restored

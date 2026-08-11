@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import argparse
+import math
 import sys
 
 from accelerators.covr_runtime import (
@@ -190,6 +191,22 @@ Examples:
         "--covr-bandit-prior-penalty", type=float, default=0.0,
         help="Initial alternative-arm penalty in log1p(loss) space. "
              "Default 0 removes the historical prior lock-in.")
+    parser.add_argument("--covr-contextual-bandit", action="store_true",
+                        default=False,
+                        help="Deferred-commit contextual LinUCB bandit (requires "
+                             "--covr-strategy-bandit and --batch_size 1). Selects "
+                             "the arm AFTER a forced-calc prefix using causal-prefix "
+                             "features. EXPERIMENTAL: semantics frozen.")
+    parser.add_argument("--covr-prefix-steps", type=int, default=3,
+                        help="Forced-calc denoise steps run before the contextual "
+                             "arm commit (default 3). Context width scales with this.")
+    parser.add_argument("--covr-efficiency-lambda", type=float, default=0.0,
+                        help="Efficiency-reward weight: combined = terminal_MSE + "
+                             "lambda*measured_FLOPs_ratio. 0.0 = pure terminal "
+                             "fidelity (default). Sweep {1e-4,1e-3,1e-2} on GPU.")
+    parser.add_argument("--covr-linucb-alpha", type=float, default=1.0,
+                        help="LinUCB exploration scale (LCB bonus on the per-arm "
+                             "linear loss model). Default 1.0.")
     parser.add_argument("--covr-safety-sample-rate", type=float, default=0.1,
                         help="Action-independent one-step safety audit rate")
     parser.add_argument("--covr-safety-chain-threshold", type=int, default=5,
@@ -474,6 +491,31 @@ def validate_args(args):
         if args.covr_sentinel_horizon < 0 or args.covr_sentinel_horizon > args.num_steps:
             print("[ERROR] --covr-sentinel-horizon must be between 0 and "
                   "--num-steps.")
+            return False
+
+    # Deferred-commit contextual bandit (experimental).
+    if args.covr_contextual_bandit:
+        if not args.covr_strategy_bandit:
+            print("[ERROR] --covr-contextual-bandit requires --covr-strategy-bandit.")
+            return False
+        if int(getattr(args, "batch_size", 1)) != 1:
+            print("[ERROR] --covr-contextual-bandit requires --batch_size 1 "
+                  "(per-image deferred commit).")
+            return False
+        if int(args.covr_prefix_steps) <= 0:
+            print("[ERROR] --covr-prefix-steps must be positive.")
+            return False
+        if int(args.covr_prefix_steps) >= int(args.num_steps):
+            print("[ERROR] --covr-prefix-steps must be smaller than --num-steps "
+                  "(the dynamic suffix must run at least one step after commit).")
+            return False
+        lam = float(args.covr_efficiency_lambda)
+        if not math.isfinite(lam) or lam < 0.0:
+            print("[ERROR] --covr-efficiency-lambda must be finite and non-negative.")
+            return False
+        alpha = float(args.covr_linucb_alpha)
+        if not math.isfinite(alpha) or alpha < 0.0:
+            print("[ERROR] --covr-linucb-alpha must be finite and non-negative.")
             return False
 
     if args.covr_force_strategy_id is not None:

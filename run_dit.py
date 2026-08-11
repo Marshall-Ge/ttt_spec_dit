@@ -79,8 +79,10 @@ from accelerators.covr_runtime import (
     COVRRuntime,
     COVRTrajectoryAssignment,
     build_covr_runtime_config,
+    flatten_prefix_features,
     load_strategy_manifest,
 )
+from accelerators.covr_viability import extract_prefix_features
 from models.ttt_plugin import (
     SessionAdaLNModulator, ttt_state_init, ttt_reset_for_image,
     ttt_train_step, ttt_record_skip, ttt_session_stats,
@@ -687,6 +689,7 @@ class DiTGenerator:
                      COVRTrajectoryAssignment] = None,
                  viability_recorder: Optional[
                      COVRViabilityRecorder] = None,
+                 covr_runtime: Optional[COVRRuntime] = None,
                  ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Generate image(s).
 
@@ -745,6 +748,7 @@ class DiTGenerator:
             cache_dic=cache_dic, current=current,
             covr_trajectory=covr_trajectory,
             viability_recorder=viability_recorder,
+            covr_runtime=covr_runtime,
         )
         if covr_profiler is not None:
             covr_profiler.stop_gpu(denoise_token)
@@ -779,6 +783,7 @@ class DiTGenerator:
                            COVRTrajectoryAssignment] = None,
                        viability_recorder: Optional[
                            COVRViabilityRecorder] = None,
+                       covr_runtime: Optional[COVRRuntime] = None,
                        ) -> torch.Tensor:
         """Single denoising loop with method dispatch.
 
@@ -822,6 +827,15 @@ class DiTGenerator:
         if covr_sentinel_start_idx is not None:
             if covr_feedback_sink is None or covr_sentinel_horizon <= 0:
                 raise ValueError("H-step sentinel requires a feedback sink and horizon")
+        # Deferred-commit contextual bandit: covr_runtime.commit_arm selects the
+        # arm after ``prefix_steps`` forced-calc denoise steps. prefix_steps==0
+        # means non-contextual (the arm was selected in begin_trajectory).
+        covr_prefix_steps = (
+            int(covr_trajectory.prefix_steps) if covr_trajectory is not None else 0)
+        covr_contextual_active = (
+            covr_prefix_steps > 0 and covr_runtime is not None
+            and covr_trajectory is not None)
+        covr_contextual_committed = False
         sentinel_start_latent = None
         sentinel_reference_latent = None
 
@@ -974,6 +988,47 @@ class DiTGenerator:
             out_channels = int(getattr(transformer.config, "out_channels"))
             if out_channels // 2 == in_channels:
                 noise_pred = noise_pred[:, :in_channels]
+
+            # ---- Deferred-commit contextual bandit: buffer prefix features
+            # and commit the arm once the forced-calc prefix completes. The
+            # prefix strategy (installed in begin_trajectory) forces every step
+            # to recompute, so the residual and previous_modulated_input are
+            # fresh when the dynamic threshold path resumes at the next step.
+            if (covr_contextual_active and not covr_contextual_committed
+                    and teacache_state is not None
+                    and step_idx < covr_prefix_steps):
+                prefix_feats = extract_prefix_features(
+                    latent_input[:1], noise_pred[:1], batch_size=1)
+                covr_trajectory.prefix_feature_buffer.append(prefix_feats)
+                if step_idx == covr_prefix_steps - 1:
+                    context_vector = flatten_prefix_features(
+                        covr_trajectory.prefix_feature_buffer)
+                    commit_token = (
+                        covr_profiler.start_gpu("strategy_selection")
+                        if covr_profiler is not None else None)
+                    selection = covr_runtime.commit_arm(
+                        covr_trajectory, context_vector)
+                    if covr_profiler is not None:
+                        covr_profiler.stop_gpu(commit_token)
+                    chosen_strategy = selection.strategy
+                    if chosen_strategy is None:
+                        raise RuntimeError(
+                            "contextual commit did not resolve a strategy")
+                    gamma = chosen_strategy.params.get("rel_l1_thresh")
+                    if gamma is None:
+                        raise RuntimeError(
+                            "contextual commit selected a strategy without "
+                            "rel_l1_thresh; only TeaCache threshold arms are "
+                            "supported in deferred-commit mode")
+                    # Drop the forced-calc mask; the chosen threshold drives the
+                    # dynamic accumulate-vs-threshold path from step K onward.
+                    # The mask branch already zeroed the accumulator each step
+                    # and kept previous_modulated_input current, so the dynamic
+                    # branch resumes cleanly (teacache.py:316 reads rel_l1_thresh
+                    # fresh each call).
+                    teacache_state["refresh_mask"] = None
+                    teacache_state["rel_l1_thresh"] = float(gamma)
+                    covr_contextual_committed = True
 
             # Terminal fidelity for bandit reward at the last denoising step.
             # A TeaCache arm whose last step recomputes is paired with the
@@ -1153,6 +1208,16 @@ class DiTGenerator:
 
         # Clear the LoRA t_emb cache so the next image starts clean.
         clear_lora_t_emb()
+        # Deferred-commit contextual bandit: every contextual trajectory must
+        # commit exactly once during the prefix. If the loop exited without
+        # committing (e.g. num_steps < prefix_steps, or the hook was skipped),
+        # the bandit's pending arm would never resolve — fail loudly rather
+        # than silently degrading to all-calc.
+        if covr_contextual_active and not covr_contextual_committed:
+            raise RuntimeError(
+                "contextual trajectory exited the denoise loop before the "
+                f"deferred commit (prefix_steps={covr_prefix_steps}, "
+                f"num_steps={len(timesteps)})")
         return latents
 
     # ==================================================================
@@ -1768,6 +1833,8 @@ def run_c2i(args) -> Dict:
                 "safety_sample_rate": float(args.covr_safety_sample_rate),
                 "sentinel_rate": float(args.covr_sentinel_rate),
                 "sentinel_horizon": int(args.covr_sentinel_horizon),
+                "prefix_steps": int(getattr(args, "covr_prefix_steps", 0)),
+                "efficiency_lambda": float(getattr(args, "covr_efficiency_lambda", 0.0)),
             }
             covr_runtime = COVRRuntime.create(
                 covr_runtime_config,
@@ -1826,6 +1893,8 @@ def run_c2i(args) -> Dict:
                     "safety_sample_rate": float(args.covr_safety_sample_rate),
                     "sentinel_rate": float(args.covr_sentinel_rate),
                     "sentinel_horizon": int(args.covr_sentinel_horizon),
+                    "prefix_steps": int(getattr(args, "covr_prefix_steps", 0)),
+                    "efficiency_lambda": float(getattr(args, "covr_efficiency_lambda", 0.0)),
                 },
                 state_path=covr_bandit_state_path,
                 resume_expected_samples=(
@@ -2028,6 +2097,12 @@ def run_c2i(args) -> Dict:
             covr_assignment = covr_trajectory.bandit_assignment
             covr_sentinel_selected = covr_trajectory.sentinel_selected
             covr_sentinel_start_idx = covr_trajectory.sentinel_start_idx
+            # Deferred-commit contextual bandit: tell the denoise loop how many
+            # forced-calc prefix steps to run before committing the arm.
+            if (covr_runtime_config is not None
+                    and covr_runtime_config.contextual):
+                covr_trajectory.prefix_steps = int(
+                    covr_runtime_config.prefix_steps)
         if covr_profiler is not None:
             covr_profiler.add_cpu(
                 "strategy_selection", time.perf_counter() - strategy_select_start)
@@ -2184,9 +2259,42 @@ def run_c2i(args) -> Dict:
                 ddim_steps=ddim_steps,
                 covr_trajectory=covr_trajectory,
                 viability_recorder=viability_recorder,
+                covr_runtime=(covr_runtime
+                              if covr_runtime_config is not None
+                              and covr_runtime_config.contextual else None),
             )
         if viability_recorder is not None:
             viability_recorder.end_trajectory()
+        # Deferred-commit contextual bandit: commit_arm refreshed the bandit
+        # assignment mid-trajectory; re-bind the outer reference so the results
+        # dict and FLOPs attribution see the committed arm, not the pending one.
+        if (covr_trajectory is not None
+                and covr_runtime_config is not None
+                and covr_runtime_config.contextual):
+            covr_assignment = covr_trajectory.bandit_assignment
+            # Efficiency-aware reward: write the measured per-trajectory FLOPs
+            # ratio (full-trajectory decisions, prefix+suffix) into the feedback
+            # sink. _bandit_feedback combines it with terminal fidelity as
+            # combined = terminal_MSE + lambda * cost (lambda from config).
+            if covr_feedback_sink is not None and teacache_state is not None:
+                decisions = teacache_state.get("decisions", [])
+                n_calc = sum(1 for d in decisions if d == "calc")
+                n_skip = sum(1 for d in decisions if d == "skip")
+                total_steps = n_calc + n_skip
+                if total_steps > 0:
+                    flops_metric = metrics.get("flops")
+                    flops_full = getattr(flops_metric, "_flops_full", 0.0)
+                    flops_skip = getattr(flops_metric, "_flops_skip", 0.0)
+                    if flops_full > 0.0:
+                        measured = (n_calc * flops_full
+                                    + n_skip * flops_skip)
+                        vanilla = total_steps * flops_full
+                        cost_ratio = measured / vanilla if vanilla > 0 else 1.0
+                    else:
+                        # FLOPs not profiled for this run: approximate a skip as
+                        # free so the cost term still favors aggressive arms.
+                        cost_ratio = n_calc / total_steps
+                    covr_feedback_sink["measured_cost_ratio"] = float(cost_ratio)
 
         # Pending safety observations are converted at the batch boundary
         # (tensors are still on the accelerator); the runtime materializes

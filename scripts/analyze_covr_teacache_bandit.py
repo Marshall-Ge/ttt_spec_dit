@@ -39,8 +39,13 @@ def _load_object(path: Path) -> Dict[str, Any]:
 
 
 def _write_csv(path: Path, fieldnames: Sequence[str], rows: Iterable[Mapping]):
+    # extrasaction='ignore' so each CSV's fieldnames is a curated projection of
+    # the row dicts (e.g. reward_observations omits the raw context vector that
+    # only context_observations.csv expands). restval writes an empty cell for
+    # keys a row does not carry (e.g. shorter context vectors).
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(
+            handle, fieldnames=fieldnames, extrasaction="ignore", restval="")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -150,6 +155,14 @@ def analyze_state(
         if joint_propensity <= 0.0:
             invalid_feedback += 1
             continue
+        # Contextual telemetry (None on non-contextual states). The context
+        # vector and the efficiency cost are carried alongside the reward so
+        # context_observations.csv can correlate per-trajectory features with
+        # the chosen arm, its loss, and its measured FLOPs ratio.
+        context = assignment.get("context")
+        terminal_efficiency_loss = _finite_float(
+            row.get("terminal_efficiency_loss"))
+        combined_loss = _finite_float(row.get("combined_loss"))
         reward_rows.append({
             "trajectory_id": trajectory_id,
             "prequential_index": int(assignment["prequential_index"]),
@@ -161,6 +174,9 @@ def analyze_state(
             "joint_propensity": joint_propensity,
             "arm_snips_weight": 1.0 / joint_propensity,
             "policy_weight": 1.0 / sentinel_propensity,
+            "context": list(context) if context is not None else None,
+            "terminal_efficiency_loss": terminal_efficiency_loss,
+            "combined_loss": combined_loss,
         })
 
     reward_rows.sort(key=lambda row: row["prequential_index"])
@@ -260,6 +276,65 @@ def analyze_state(
     best_static_id = min(valid_static, key=valid_static.get) if valid_static else None
     best_static_loss = valid_static.get(best_static_id) if best_static_id else None
 
+    # ---- Contextual (deferred-commit LinUCB) telemetry ---------------------
+    # Detected by schema version >= 2 (the contextual bandit) or by any
+    # assignment carrying a context vector. The IPS policy-value estimate is
+    # computed the same way as the non-contextual path (per-trajectory
+    # propensity is logged at commit time), so the existing policy_loss /
+    # best_static_loss ARE the contextual-policy-vs-best-static comparison;
+    # we surface them under contextual names and add the LinUCB diagnostics.
+    is_contextual = (
+        int(state.get("schema_version", 1)) >= 2
+        or any(row.get("context") is not None for row in reward_rows))
+    context_dim = _finite_float(state.get("context_dim"))
+    linucb_alpha = _finite_float(state.get("linucb_alpha"))
+    run_identity = state.get("run_identity", {}) or {}
+    prefix_steps = _finite_float(run_identity.get("prefix_steps"))
+    efficiency_lambda = _finite_float(run_identity.get("efficiency_lambda"))
+    linucb_theta_norm: Dict[str, Optional[float]] = {}
+    linucb_state = state.get("linucb") or {}
+    for arm_id in arm_ids:
+        entry = linucb_state.get(arm_id)
+        if not entry or "A" not in entry or "b" not in entry:
+            linucb_theta_norm[arm_id] = None
+            continue
+        try:
+            a_mat = np.asarray(entry["A"], dtype=np.float64)
+            b_vec = np.asarray(entry["b"], dtype=np.float64)
+            theta = np.linalg.solve(a_mat, b_vec)
+            linucb_theta_norm[arm_id] = float(np.linalg.norm(theta))
+        except (np.linalg.LinAlgError, ValueError):
+            linucb_theta_norm[arm_id] = None
+    # context_observations: one row per rewarded trajectory with its context
+    # vector expanded into named columns (c0..cN-1). Only emitted when the run
+    # actually produced contexts; downstream tooling treats absence as
+    # "non-contextual state".
+    context_rows: List[Dict[str, Any]] = []
+    context_width = 0
+    if is_contextual:
+        for row in reward_rows:
+            ctx = row.get("context")
+            if ctx is None:
+                continue
+            context_width = max(context_width, len(ctx))
+        for row in reward_rows:
+            ctx = row.get("context") or []
+            base = {
+                "trajectory_id": row["trajectory_id"],
+                "prequential_index": row["prequential_index"],
+                "arm_id": row["arm_id"],
+                "loss": row["loss"],
+                "terminal_efficiency_loss": row.get("terminal_efficiency_loss"),
+                "combined_loss": row.get("combined_loss"),
+                "assignment_propensity": row["assignment_propensity"],
+            }
+            for idx in range(context_width):
+                base[f"c{idx}"] = float(ctx[idx]) if idx < len(ctx) else None
+            context_rows.append(base)
+    distinct_theta_norms = {
+        value for value in linucb_theta_norm.values()
+        if value is not None}
+
     first_window = [row for row in timeline_rows if row["window_index"] == 0]
     last_window = [row for row in timeline_rows
                    if row["window_index"] == num_windows - 1]
@@ -280,7 +355,7 @@ def analyze_state(
         return float(-(positive * np.log(positive)).sum() / math.log(len(arm_ids)))
 
     summary = {
-        "schema_version": 1,
+        "schema_version": int(state.get("schema_version", 1)),
         "session_id": state.get("session_id"),
         "manifest_hash": state.get("manifest_hash"),
         "baseline_arm_id": baseline_id,
@@ -324,11 +399,35 @@ def analyze_state(
             "effective sample sizes before claiming online gain."),
         "per_image_crossover_identifiable": False,
         "pairwise_metric": "observed_unpaired_probability_left_loss_is_lower",
-        "policy_scope": "per-image assignment, non-contextual epsilon-greedy",
+        "policy_scope": (
+            "contextual LinUCB (deferred-commit)" if is_contextual
+            else "per-image assignment, non-contextual epsilon-greedy"),
         "policy_scope_warning": (
+            "The contextual policy selects the arm from a causal-prefix context "
+            "after a forced-calc prefix; the IPS policy value below compares it "
+            "to the best static arm. Per-image counterfactuals for unselected "
+            "arms remain unidentified, so the gain is an IPS policy-value "
+            "comparison, not an oracle." if is_contextual else
             "The current bandit learns a global arm mean. Batch size 1 makes "
             "the assignment and reward per-image, but it does not condition "
             "selection on image features."),
+        "contextual": bool(is_contextual),
+        "context_dim": (int(context_dim) if context_dim is not None else None),
+        "prefix_steps": (int(prefix_steps) if prefix_steps is not None else None),
+        "efficiency_lambda": efficiency_lambda,
+        "linucb_alpha": linucb_alpha,
+        "linucb_theta_norm": linucb_theta_norm,
+        "linucb_theta_norms_distinct": (
+            len(distinct_theta_norms) > 1 if distinct_theta_norms else False),
+        "context_observations": len(context_rows),
+        # Contextual gain vs best static arm (IPS policy value vs best static
+        # SNIPS). Same estimator as the non-contextual path; surfaced under a
+        # contextual name so reports name what they measure.
+        "contextual_policy_loss_ips": policy_loss if is_contextual else None,
+        "estimated_contextual_gain_vs_best_static": (
+            (best_static_loss - policy_loss) if is_contextual
+            and best_static_loss is not None and policy_loss is not None
+            else None),
         "arms": arm_rows,
         "pairwise": pairwise_matrix,
     }
@@ -337,6 +436,7 @@ def analyze_state(
         "arm_share_timeline": timeline_rows,
         "reward_observations": reward_rows,
         "pairwise_probability": pairwise_rows,
+        "context_observations": context_rows,
     }
     return summary, tables
 
@@ -487,6 +587,7 @@ def main() -> int:
             "trajectory_id", "prequential_index", "arm_id", "loss",
             "reward_kind", "assignment_propensity", "sentinel_propensity",
             "joint_propensity", "arm_snips_weight", "policy_weight",
+            "terminal_efficiency_loss", "combined_loss",
         ],
         tables["reward_observations"],
     )
@@ -498,6 +599,25 @@ def main() -> int:
         ],
         tables["pairwise_probability"],
     )
+    context_rows = tables.get("context_observations", [])
+    if context_rows:
+        # Context columns are c0..cN-1; width is the max across observed rows.
+        context_width = max(
+            (1 + max(
+                (int(key[1:]) for key in row if key.startswith("c")
+                 and key[1:].isdigit()),
+                default=-1))
+            for row in context_rows)
+        context_fields = (
+            ["trajectory_id", "prequential_index", "arm_id", "loss",
+             "terminal_efficiency_loss", "combined_loss",
+             "assignment_propensity"]
+            + [f"c{idx}" for idx in range(context_width)])
+        _write_csv(
+            args.output_dir / "context_observations.csv",
+            context_fields,
+            context_rows,
+        )
 
     plots = [] if args.no_plots else _plot_reports(args.output_dir, summary, tables)
     summary["plots_generated"] = plots
@@ -514,6 +634,16 @@ def main() -> int:
     print(f"baseline arm: {summary['baseline_arm_id']}")
     print("estimated gain vs baseline: "
           f"{summary['estimated_online_gain_vs_baseline']}")
+    if summary.get("contextual"):
+        print(f"policy scope: {summary['policy_scope']}")
+        print(f"context_dim: {summary['context_dim']} "
+              f"prefix_steps: {summary['prefix_steps']} "
+              f"efficiency_lambda: {summary['efficiency_lambda']}")
+        print(f"linucb theta norms distinct: "
+              f"{summary['linucb_theta_norms_distinct']} "
+              f"({summary['linucb_theta_norm']})")
+        print("estimated contextual gain vs best static: "
+              f"{summary['estimated_contextual_gain_vs_best_static']}")
     print(f"wrote report -> {args.output_dir}")
     return 0
 

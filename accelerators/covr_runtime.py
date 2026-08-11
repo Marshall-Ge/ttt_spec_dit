@@ -27,11 +27,45 @@ from .covr import ActionAuditRecorder, COVRVersion
 from .covr_bandit import (
     AccelerationStrategy,
     ConservativeTemplateBandit,
+    ContextualLinUCBBandit,
     StrategyManifest,
     TemplateAssignment,
     TemplateFeedback,
     TemplateManifest,
 )
+
+# Width of the per-step causal-prefix feature vector produced by
+# ``covr_viability.extract_prefix_features`` (4 stats x {latent, noise, delta}
+# + cosine + relative L1 = 14). The full context is this width times the
+# number of forced-calc prefix steps, concatenated in canonical key order.
+PREFIX_FEATURE_WIDTH: int = 14
+
+
+def flatten_prefix_features(
+        feature_rows: Sequence[Mapping[str, float]]) -> List[float]:
+    """Flatten K per-step feature dicts into one LinUCB context vector.
+
+    Canonical key order is the sorted union of the first row's keys; every row
+    must share that exact key set. Returns a length-``K * PREFIX_FEATURE_WIDTH``
+    list of finite floats, suitable for ``ContextualLinUCBBandit.commit_arm``.
+    """
+    if not feature_rows:
+        raise ValueError("prefix feature buffer is empty")
+    canonical = sorted(feature_rows[0].keys())
+    if len(canonical) != PREFIX_FEATURE_WIDTH:
+        raise ValueError(
+            f"expected {PREFIX_FEATURE_WIDTH} prefix features per step, "
+            f"got {len(canonical)}")
+    vector: List[float] = []
+    for row in feature_rows:
+        if sorted(row.keys()) != canonical:
+            raise ValueError("inconsistent prefix feature keys across steps")
+        for key in canonical:
+            value = float(row[key])
+            if not math.isfinite(value):
+                raise ValueError(f"prefix feature {key!r} is not finite")
+            vector.append(value)
+    return vector
 from .registry import get_adapter, is_registered
 from .strategy_dispatch import apply_strategy
 from run_dit_shared import (
@@ -102,6 +136,15 @@ class COVRRuntimeConfig:
     sentinel_horizon: int
     seed: int
     bandit_prior_penalty: float = 0.0
+    # Deferred-commit contextual bandit (experimental). When ``contextual`` is
+    # True the runtime opens a *pending* trajectory, the loop runs a forced-calc
+    # prefix of ``prefix_steps`` denoise steps, extracts a causal-prefix context
+    # vector, and ``commit_arm`` selects the arm. ``efficiency_lambda`` blends a
+    # measured-FLOPs cost into the reward (0.0 = pure terminal fidelity).
+    contextual: bool = False
+    prefix_steps: int = 0
+    efficiency_lambda: float = 0.0
+    linucb_alpha: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -121,6 +164,11 @@ class COVRPolicyBackend(Protocol):
 
     def begin_trajectory(
             self, trajectory_id: int, sample_count: int) -> BackendSelection:
+        ...
+
+    def commit_arm(
+            self, trajectory_id: int,
+            context: Sequence[float]) -> BackendSelection:
         ...
 
     def observe_one_step(
@@ -157,6 +205,13 @@ class ForcedStrategyBackend:
         del trajectory_id, sample_count
         return BackendSelection(strategy=self._strategy, assignment=None)
 
+    def commit_arm(
+            self, trajectory_id: int,
+            context: Sequence[float]) -> BackendSelection:
+        del trajectory_id, context
+        raise NotImplementedError(
+            "commit_arm is only supported by the contextual bandit backend")
+
     def observe_one_step(
             self, trajectory_id: int, step_idx: int,
             numerators: Sequence[float], denominators: Sequence[float]) -> None:
@@ -192,6 +247,31 @@ class ExperimentalBanditBackend:
             self, trajectory_id: int, sample_count: int) -> BackendSelection:
         assignment = self.bandit.begin_trajectory(
             trajectory_id, sample_count=sample_count)
+        # A deferred-commit contextual trajectory opens *pending*: the arm is
+        # chosen later by ``commit_arm``, so ``active_strategy`` has no strategy
+        # to return yet. The runtime installs a synthetic all-calc prefix
+        # strategy in that case; return ``strategy=None`` here so it can.
+        if assignment.template_id is None:
+            return BackendSelection(strategy=None, assignment=assignment)
+        return BackendSelection(
+            strategy=self.bandit.active_strategy,
+            assignment=assignment,
+        )
+
+    def commit_arm(
+            self, trajectory_id: int,
+            context: Sequence[float]) -> BackendSelection:
+        """Commit the deferred arm for a contextual trajectory.
+
+        Routes to the wrapped bandit's ``commit_arm``. The non-contextual
+        bandit selects its arm in ``begin_trajectory`` and its ``commit_arm``
+        raises ``NotImplementedError``; ``getattr`` keeps this backend compatible
+        with both bandit flavours so the runtime does not branch on type.
+        """
+        if not getattr(self.bandit, "is_contextual", False):
+            raise RuntimeError(
+                "deferred-commit requires a contextual bandit backend")
+        assignment = self.bandit.commit_arm(trajectory_id, context)
         return BackendSelection(
             strategy=self.bandit.active_strategy,
             assignment=assignment,
@@ -262,6 +342,10 @@ class COVRTrajectoryAssignment:
         default_factory=COVRTrajectoryFeedback)
     accelerator_states: Dict[str, Any] = field(default_factory=dict)
     profiler: Any = None
+    # Deferred-commit contextual bandit: the loop buffers one feature dict per
+    # forced-calc prefix step and commits the arm after ``prefix_steps`` steps.
+    prefix_steps: int = 0
+    prefix_feature_buffer: List[Dict[str, float]] = field(default_factory=list)
 
 
 @dataclass
@@ -310,6 +394,7 @@ class COVRRuntime:
         self.session_id = str(
             session_id or getattr(config, "session_id", None) or "")
         self._closed = False
+        self._prefix_strategy_cache: Optional[AccelerationStrategy] = None
 
     # ------------------------------------------------------------------
     # Factory
@@ -396,7 +481,17 @@ class COVRRuntime:
             self, manifest: Any, session_id: str, epsilon: float, seed: int,
             run_identity: Mapping[str, Any],
             state_path: str) -> ExperimentalBanditBackend:
-        if isinstance(manifest, StrategyManifest):
+        if self.config.contextual:
+            context_dim = PREFIX_FEATURE_WIDTH * int(self.config.prefix_steps)
+            if context_dim <= 0:
+                raise ValueError(
+                    "contextual bandit requires prefix_steps > 0")
+            bandit = ContextualLinUCBBandit.from_strategies(
+                manifest, session_id=session_id, context_dim=context_dim,
+                epsilon=epsilon, seed=seed, alpha=self.config.linucb_alpha,
+                run_identity=run_identity,
+                alternative_prior_penalty=self.config.bandit_prior_penalty)
+        elif isinstance(manifest, StrategyManifest):
             bandit = ConservativeTemplateBandit.from_strategies(
                 manifest, session_id=session_id, epsilon=epsilon, seed=seed,
                 run_identity=run_identity,
@@ -488,10 +583,24 @@ class COVRRuntime:
 
         selection = self.backend.begin_trajectory(
             trajectory_id, sample_count=int(sample_count))
+        # Deferred-commit contextual mode: the backend opens a *pending*
+        # trajectory (template_id=None, strategy=None). Install a synthetic
+        # all-calc prefix strategy so the loop's apply_acceleration_strategy
+        # initializes a TeaCache state with a forced-calc refresh mask for the
+        # first ``prefix_steps`` denoise steps. commit_arm swaps in the chosen
+        # threshold arm and the loop mutates the mask off mid-trajectory.
+        contextual_pending = (
+            self.config.contextual and selection.assignment is not None
+            and selection.assignment.template_id is None)
+        prefix_strategy = (
+            self._contextual_prefix_strategy() if contextual_pending else None)
+        effective_strategy = (
+            prefix_strategy if prefix_strategy is not None
+            else selection.strategy)
         assignment = COVRTrajectoryAssignment(
             trajectory_id=trajectory_id,
             sample_count=int(sample_count),
-            strategy=selection.strategy,
+            strategy=effective_strategy,
             bandit_assignment=selection.assignment,
             sentinel_selected=sentinel_selected,
             sentinel_start_idx=sentinel_start_idx,
@@ -511,10 +620,66 @@ class COVRRuntime:
             template_id=(
                 selection.assignment.template_id
                 if selection.assignment is not None
-                else selection.strategy.strategy_id
-                if selection.strategy is not None else None),
+                else effective_strategy.strategy_id
+                if effective_strategy is not None else None),
         )
         return assignment
+
+    def _contextual_prefix_strategy(self) -> AccelerationStrategy:
+        """All-calc TeaCache strategy used during the deferred-commit prefix.
+
+        Forced to ``True`` for every step so the prefix recomputes the full
+        block stack and caches a fresh residual each step; ``commit_arm`` drops
+        the mask (``refresh_mask=None``) and sets the chosen arm's
+        ``rel_l1_thresh`` so the dynamic accumulate-vs-threshold path resumes
+        from step ``prefix_steps`` onward. Built lazily and cached.
+        """
+        if self._prefix_strategy_cache is None:
+            if not isinstance(self.backend, ExperimentalBanditBackend):
+                raise RuntimeError(
+                    "contextual prefix requires a bandit backend")
+            manifest = self.backend.bandit.manifest
+            strategies = getattr(manifest, "strategies", None) or []
+            if not strategies:
+                raise RuntimeError(
+                    "contextual prefix requires a non-empty strategy manifest")
+            method = strategies[0].method
+            num_steps = int(self.version.num_steps)
+            if num_steps <= 0:
+                raise RuntimeError(
+                    "contextual prefix requires a positive num_steps version")
+            self._prefix_strategy_cache = AccelerationStrategy(
+                strategy_id="__contextual_prefix__",
+                method=method,
+                params={"refresh_mask": tuple([True] * num_steps)},
+                modeled_flops=0.0,
+                source="contextual-prefix",
+            )
+        return self._prefix_strategy_cache
+
+    def commit_arm(
+            self, trajectory: COVRTrajectoryAssignment,
+            context: Sequence[float]) -> BackendSelection:
+        """Select the deferred arm from a causal-prefix context vector.
+
+        Refreshes ``trajectory.strategy``, ``trajectory.bandit_assignment`` and
+        ``trajectory.template_id`` to the committed arm so the rest of the loop
+        (results dict, FLOPs attribution, end_trajectory feedback) sees the
+        chosen arm. The loop is responsible for mutating the live TeaCache
+        state (mask off, threshold on) from the returned strategy's params.
+        """
+        if self.backend is None:
+            raise RuntimeError("commit_arm requires an active backend")
+        if trajectory.bandit_assignment is None:
+            raise RuntimeError(
+                "commit_arm requires an open (pending) trajectory")
+        selection = self.backend.commit_arm(trajectory.trajectory_id, context)
+        trajectory.strategy = selection.strategy
+        trajectory.bandit_assignment = selection.assignment
+        trajectory.template_id = (
+            selection.assignment.template_id
+            if selection.assignment is not None else None)
+        return selection
 
     def apply_acceleration_strategy(
             self, trajectory: COVRTrajectoryAssignment,
@@ -846,12 +1011,19 @@ class COVRRuntime:
             scalar_loss = sink.pop("terminal_fidelity_loss", None)
             if scalar_loss is not None:
                 terminal_fidelity_loss = float(scalar_loss)
+        # Efficiency-aware reward: normalized measured FLOPs ratio (∈[0,1])
+        # written by the loop after generate(). None when the trajectory did
+        # not produce one (legacy / non-contextual path).
+        measured_cost_ratio = sink.pop("measured_cost_ratio", None)
+        if measured_cost_ratio is not None:
+            measured_cost_ratio = float(measured_cost_ratio)
         return {
             "terminal_fidelity_loss": terminal_fidelity_loss,
             "h_step_numerator": h_step_numerator,
             "h_step_denominator": h_step_denominator,
             "safety_full_steps": int(sink.get("safety_full_steps", 0)),
             "terminal_full_steps": int(sink.get("terminal_full_steps", 0)),
+            "measured_cost_ratio": measured_cost_ratio,
         }
 
     def _profile_bucket_summary(
@@ -869,6 +1041,30 @@ class COVRRuntime:
         for stage, seconds in profile.items():
             totals[stage] = totals.get(stage, 0.0) + float(seconds)
             counts[stage] = counts.get(stage, 0) + 1
+
+    def _efficiency_labels(
+            self, terminal_fidelity_loss: float,
+            materialized: Mapping[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+        """Combine terminal fidelity with the measured cost ratio.
+
+        Returns ``(terminal_efficiency_loss, combined_loss)`` for the
+        ``TemplateFeedback`` schema. ``terminal_efficiency_loss`` is the raw
+        normalized cost (∈[0,1]); ``combined_loss`` is what the bandit actually
+        minimizes: ``terminal_fidelity + lambda * cost``. Both are None when no
+        cost was recorded (legacy / non-contextual terminal sentinel), so the
+        bandit falls back to pure terminal fidelity.
+        """
+        cost = materialized.get("measured_cost_ratio")
+        if cost is None:
+            return None, None
+        cost = float(cost)
+        if not math.isfinite(cost) or cost < 0.0:
+            raise ValueError("measured_cost_ratio must be finite and non-negative")
+        lam = float(self.config.efficiency_lambda)
+        if not math.isfinite(lam) or lam < 0.0:
+            raise ValueError("efficiency_lambda must be finite and non-negative")
+        combined = float(terminal_fidelity_loss) + lam * cost
+        return cost, combined
 
     def _bandit_feedback(
             self, trajectory: COVRTrajectoryAssignment,
@@ -890,13 +1086,17 @@ class COVRRuntime:
             if materialized["terminal_fidelity_loss"] is None:
                 raise RuntimeError(
                     "terminal sentinel did not produce feedback")
+            terminal_loss = float(materialized["terminal_fidelity_loss"])
+            efficiency_loss, combined_loss = self._efficiency_labels(
+                terminal_loss, materialized)
             return TemplateFeedback(
                 trajectory_id=trajectory.trajectory_id,
                 template_id=trajectory.bandit_assignment.template_id,
                 sentinel_propensity=float(sentinel_propensity),
                 horizon=int(horizon),
-                terminal_fidelity_loss=float(
-                    materialized["terminal_fidelity_loss"]),
+                terminal_fidelity_loss=terminal_loss,
+                terminal_efficiency_loss=efficiency_loss,
+                combined_loss=combined_loss,
             )
         if (materialized["h_step_numerator"] is None
                 or materialized["h_step_denominator"] is None):
@@ -1113,6 +1313,25 @@ def validate_covr_capabilities(args: Any) -> None:
         if not math.isfinite(prior_penalty) or prior_penalty < 0.0:
             raise ValueError(
                 "--covr-bandit-prior-penalty must be finite and non-negative")
+    if getattr(args, "covr_contextual_bandit", False):
+        if not getattr(args, "covr_strategy_bandit", False):
+            raise ValueError(
+                "--covr-contextual-bandit requires --covr-strategy-bandit")
+        prefix_steps = int(getattr(args, "covr_prefix_steps", 3))
+        num_steps = int(getattr(args, "num_steps", 0))
+        if prefix_steps <= 0:
+            raise ValueError("--covr-prefix-steps must be positive")
+        if num_steps <= 0 or prefix_steps >= num_steps:
+            raise ValueError(
+                "--covr-prefix-steps must be smaller than --num-steps")
+        lam = float(getattr(args, "covr_efficiency_lambda", 0.0))
+        if not math.isfinite(lam) or lam < 0.0:
+            raise ValueError(
+                "--covr-efficiency-lambda must be finite and non-negative")
+        alpha = float(getattr(args, "covr_linucb_alpha", 1.0))
+        if not math.isfinite(alpha) or alpha < 0.0:
+            raise ValueError(
+                "--covr-linucb-alpha must be finite and non-negative")
 
 
 def _resolve_mode(args: Any) -> COVRMode:
@@ -1183,6 +1402,10 @@ def build_covr_runtime_config(
         seed=int(getattr(args, "seed", 0)),
         bandit_prior_penalty=float(
             getattr(args, "covr_bandit_prior_penalty", 0.0)),
+        contextual=bool(getattr(args, "covr_contextual_bandit", False)),
+        prefix_steps=int(getattr(args, "covr_prefix_steps", 0)),
+        efficiency_lambda=float(getattr(args, "covr_efficiency_lambda", 0.0)),
+        linucb_alpha=float(getattr(args, "covr_linucb_alpha", 1.0)),
     )
 
 
