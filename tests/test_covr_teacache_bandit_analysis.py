@@ -211,6 +211,38 @@ def _contextual_fixtures():
     return state, manifest
 
 
+def test_contextual_analysis_reports_combined_dimension():
+    # _contextual_fixtures populates combined_loss = fid + 1e-3*cost, so the
+    # combined dimension (the bandit's actual objective) is analyzable and
+    # should mirror the fidelity SNIPS/best-static/gain structure.
+    state, manifest = _contextual_fixtures()
+    summary, _ = analyze_state(state, manifest, window_size=3)
+    assert summary["combined_loss_available"] is True
+    # baseline combined SNIPS = weighted_mean([0.1004, 0.1204]) = 0.1104 beats
+    # thresh_0p35 (0.20065), so best static on combined is baseline too.
+    assert summary["best_static_arm_id_in_sample_combined"] == "baseline"
+    assert summary["best_static_combined_loss_snips_in_sample"] == \
+        pytest.approx(0.1104, rel=1e-4)
+    assert summary["contextual_policy_combined_loss_ips"] is not None
+    assert summary["policy_combined_loss_effective_sample_size"] > 0.0
+    assert summary["estimated_contextual_gain_vs_best_static_combined"] is not None
+
+
+def test_combined_dimension_unavailable_when_no_measured_cost():
+    # A pure-fidelity probe (lambda=0 or FLOPs not profiled) leaves combined_loss
+    # null; the analyzer must report the dimension unavailable rather than
+    # fabricate a gain.
+    state, manifest = _contextual_fixtures()
+    for fb in state["feedback"]:
+        fb["combined_loss"] = None
+        fb["terminal_efficiency_loss"] = None
+    summary, _ = analyze_state(state, manifest, window_size=3)
+    assert summary["combined_loss_available"] is False
+    assert summary["contextual_policy_combined_loss_ips"] is None
+    assert summary["best_static_arm_id_in_sample_combined"] is None
+    assert summary["estimated_contextual_gain_vs_best_static_combined"] is None
+
+
 def test_contextual_analysis_reports_contextual_diagnostics():
     state, manifest = _contextual_fixtures()
 

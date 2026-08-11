@@ -92,6 +92,51 @@ def _probability_superiority(left: np.ndarray, right: np.ndarray) -> Optional[fl
     return wins / float(left.size * right.size)
 
 
+def _dimension_stats(
+        reward_rows: List[Mapping[str, Any]],
+        loss_key: str,
+        arm_ids: List[str]) -> Dict[str, Any]:
+    """Per-arm SNIPS + contextual-policy IPS value for one loss dimension.
+
+    Mirrors the fidelity SNIPS/policy/best-static logic but reads ``loss_key``
+    from each reward row, skipping rows where that dimension is absent. Used
+    for the efficiency-aware ``combined`` dimension (terminal_fidelity +
+    lambda*measured_cost) so the analyzer can report whether the bandit's
+    *actual* objective yields a contextual gain even when pure terminal
+    fidelity shows no per-image crossover. Returns ``available=False`` when no
+    row carries the key (a pure-fidelity probe with no measured cost).
+    """
+    rewards_by_arm: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
+    for row in reward_rows:
+        if row.get(loss_key) is None:
+            continue
+        rewards_by_arm[row["arm_id"]].append(row)
+    arm_snips: Dict[str, Optional[float]] = {}
+    for arm_id in arm_ids:
+        rows = rewards_by_arm.get(arm_id, [])
+        losses = np.asarray([row[loss_key] for row in rows], dtype=np.float64)
+        weights = np.asarray(
+            [row["arm_snips_weight"] for row in rows], dtype=np.float64)
+        arm_snips[arm_id] = _weighted_mean(losses, weights)
+    valid = {key: value for key, value in arm_snips.items()
+             if value is not None}
+    best_static_id = min(valid, key=valid.get) if valid else None
+    best_static_loss = valid.get(best_static_id) if best_static_id else None
+    policy_rows = [row for row in reward_rows if row.get(loss_key) is not None]
+    policy_values = np.asarray(
+        [row[loss_key] for row in policy_rows], dtype=np.float64)
+    policy_weights = np.asarray(
+        [row["policy_weight"] for row in policy_rows], dtype=np.float64)
+    return {
+        "available": bool(policy_rows),
+        "arm_snips": arm_snips,
+        "best_static_id": best_static_id,
+        "best_static_loss": best_static_loss,
+        "policy_loss": _weighted_mean(policy_values, policy_weights),
+        "policy_ess": _effective_sample_size(policy_weights),
+    }
+
+
 def _manifest_metadata(manifest: Optional[Mapping[str, Any]]) -> Dict[str, Dict]:
     if manifest is None:
         return {}
@@ -276,6 +321,11 @@ def analyze_state(
     best_static_id = min(valid_static, key=valid_static.get) if valid_static else None
     best_static_loss = valid_static.get(best_static_id) if best_static_id else None
 
+    # Efficiency-aware combined dimension (the bandit's actual objective):
+    # SNIPS/best-static/policy-gain recomputed on combined_loss so the Pareto
+    # thesis can be checked independently of pure terminal fidelity.
+    combined_dim = _dimension_stats(reward_rows, "combined_loss", arm_ids)
+
     # ---- Contextual (deferred-commit LinUCB) telemetry ---------------------
     # Detected by schema version >= 2 (the contextual bandit) or by any
     # assignment carrying a context vector. The IPS policy-value estimate is
@@ -428,6 +478,36 @@ def analyze_state(
             (best_static_loss - policy_loss) if is_contextual
             and best_static_loss is not None and policy_loss is not None
             else None),
+        # Efficiency-aware combined dimension: does the contextual policy beat
+        # the best static arm on the objective the bandit actually minimizes
+        # (combined = terminal_fidelity + lambda*measured_cost)? A positive
+        # gain here is the Pareto-thesis signal; None when the state carries no
+        # measured cost (a pure-fidelity probe, or FLOPs not profiled).
+        "combined_loss_available": combined_dim["available"],
+        "contextual_policy_combined_loss_ips": (
+            combined_dim["policy_loss"] if is_contextual else None),
+        "policy_combined_loss_effective_sample_size": (
+            combined_dim["policy_ess"] if is_contextual else None),
+        "best_static_arm_id_in_sample_combined": (
+            combined_dim["best_static_id"] if is_contextual else None),
+        "best_static_combined_loss_snips_in_sample": (
+            combined_dim["best_static_loss"] if is_contextual else None),
+        "estimated_contextual_gain_vs_best_static_combined": (
+            (combined_dim["best_static_loss"] - combined_dim["policy_loss"])
+            if is_contextual and combined_dim["available"]
+            and combined_dim["best_static_loss"] is not None
+            and combined_dim["policy_loss"] is not None else None),
+        "combined_dimension_note": (
+            "combined_loss = terminal_fidelity + efficiency_lambda * "
+            "measured_cost_ratio (the bandit's actual objective). A positive "
+            "gain means the contextual policy beats the best static arm on the "
+            "efficiency-aware objective, not on pure fidelity; SNIPS variance "
+            "is high, so inspect policy_combined_loss_effective_sample_size "
+            "before claiming gain."
+            if combined_dim["available"]
+            else "combined_loss unavailable: the state carries no measured "
+            "cost (terminal_efficiency_loss/combined_loss are null). Run with "
+            "efficiency_lambda > 0 and a FLOPs metric to populate it."),
         "arms": arm_rows,
         "pairwise": pairwise_matrix,
     }
