@@ -220,6 +220,19 @@ Examples:
                              "a terminal full-reference rollout")
     parser.add_argument("--covr-profile-stages", action="store_true", default=False,
                         help="Record per-stage generation timings with CUDA events")
+    parser.add_argument("--covr-timestep-feedback", action="store_true",
+                        default=False,
+                        help="Shadow-only session-level timestep feedback "
+                             "learner (one-step defect target)")
+    parser.add_argument("--covr-timestep-feedback-budget", type=int, default=8,
+                        help="Refresh budget for timestep feedback shadow "
+                             "controller (default: 8)")
+    parser.add_argument("--covr-timestep-feedback-state", type=str, default=None,
+                        help="Persisted timestep feedback state path")
+    parser.add_argument("--covr-timestep-feedback-p-min", type=float, default=0.02,
+                        help="Minimum refresh exploration propensity")
+    parser.add_argument("--covr-timestep-feedback-beta", type=float, default=1.0,
+                        help="Timestep feedback UCB coefficient")
     # ---- TTT (Test-Time Training plugin, DiT-only) ----
     parser.add_argument("--ttt", action="store_true", default=False,
                         help="Enable online TTT plugin on top of TeaCache "

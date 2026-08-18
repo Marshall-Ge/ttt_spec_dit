@@ -113,14 +113,12 @@ def main() -> int:
             print(f"  Best arm there: {ranked[0]['label']} "
                   f"(FID {ranked[0]['fid']:.2f}); worst: "
                   f"{ranked[-1]['label']} (FID {ranked[-1]['fid']:.2f}).")
-        print("  => Hypothesis A SURVIVES: mask placement matters once the "
-              "cache is overdrawn. Next gate is NOT a bandit run — it is the "
-              "reward repair (hypothesis C): confirm the reward proxy ranks "
-              "these arms the same way FID does. A bandit whose reward can't "
-              "see this spread will still converge to one arm.")
-        print("  Also check: does the best arm win for ALL classes, or do "
-              "classes disagree? One globally dominant arm means pick it "
-              "offline; the bandit only earns its keep on crossover.")
+        print("  => STATIC PLACEMENT EFFECT: mask placement matters at this "
+              "budget, but this is not evidence for an adaptive controller.")
+        print("  Use paired FID/IS and held-out schedule comparisons to select "
+              "an offline policy. Do not start a bandit from this arm spread; "
+              "adaptive selection still requires a valid per-trajectory "
+              "crossover signal and a multi-metric gate.")
     elif ties and all(v[1] == "tie" for v in verdicts):
         harshest = min(v[0] for v in verdicts)
         print(f"  Arms TIE at every budget tested, down to calc="

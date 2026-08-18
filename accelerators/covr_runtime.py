@@ -1282,6 +1282,7 @@ def covr_requested(args: Any) -> bool:
         or getattr(args, "covr_strategy_bandit", False)
         or getattr(args, "covr_force_strategy_id", None)
         or getattr(args, "covr_strategy_manifest", None)
+        or getattr(args, "covr_timestep_feedback", False)
     )
 
 
@@ -1298,6 +1299,33 @@ def validate_covr_capabilities(args: Any) -> None:
     method = getattr(args, "method", None)
     if getattr(args, "covr_shadow", False) and method != "speca":
         raise ValueError("COVR shadow audit requires --method speca")
+    if getattr(args, "covr_timestep_feedback", False):
+        if not getattr(args, "covr_shadow", False):
+            raise ValueError(
+                "--covr-timestep-feedback requires --covr-shadow")
+        if method != "speca":
+            raise ValueError(
+                "timestep feedback shadow requires method='speca'")
+        if (getattr(args, "covr_template_bandit", False)
+                or getattr(args, "covr_strategy_bandit", False)
+                or getattr(args, "covr_force_template_id", None)
+                or getattr(args, "covr_force_strategy_id", None)):
+            raise ValueError(
+                "timestep feedback shadow cannot combine with a COVR strategy "
+                "selection mode")
+        budget = int(getattr(args, "covr_timestep_feedback_budget", 0))
+        num_steps = int(getattr(args, "num_steps", 0))
+        if budget < 0 or budget > num_steps:
+            raise ValueError(
+                "--covr-timestep-feedback-budget must be in [0, num_steps]")
+        p_min = float(getattr(args, "covr_timestep_feedback_p_min", 0.0))
+        if not math.isfinite(p_min) or not 0.0 < p_min <= 1.0:
+            raise ValueError(
+                "--covr-timestep-feedback-p-min must be in (0, 1]")
+        beta = float(getattr(args, "covr_timestep_feedback_beta", -1.0))
+        if not math.isfinite(beta) or beta < 0.0:
+            raise ValueError(
+                "--covr-timestep-feedback-beta must be non-negative")
     if (getattr(args, "covr_template_bandit", False)
             or getattr(args, "covr_force_template_id", None)) and method != "speca":
         raise ValueError(

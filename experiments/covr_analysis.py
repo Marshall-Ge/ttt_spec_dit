@@ -403,11 +403,15 @@ def evaluate_action_audit_integrity(
         if (
             not 0 < event.committed_propensity <= 1
             or not 0 < event.audit_propensity <= 1
-            or not math.isclose(event.committed_propensity, 1.0)
-            or not math.isclose(event.audit_propensity, 1.0)
+            or (
+                event.policy == "shadow_static_speca"
+                and (
+                    not math.isclose(event.committed_propensity, 1.0)
+                    or not math.isclose(event.audit_propensity, 1.0)))
         ):
             propensity_violations += 1
-        if event.policy != "shadow_static_speca":
+        if event.policy not in (
+                "shadow_static_speca", "timestep_feedback_shadow"):
             policy_violations += 1
         if (
             not math.isfinite(event.incremental_cost)

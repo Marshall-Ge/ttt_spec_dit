@@ -58,7 +58,8 @@
 │   │                          #   COVRRuntime facade + Forced/ExperimentalBandit backend + recorder
 │   │                          #   Phase 1 仅 DiT 非 TTT 主去噪循环; 禁用时不构造任何对象
 │   ├── covr_viability.py      # Opt-in batch=1 causal-prefix scalar recorder (JSONL)
-│   └── covr_bandit.py         # ConservativeTemplateBandit (EXPERIMENTAL, 语义冻结) + manifests
+│   ├── covr_bandit.py         # ConservativeTemplateBandit (EXPERIMENTAL, 语义冻结) + manifests
+│   └── timestep_feedback.py   # Session-level per-timestep defect learner: clipped IPW, p_min, hard budget, state gate
 ├── verification_feedback_loop/    # VFL 子系统 (三层架构, 详见 §12)
 │   ├── __init__.py            # 导出所有公共符号
 │   ├── config.py              # VFLConfig: accept_sample_rate, buffer_capacity_per_stratum, loRA_rank...
@@ -92,6 +93,7 @@
     ├── check_covr_bandit_resume_smoke.py # 检查 state 连续性/resume window/schema
     ├── run_covr_v2_viability_probe.sh # batch=1 causal-prefix OOS viability probe
     ├── analyze_covr_v2_viability.py # machine-readable OOS headroom gate
+    ├── analyze_timestep_feedback.py # session-held-out one-step timestep learner analysis
     └── calibrate_teacache.py  # TeaCache 多项式系数标定脚本
 ```
 

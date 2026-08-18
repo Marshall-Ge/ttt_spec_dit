@@ -104,3 +104,8 @@ from .teacache import (
     teacache_step,
     teacache_reset,
 )
+from .timestep_feedback import (
+    TIMESTEP_FEEDBACK_SCHEMA_VERSION,
+    TimestepDecision,
+    TimestepFeedbackController,
+)

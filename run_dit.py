@@ -83,6 +83,7 @@ from accelerators.covr_runtime import (
     load_strategy_manifest,
 )
 from accelerators.covr_viability import extract_prefix_features
+from accelerators.timestep_feedback import TimestepFeedbackController
 from models.ttt_plugin import (
     SessionAdaLNModulator, ttt_state_init, ttt_reset_for_image,
     ttt_train_step, ttt_record_skip, ttt_session_stats,
@@ -690,6 +691,8 @@ class DiTGenerator:
                  viability_recorder: Optional[
                      COVRViabilityRecorder] = None,
                  covr_runtime: Optional[COVRRuntime] = None,
+                 timestep_feedback: Optional[
+                     TimestepFeedbackController] = None,
                  ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Generate image(s).
 
@@ -749,6 +752,7 @@ class DiTGenerator:
             covr_trajectory=covr_trajectory,
             viability_recorder=viability_recorder,
             covr_runtime=covr_runtime,
+            timestep_feedback=timestep_feedback,
         )
         if covr_profiler is not None:
             covr_profiler.stop_gpu(denoise_token)
@@ -784,6 +788,8 @@ class DiTGenerator:
                        viability_recorder: Optional[
                            COVRViabilityRecorder] = None,
                        covr_runtime: Optional[COVRRuntime] = None,
+                       timestep_feedback: Optional[
+                           TimestepFeedbackController] = None,
                        ) -> torch.Tensor:
         """Single denoising loop with method dispatch.
 
@@ -1105,24 +1111,52 @@ class DiTGenerator:
                 )
                 local_probe_error = (
                     current.last_layer_error if cache_dic.check else None)
-                event = ActionAuditEvent(
-                    session_id=covr_recorder.session_id,
-                    trajectory_id=covr_trajectory_id,
-                    sample_ids=tuple(covr_sample_ids),
-                    class_ids=tuple(
-                        int(label.item()) for label in class_labels[:base_bs]),
-                    version_key=covr_recorder.version.key,
-                    context=context,
-                    committed_action=COVRAction.ACCEPT,
-                    committed_propensity=1.0,
-                    audit_action=COVRAction.REFRESH,
-                    audit_propensity=1.0,
-                    policy="shadow_static_speca",
-                    incremental_cost=1.0,
-                    one_step_transition=transition,
-                    local_probe_error=local_probe_error,
-                )
-                covr_recorder.record(event)
+                feedback_decision = None
+                if timestep_feedback is not None:
+                    feedback_decision = timestep_feedback.decide(
+                        step_idx,
+                        remaining_budget=(
+                            timestep_feedback.budget_refreshes
+                            - timestep_feedback.trajectory_refreshes),
+                    )
+                # In shadow mode the full label is computed for inspection, but
+                # only a refresh sampled by the learner is admitted to its
+                # update. This preserves the selective-label semantics without
+                # changing the SpecA trajectory.
+                if (feedback_decision is None
+                        or feedback_decision.refresh):
+                    audit_propensity = (
+                        feedback_decision.propensity
+                        if feedback_decision is not None else 1.0)
+                    event = ActionAuditEvent(
+                        session_id=covr_recorder.session_id,
+                        trajectory_id=covr_trajectory_id,
+                        sample_ids=tuple(covr_sample_ids),
+                        class_ids=tuple(
+                            int(label.item()) for label in class_labels[:base_bs]),
+                        version_key=covr_recorder.version.key,
+                        context=context,
+                        committed_action=COVRAction.ACCEPT,
+                        committed_propensity=1.0,
+                        audit_action=COVRAction.REFRESH,
+                        audit_propensity=audit_propensity,
+                        policy=(
+                            "timestep_feedback_shadow"
+                            if feedback_decision is not None
+                            else "shadow_static_speca"),
+                        incremental_cost=1.0,
+                        one_step_transition=transition,
+                        local_probe_error=local_probe_error,
+                        metadata=(
+                            {"feedback_reason": feedback_decision.reason}
+                            if feedback_decision is not None else {}),
+                    )
+                    if covr_recorder.record(event) and feedback_decision is not None:
+                        timestep_feedback.observe(
+                            step_idx,
+                            transition.mean_ratio,
+                            feedback_decision.propensity,
+                        )
 
             # Safety shadow gate: skip when Taylor chain is short.
             # Benchmark shows defect correlates with chain length (r=+0.63);
@@ -1819,6 +1853,8 @@ def run_c2i(args) -> Dict:
     covr_sentinel_skipped = 0
     covr_trajectory_offset = 0
     covr_runtime = None
+    timestep_feedback = None
+    timestep_feedback_state_path = None
     if covr_runtime_config is not None:
         # ---- Runtime construction (version / resume / backend / recorder) ----
         scheduler_instance = generator.scheduler
@@ -1954,6 +1990,40 @@ def run_c2i(args) -> Dict:
         covr_recorder = covr_runtime.recorder
         if covr_recorder is not None:
             print(f"  COVR shadow recorder: {covr_recorder.event_path}")
+
+        if getattr(args, "covr_timestep_feedback", False):
+            timestep_feedback_state_path = (
+                getattr(args, "covr_timestep_feedback_state", None)
+                or os.path.join(
+                    covr_runtime.config.output_dir,
+                    "timestep_feedback_state.json"))
+            if os.path.exists(timestep_feedback_state_path):
+                with open(timestep_feedback_state_path, encoding="utf-8") as handle:
+                    timestep_feedback = TimestepFeedbackController.from_state_dict(
+                        json.load(handle),
+                        expected_version_key=covr_version.key,
+                        seed=int(args.seed),
+                    )
+                if (timestep_feedback.num_steps != int(args.num_steps)
+                        or timestep_feedback.budget_refreshes != int(
+                            args.covr_timestep_feedback_budget)):
+                    raise ValueError(
+                        "persisted timestep feedback identity does not match "
+                        "the requested num_steps or refresh budget")
+            else:
+                timestep_feedback = TimestepFeedbackController(
+                    num_steps=int(args.num_steps),
+                    budget_refreshes=int(args.covr_timestep_feedback_budget),
+                    version_key=covr_version.key,
+                    p_min=float(args.covr_timestep_feedback_p_min),
+                    ucb_beta=float(args.covr_timestep_feedback_beta),
+                    seed=int(args.seed),
+                )
+            print(
+                f"  Timestep feedback shadow ready "
+                f"(budget={timestep_feedback.budget_refreshes}, "
+                f"p_min={timestep_feedback.p_min}, "
+                f"state={timestep_feedback_state_path})")
 
         if getattr(args, "covr_force_template_id", None):
             covr_forced_manifest, covr_forced_template = (
@@ -2103,6 +2173,8 @@ def run_c2i(args) -> Dict:
                     and covr_runtime_config.contextual):
                 covr_trajectory.prefix_steps = int(
                     covr_runtime_config.prefix_steps)
+        if timestep_feedback is not None:
+            timestep_feedback.begin_trajectory()
         if covr_profiler is not None:
             covr_profiler.add_cpu(
                 "strategy_selection", time.perf_counter() - strategy_select_start)
@@ -2262,6 +2334,7 @@ def run_c2i(args) -> Dict:
                 covr_runtime=(covr_runtime
                               if covr_runtime_config is not None
                               and covr_runtime_config.contextual else None),
+                timestep_feedback=timestep_feedback,
             )
         if viability_recorder is not None:
             viability_recorder.end_trajectory()
@@ -2384,6 +2457,8 @@ def run_c2i(args) -> Dict:
             )
             if covr_runtime is not None and covr_trajectory is not None
             else None)
+        if timestep_feedback is not None:
+            timestep_feedback.end_trajectory()
         if covr_profiler is not None:
             covr_profiler.reset()
         control_wall_s = (
@@ -2745,6 +2820,22 @@ def run_c2i(args) -> Dict:
         if ws.get("latest_checkpoint"):
             agg["vfl_latest_checkpoint"] = ws["latest_checkpoint"]
 
+    if timestep_feedback is not None:
+        timestep_feedback_summary = timestep_feedback.summary()
+        agg["covr_timestep_feedback"] = timestep_feedback_summary
+        state_dir = os.path.dirname(os.path.abspath(timestep_feedback_state_path))
+        os.makedirs(state_dir, exist_ok=True)
+        state_tmp = timestep_feedback_state_path + ".tmp"
+        with open(state_tmp, "w", encoding="utf-8") as handle:
+            json.dump(timestep_feedback.state_dict(), handle, indent=2,
+                      sort_keys=True)
+            handle.write("\n")
+        os.replace(state_tmp, timestep_feedback_state_path)
+        print(
+            f"  Timestep feedback shadow: "
+            f"{timestep_feedback_summary['trajectories']} trajectories -> "
+            f"{timestep_feedback_state_path}")
+
     # Runtime owns the run-level COVR aggregate payloads (shadow summary,
     # template-bandit summary, forced-template info, sentinel reward
     # telemetry). Local aliases mirror the runtime state so the prints below
@@ -2825,6 +2916,15 @@ def run_c2i(args) -> Dict:
                 covr_version.key if covr_version is not None else None),
             "covr_profile_stages": bool(getattr(
                 args, "covr_profile_stages", False)),
+        })
+    if timestep_feedback is not None:
+        covr_config.update({
+            "covr_timestep_feedback": True,
+            "covr_timestep_feedback_budget": (
+                timestep_feedback.budget_refreshes),
+            "covr_timestep_feedback_p_min": timestep_feedback.p_min,
+            "covr_timestep_feedback_beta": timestep_feedback.ucb_beta,
+            "covr_timestep_feedback_state": timestep_feedback_state_path,
         })
 
     results = {

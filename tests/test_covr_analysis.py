@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -150,6 +152,18 @@ def test_integrity_rejects_duplicate_batch_context():
     result = evaluate_action_audit_integrity(events + [events[0]])
     assert result.status == "stop"
     assert result.metrics["duplicate_contexts"] == 1
+
+
+def test_integrity_accepts_selective_timestep_feedback_propensity():
+    events = _audit_events()
+    events[0] = replace(
+        events[0],
+        policy="timestep_feedback_shadow",
+        audit_propensity=0.02,
+    )
+    result = evaluate_action_audit_integrity(events)
+    assert result.status == "pass"
+    assert result.metrics["propensity_violations"] == 0
 
 
 def test_denominator_tail_distinguishes_numerator_spike_and_collapse():

@@ -31,6 +31,19 @@ threshold was FID `-9.270 +/- 0.848 SE` and IS `-5.612 +/- 0.242 SE`. FID
 favored uniform, while IS favored plain TeaCache on all five offsets. Therefore
 there is no single static winner across both quality metrics.
 
+The all-arm paired analysis further showed:
+
+- uniform minus back-loaded: FID `-9.483 +/- 0.600 SE`, IS `+3.751 +/- 0.239 SE`;
+- uniform minus front-loaded: FID `-20.635 +/- 0.733 SE`, IS `+13.451 +/- 0.503 SE`;
+- uniform minus geometric: FID `-1.768 +/- 0.681 SE`, IS `+4.636 +/- 0.293 SE`;
+- uniform minus random-00: FID `-2.650 +/- 0.729 SE`, IS `-1.247 +/- 0.314 SE`;
+- uniform minus random-01: FID `-3.454 +/- 0.626 SE`, IS `-1.027 +/- 0.227 SE`.
+
+All five offsets favored uniform in FID. The random nulls favored uniform in FID
+but random masks in IS, so no arm passes all paired metric gates. This strengthens
+the static Pareto conclusion rather than providing evidence for per-image
+adaptive selection.
+
 No reward conclusion is available: the run intentionally used
 `SENTINEL_RATE=0`, so terminal reward telemetry was absent. The reference-based
 per-image Inception distance also failed the declared rank-validity gate
@@ -38,6 +51,7 @@ per-image Inception distance also failed the declared rank-validity gate
 or justify an adaptive bandit.
 
 Decision: retain uniform K=8 as the FID-oriented static candidate, retain plain
-TeaCache threshold 1.40 as the IS-oriented comparator, and do not resume COVR
-bandit development. Further work should be held-out static schedule/Pareto
-validation, not online controller training.
+TeaCache threshold 1.40 as the IS-oriented comparator, and close the K=8 static
+mask search as a multi-metric winner. Do not resume COVR bandit development.
+Further work should move to scheduler-aware static/segmented schedules or stop,
+not online controller training.

@@ -59,6 +59,12 @@ def _runtime_args(**overrides):
         "covr_sentinel_rate": 0.05,
         "covr_sentinel_horizon": 0,
         "covr_profile_stages": False,
+        "covr_timestep_feedback": False,
+        "covr_timestep_feedback_budget": 8,
+        "covr_timestep_feedback_state": None,
+        "covr_timestep_feedback_p_min": 0.02,
+        "covr_timestep_feedback_beta": 1.0,
+        "num_steps": 50,
         "seed": 42,
     }
     values.update(overrides)
@@ -362,6 +368,31 @@ def test_cli_rejects_pixart_covr_runtime_in_phase_one(monkeypatch):
     )
 
     assert validate_args(args) is False
+
+
+def test_timestep_feedback_requires_shadow(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        "--model", "dit",
+        "--task", "c2i",
+        "--dataset", "imagenet",
+        "--method", "speca",
+        "--covr-timestep-feedback",
+    )
+
+    assert validate_args(args) is False
+
+
+def test_timestep_feedback_shadow_builds_observe_runtime(tmp_path):
+    args = _runtime_args(
+        covr_shadow=True,
+        covr_timestep_feedback=True,
+        covr_output_dir=str(tmp_path / "covr"),
+    )
+
+    config = build_covr_runtime_config(args, str(tmp_path))
+    assert config is not None
+    assert config.shadow is True
 
 
 def test_cli_rejects_ttt_covr_runtime_in_phase_one(monkeypatch):
