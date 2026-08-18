@@ -72,6 +72,8 @@ def evaluate_prequential(
         version_key=version_key,
         **dict(controller_kwargs or {}),
     )
+    baseline_sum = [0.0] * num_steps
+    baseline_count = [0] * num_steps
     session_rows = []
     for session_id in sessions:
         session_events = sorted(
@@ -80,14 +82,24 @@ def evaluate_prequential(
         )
         predictions = []
         targets = []
+        baseline_predictions = []
         for event in session_events:
-            mean, _ = controller.risk(int(event.context.step_idx))
+            step_idx = int(event.context.step_idx)
+            mean, _ = controller.risk(step_idx)
             predictions.append(mean)
-            targets.append(float(event.one_step_transition.mean_ratio))
+            target = float(event.one_step_transition.mean_ratio)
+            targets.append(target)
+            baseline_predictions.append(
+                baseline_sum[step_idx] / baseline_count[step_idx]
+                if baseline_count[step_idx] else 0.0)
 
         squared = [
             (prediction - target) ** 2
             for prediction, target in zip(predictions, targets)
+        ]
+        baseline_squared = [
+            (prediction - target) ** 2
+            for prediction, target in zip(baseline_predictions, targets)
         ]
         session_rows.append({
             "session_id": session_id,
@@ -96,6 +108,12 @@ def evaluate_prequential(
             "mae": sum(abs(prediction - target)
                        for prediction, target in zip(predictions, targets)) / len(targets),
             "top_decile_recall": _top_decile_recall(predictions, targets),
+            "baseline_mse": sum(baseline_squared) / len(baseline_squared),
+            "baseline_mae": sum(abs(prediction - target)
+                                 for prediction, target in zip(
+                                     baseline_predictions, targets)) / len(targets),
+            "baseline_top_decile_recall": _top_decile_recall(
+                baseline_predictions, targets),
             "observations_before_update": sum(
                 item["observations"] for item in controller.summary()["timesteps"]),
         })
@@ -103,11 +121,15 @@ def evaluate_prequential(
         # Session labels are ingested only after the held-out predictions above.
         for event in session_events:
             if event.audit_action is COVRAction.REFRESH:
+                step_idx = int(event.context.step_idx)
+                target = float(event.one_step_transition.mean_ratio)
                 controller.observe(
-                    int(event.context.step_idx),
-                    float(event.one_step_transition.mean_ratio),
+                    step_idx,
+                    target,
                     float(event.audit_propensity),
                 )
+                baseline_sum[step_idx] += target
+                baseline_count[step_idx] += 1
         controller.begin_trajectory()
         observed_refreshes = sum(
             event.audit_action is COVRAction.REFRESH
@@ -127,6 +149,15 @@ def evaluate_prequential(
         "prequential_mae": sum(row["mae"] for row in session_rows) / len(session_rows),
         "prequential_top_decile_recall": (
             sum(row["top_decile_recall"] for row in session_rows)
+            / len(session_rows)),
+        "baseline_prequential_mse": (
+            sum(row["baseline_mse"] for row in session_rows)
+            / len(session_rows)),
+        "baseline_prequential_mae": (
+            sum(row["baseline_mae"] for row in session_rows)
+            / len(session_rows)),
+        "baseline_prequential_top_decile_recall": (
+            sum(row["baseline_top_decile_recall"] for row in session_rows)
             / len(session_rows)),
         "session_rows": session_rows,
         "final_controller": controller.summary(),
