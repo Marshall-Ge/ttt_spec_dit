@@ -193,3 +193,20 @@ def test_cli_requires_five_complete_pairs(tmp_path, capsys):
 
     assert "INSUFFICIENT EVIDENCE (need >= 5" in output
     assert "INSUFFICIENT EVIDENCE: need >= 5 paired latent offsets" in output
+
+
+def test_cli_compares_all_discovered_arms(tmp_path, capsys):
+    for offset in range(5):
+        _write_arm(tmp_path, "uniform", offset,
+                   fid=100.0 + offset, is_mean=35.0 + offset)
+        _write_arm(tmp_path, "geometric", offset,
+                   fid=101.0 + offset, is_mean=30.0 + offset)
+        _write_arm(tmp_path, "random_00", offset,
+                   fid=102.0 + offset, is_mean=29.0 + offset)
+
+    assert asm.main([
+        str(tmp_path), "--left", "uniform", "--right", "all",
+    ]) == 0
+    output = capsys.readouterr().out
+    assert "comparison: uniform - geometric" in output
+    assert "comparison: uniform - random_00" in output

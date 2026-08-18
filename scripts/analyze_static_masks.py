@@ -289,7 +289,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         description="Paired FID/IS verdict for static TeaCache mask replicas")
     parser.add_argument("probe_dir")
     parser.add_argument("--left", default="uniform")
-    parser.add_argument("--right", default="geometric")
+    parser.add_argument(
+        "--right", default="geometric",
+        help="comparison arm ID, or 'all' for every discovered arm")
     parser.add_argument("--fid-margin", type=float, default=2.0)
     parser.add_argument("--is-margin", type=float, default=0.0)
     parser.add_argument("--min-pairs", type=int, default=5)
@@ -319,17 +321,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"== budget k{budget} ==")
         arms, warnings = discover_arm_runs(budget_dir)
         _render_warnings(warnings)
-        if args.left not in arms or args.right not in arms:
-            print(f"  INSUFFICIENT EVIDENCE: need arm_{args.left} and "
-                  f"arm_{args.right}")
+        if args.left not in arms:
+            print(f"  INSUFFICIENT EVIDENCE: need arm_{args.left}")
             all_pass = False
             continue
-        fid_pass, is_pass = _render_pair(
-            args.left, args.right, arms[args.left], arms[args.right],
-            args.fid_margin, args.is_margin, args.min_pairs)
-        complete_pairs = len(set(arms[args.left]) & set(arms[args.right]))
-        any_complete = any_complete or complete_pairs >= args.min_pairs
-        all_pass = all_pass and fid_pass and is_pass
+        right_names = (
+            sorted(name for name in arms if name != args.left)
+            if args.right == "all" else [args.right]
+        )
+        if not right_names:
+            print("  INSUFFICIENT EVIDENCE: no comparison arms found")
+            all_pass = False
+            continue
+        for right_name in right_names:
+            if right_name not in arms:
+                print(f"  INSUFFICIENT EVIDENCE: need arm_{right_name}")
+                all_pass = False
+                continue
+            fid_pass, is_pass = _render_pair(
+                args.left, right_name, arms[args.left], arms[right_name],
+                args.fid_margin, args.is_margin, args.min_pairs)
+            complete_pairs = len(
+                set(arms[args.left]) & set(arms[right_name]))
+            any_complete = any_complete or complete_pairs >= args.min_pairs
+            all_pass = all_pass and fid_pass and is_pass
 
         if not thresholds:
             print("  plain TeaCache comparator: not run")
