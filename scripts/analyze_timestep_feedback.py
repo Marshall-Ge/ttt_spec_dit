@@ -108,6 +108,12 @@ def evaluate_prequential(
                     float(event.one_step_transition.mean_ratio),
                     float(event.audit_propensity),
                 )
+        controller.begin_trajectory()
+        observed_refreshes = sum(
+            event.audit_action is COVRAction.REFRESH
+            for event in session_events)
+        controller.end_trajectory(
+            observed_cost=observed_refreshes / num_steps)
 
     total_events = sum(row["events"] for row in session_rows)
     return {

@@ -189,4 +189,5 @@ def test_session_held_out_analysis_updates_after_prediction():
     )
     assert result["status"] == "pass"
     assert result["session_rows"][1]["mse"] < result["session_rows"][0]["mse"]
+    assert result["final_controller"]["trajectories"] == 2
     assert result["target"] == "one_step_transition_defect_only"
