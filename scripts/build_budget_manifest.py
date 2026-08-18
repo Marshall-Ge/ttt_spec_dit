@@ -17,6 +17,9 @@ found per-image crossover on. No audit, no cardinality floor.
 
 Every arm carries EXACTLY ``--refresh-count`` calc steps, so the equal-FLOPs
 invariant the arm-spread verdict depends on holds by construction.
+Use ``--random-count N --random-seed S`` to append N reproducible random-null
+arms per budget. The legacy invocation still emits only the four deterministic
+layouts and keeps ``uniform`` as the baseline.
 
 Usage:
   python scripts/build_budget_manifest.py --num-steps 50 --refresh-count 8 \
@@ -26,7 +29,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import os
+import random
 import sys
 from typing import List, Tuple
 
@@ -94,6 +99,35 @@ def _layouts(num_steps: int, k: int, prefix: int) -> List[Tuple[str, List[int]]]
     ]
 
 
+def _random_layouts(
+        num_steps: int, k: int, prefix: int, count: int, seed: int,
+        ) -> List[Tuple[str, List[int]]]:
+    """Return reproducible random masks with the same prefix and budget."""
+    if count <= 0:
+        return []
+    prefix_steps = list(range(min(prefix, k)))
+    available = list(range(len(prefix_steps), num_steps))
+    rest = k - len(prefix_steps)
+    if rest > len(available):
+        raise ValueError("refresh_count leaves no room for random mask sampling")
+
+    rng = random.Random(seed)
+    layouts = []
+    seen = set()
+    max_unique = math.comb(len(available), rest)
+    if count > max_unique:
+        raise ValueError(
+            f"random_count={count} exceeds {max_unique} unique masks for "
+            f"num_steps={num_steps}, refresh_count={k}, prefix={prefix}")
+    while len(layouts) < count:
+        selected = tuple(sorted(prefix_steps + rng.sample(available, rest)))
+        if selected in seen:
+            continue
+        seen.add(selected)
+        layouts.append((f"random_{len(layouts):02d}", list(selected)))
+    return layouts
+
+
 def _max_taylor_gap(mask: Tuple[bool, ...]) -> int:
     worst = run = 0
     for flag in mask:
@@ -130,6 +164,11 @@ def main() -> int:
                     help="legacy single fixed-mask calc budget")
     ap.add_argument("--refresh-counts", type=int, nargs="*", default=[],
                     help="fixed-mask calc budgets; emits four patterns per budget")
+    ap.add_argument("--random-count", type=int, default=0,
+                    help="deterministic random masks per fixed budget; disabled "
+                         "by default")
+    ap.add_argument("--random-seed", type=int, default=0,
+                    help="seed for deterministic random masks")
     ap.add_argument(
         "--threshold-arm", action="append", default=[],
         metavar="THRESHOLD:EXPECTED_SKIP_RATE",
@@ -163,6 +202,8 @@ def main() -> int:
         ap.error("provide --refresh-count/--refresh-counts or --threshold-arm")
     if threshold_arms and args.method != "teacache":
         ap.error("--threshold-arm requires --method teacache")
+    if args.random_count < 0:
+        ap.error("--random-count must be non-negative")
     for k in refresh_counts:
         if not 1 <= k <= ns:
             ap.error(f"refresh counts must be in [1, {ns}]")
@@ -187,7 +228,10 @@ def main() -> int:
             source="teacache_threshold_manifest",
         ))
 
-    mixed_ids = bool(threshold_arms) or len(refresh_counts) > 1
+    mixed_ids = (
+        bool(threshold_arms) or len(refresh_counts) > 1
+        or args.random_count > 0
+    )
     for k in refresh_counts:
         print(f"fixed-mask arms at calc={k}/{ns}, method={args.method}:")
         for name, steps in _layouts(ns, k, args.mandatory_prefix):
@@ -212,6 +256,31 @@ def main() -> int:
                 modeled_flops=float(k),
                 source=f"budget_manifest_k{k}",
             ))
+        for name, steps in _random_layouts(
+                ns, k, args.mandatory_prefix, args.random_count,
+                args.random_seed + k):
+            calc = _fill_to(steps, k, ns)
+            mask = tuple(i in set(calc) for i in range(ns))
+            assert sum(mask) == k and mask[0], (name, sum(mask), mask[0])
+            gap = _max_taylor_gap(mask)
+            arm_id = f"pattern_{name}_k{k}" if mixed_ids else name
+            if args.max_taylor_gap is not None and gap > args.max_taylor_gap:
+                print(f"  {arm_id:<24} SKIPPED (max cache gap {gap} > "
+                      f"{args.max_taylor_gap})")
+                continue
+            print(f"  {arm_id:<24} max_gap={gap:>2}  calc at {calc}")
+            strategies.append(AccelerationStrategy(
+                strategy_id=arm_id,
+                method=args.method,
+                params={
+                    "refresh_mask": list(mask),
+                    "refresh_count": k,
+                    "num_steps": ns,
+                    "random_seed": args.random_seed + k,
+                },
+                modeled_flops=float(k),
+                source=f"budget_random_null_k{k}",
+            ))
 
     ids = [s.strategy_id for s in strategies]
     if not ids:
@@ -222,10 +291,17 @@ def main() -> int:
         if args.baseline_arm not in ids:
             ap.error(f"--baseline-arm is not present: {args.baseline_arm}")
         baseline = args.baseline_arm
-    elif not mixed_ids and "uniform" in ids:
-        baseline = "uniform"
     elif "threshold_0p25" in ids:
         baseline = "threshold_0p25"
+    elif args.random_count > 0:
+        uniform_ids = sorted(
+            strategy_id for strategy_id in ids
+            if strategy_id.startswith("pattern_uniform_k"))
+        if not uniform_ids:
+            raise RuntimeError("expected a uniform baseline arm")
+        baseline = uniform_ids[0]
+    elif "uniform" in ids:
+        baseline = "uniform"
     else:
         baseline = ids[0]
 

@@ -36,6 +36,7 @@
 #   REWARD_MODE (terminal|hstep, default terminal)  SENTINEL_RATE (1.0)
 #   SENTINEL_HORIZON (hstep mode only, default 10)  SESSION_ID (auto)
 #   ARM_FILTER (comma-separated strategy IDs; empty = all manifest arms)
+#   RANDOM_COUNT (default 0)  RANDOM_SEED (default 0)
 #   PAIRED_REPLICAS (total latent draws per selected arm, default 1)
 #   THRESHOLDS (comma-separated plain TeaCache thresholds; empty = disabled)
 #   THRESHOLD_REPLICAS (total latent draws per threshold, default 1)
@@ -126,6 +127,8 @@ ARM_FILTER="${ARM_FILTER:-}"
 PAIRED_REPLICAS="${PAIRED_REPLICAS:-1}"
 THRESHOLDS="${THRESHOLDS:-}"
 THRESHOLD_REPLICAS="${THRESHOLD_REPLICAS:-1}"
+RANDOM_COUNT="${RANDOM_COUNT:-0}"
+RANDOM_SEED="${RANDOM_SEED:-0}"
 
 # --- noise floor: WHICH noise the floor measures (see header) ---
 NOISE_MODE="${NOISE_MODE:-seed}"       # latent|seed
@@ -176,6 +179,13 @@ if [ "${REWARD_MODE}" = "hstep" ] && \
 import sys
 h, n = int(sys.argv[1]), int(sys.argv[2])
 assert 0 < h < n, "SENTINEL_HORIZON must be in (0, NUM_STEPS)"
+PY
+then
+  exit 2
+fi
+if ! python - "${RANDOM_COUNT}" <<'PY' >/dev/null
+import sys
+assert int(sys.argv[1]) >= 0, "RANDOM_COUNT must be >= 0"
 PY
 then
   exit 2
@@ -261,7 +271,7 @@ run_reference() {  # run_reference <out>  — full compute, shared cross-budget 
 python - "$BUDGETS" "$NUM_STEPS" "$N_PROMPTS" "$IMG_SAVE_LIMIT" "$REFERENCE" \
         "$NOISE_REPLICAS" "$SKIP_ARMS" "$SKIP_NOISE" "$NOISE_MODE" \
         "$ARM_FILTER" "$PAIRED_REPLICAS" "$THRESHOLDS" \
-        "$THRESHOLD_REPLICAS" <<'PY'
+        "$THRESHOLD_REPLICAS" "$RANDOM_COUNT" <<'PY'
 import sys
 budgets = [int(k) for k in sys.argv[1].split(",") if k.strip()]
 num_steps, n_prompts, img_limit = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
@@ -273,7 +283,8 @@ arm_filter = [a.strip() for a in sys.argv[10].split(",") if a.strip()]
 paired_replicas = int(sys.argv[11])
 thresholds = [t.strip() for t in sys.argv[12].split(",") if t.strip()]
 threshold_replicas = int(sys.argv[13])
-n_selected = len(arm_filter) if arm_filter else 4
+n_random = int(sys.argv[14])
+n_selected = len(arm_filter) if arm_filter else 4 + n_random
 n_arms = 0 if skip_arms else n_selected * paired_replicas
 n_noise = 0 if skip_noise else replicas
 per_budget = n_arms + n_noise
@@ -287,7 +298,7 @@ print(f"  arm runs: {arm_runs} ({n_arms} selected-arm replicas + "
       f"{n_noise} noise[{noise_mode}] per budget, K={budgets})")
 print(f"  plain TeaCache threshold runs: {threshold_runs}")
 if skip_arms:
-    print("    SKIP_ARMS=1 -> the 4 forced arms are REUSED from disk, not rerun")
+    print("    SKIP_ARMS=1 -> forced arms are REUSED from disk, not rerun")
 if skip_noise:
     print("    SKIP_NOISE=1 -> existing noise_* dirs are REUSED, not rerun")
 print(f"  forward-units per trajectory: arms={arm_units}, reference={ref_units}"
@@ -339,7 +350,9 @@ for K in "${BUDGET_ARR[@]}"; do
   echo "########## budget K=${K}/${NUM_STEPS} calc steps ##########"
   echo "############################################################"
   python scripts/build_budget_manifest.py \
-      --num-steps "${NUM_STEPS}" --refresh-count "${K}" --output "${MANIFEST}"
+      --num-steps "${NUM_STEPS}" --refresh-count "${K}" \
+      --random-count "${RANDOM_COUNT}" --random-seed "${RANDOM_SEED}" \
+      --output "${MANIFEST}"
 
   ARMS=()
   while IFS= read -r arm; do
@@ -513,5 +526,18 @@ python scripts/analyze_crossover.py "${OUT_DIR}"
 if [ "${PAIRED_REPLICAS}" -gt 1 ] || [ -n "${THRESHOLDS}" ]; then
   echo ""
   echo "########## paired static-mask verdict ##########"
-  python scripts/analyze_static_masks.py "${OUT_DIR}"
+  if [ "${RANDOM_COUNT}" -gt 0 ]; then
+    if [[ "${BUDGETS}" != *,* ]]; then
+      STATIC_LEFT="pattern_uniform_k${BUDGETS}"
+      STATIC_RIGHT="pattern_geometric_k${BUDGETS}"
+      python scripts/analyze_static_masks.py "${OUT_DIR}" \
+          --left "${STATIC_LEFT}" --right "${STATIC_RIGHT}"
+    else
+      echo "  random arms use budget-qualified IDs; run paired analysis per "
+      echo "  budget with --left pattern_uniform_k<K> --right "
+      echo "  pattern_geometric_k<K>"
+    fi
+  else
+    python scripts/analyze_static_masks.py "${OUT_DIR}"
+  fi
 fi

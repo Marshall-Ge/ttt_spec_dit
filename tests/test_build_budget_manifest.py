@@ -75,3 +75,41 @@ def test_mixed_manifest_emits_disjoint_threshold_and_pattern_arms(tmp_path):
     assert sum(pattern["params"]["refresh_mask"]) == 8
     assert "rel_l1_thresh" not in pattern["params"]
     assert "pattern_geometric_k10" in arms
+
+
+def test_random_null_arms_are_reproducible_and_budget_matched(tmp_path):
+    first, _ = _run_builder(
+        tmp_path / "first",
+        "--num-steps", "12",
+        "--refresh-count", "5",
+        "--random-count", "3",
+        "--random-seed", "17",
+    )
+    second, _ = _run_builder(
+        tmp_path / "second",
+        "--num-steps", "12",
+        "--refresh-count", "5",
+        "--random-count", "3",
+        "--random-seed", "17",
+    )
+
+    first_random = [
+        arm for arm in first["strategies"]
+        if arm["source"] == "budget_random_null_k5"
+    ]
+    second_random = [
+        arm for arm in second["strategies"]
+        if arm["source"] == "budget_random_null_k5"
+    ]
+    assert [arm["params"]["refresh_mask"] for arm in first_random] == [
+        arm["params"]["refresh_mask"] for arm in second_random
+    ]
+    assert len(first_random) == 3
+    assert len({tuple(arm["params"]["refresh_mask"]) for arm in first_random}) == 3
+    for arm in first_random:
+        mask = arm["params"]["refresh_mask"]
+        assert len(mask) == 12
+        assert sum(mask) == 5
+        assert mask[:3] == [True, True, True]
+        assert arm["modeled_flops"] == 5.0
+    assert first["baseline_strategy_id"] == "pattern_uniform_k5"
