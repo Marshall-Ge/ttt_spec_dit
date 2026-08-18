@@ -1855,6 +1855,7 @@ def run_c2i(args) -> Dict:
     covr_runtime = None
     timestep_feedback = None
     timestep_feedback_state_path = None
+    timestep_feedback_masks = []
     if covr_runtime_config is not None:
         # ---- Runtime construction (version / resume / backend / recorder) ----
         scheduler_instance = generator.scheduler
@@ -2023,6 +2024,7 @@ def run_c2i(args) -> Dict:
                 f"  Timestep feedback shadow ready "
                 f"(budget={timestep_feedback.budget_refreshes}, "
                 f"p_min={timestep_feedback.p_min}, "
+                f"active={bool(getattr(args, 'covr_timestep_feedback_active', False))}, "
                 f"state={timestep_feedback_state_path})")
 
         if getattr(args, "covr_force_template_id", None):
@@ -2192,6 +2194,23 @@ def run_c2i(args) -> Dict:
                 reset_stage, time.perf_counter() - reset_start)
 
         strategy_init_start = time.perf_counter()
+        feedback_speca_init_kwargs = speca_init_kwargs
+        if (timestep_feedback is not None
+                and getattr(args, "covr_timestep_feedback_active", False)):
+            feedback_mask = timestep_feedback.recommended_refresh_mask()
+            feedback_speca_init_kwargs = {
+                **speca_init_kwargs,
+                "refresh_mask": feedback_mask,
+            }
+            timestep_feedback_masks.append({
+                "trajectory_id": trajectory_id,
+                "refresh_steps": [
+                    step for step, refresh in enumerate(feedback_mask) if refresh
+                ],
+            })
+            print(
+                f"  Timestep feedback active mask trajectory={trajectory_id}: "
+                f"{timestep_feedback_masks[-1]['refresh_steps']}")
         # Strategy dispatch: configure the accelerator from the
         # bandit/forced-template selection when one is active. Method-agnostic
         # via the adapter registry — apply_strategy() looks up the strategy's
@@ -2261,10 +2280,11 @@ def run_c2i(args) -> Dict:
             # SpecA controller lifecycle (controller is None for other methods).
             if "cache_dic" in dispatch_result and compute_controller is not None:
                 compute_controller.begin_trajectory(trajectory_id)
-        elif speca_init_kwargs is not None:
-            # No bandit, direct SpecA config (no refresh_mask = auto-decay)
+        elif feedback_speca_init_kwargs is not None:
+            # Direct SpecA config; active timestep feedback may provide a
+            # session-level fixed refresh mask here.
             speca_cache_dic, speca_current = speca_init(
-                **speca_init_kwargs,
+                **feedback_speca_init_kwargs,
                 controller=compute_controller,
                 trajectory_id=trajectory_id,
             )
@@ -2822,6 +2842,8 @@ def run_c2i(args) -> Dict:
 
     if timestep_feedback is not None:
         timestep_feedback_summary = timestep_feedback.summary()
+        if timestep_feedback_masks:
+            timestep_feedback_summary["active_masks"] = timestep_feedback_masks
         agg["covr_timestep_feedback"] = timestep_feedback_summary
         state_dir = os.path.dirname(os.path.abspath(timestep_feedback_state_path))
         os.makedirs(state_dir, exist_ok=True)
@@ -2920,6 +2942,8 @@ def run_c2i(args) -> Dict:
     if timestep_feedback is not None:
         covr_config.update({
             "covr_timestep_feedback": True,
+            "covr_timestep_feedback_active": bool(
+                getattr(args, "covr_timestep_feedback_active", False)),
             "covr_timestep_feedback_budget": (
                 timestep_feedback.budget_refreshes),
             "covr_timestep_feedback_p_min": timestep_feedback.p_min,

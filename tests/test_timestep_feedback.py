@@ -85,6 +85,20 @@ def test_mandatory_steps_are_validated_and_forced():
     assert last.refresh and last.reason == "mandatory"
 
 
+def test_refresh_mask_falls_back_to_even_schedule_then_uses_risk():
+    controller = _controller(num_steps=10, budget_refreshes=4)
+    fresh_mask = controller.recommended_refresh_mask()
+    assert sum(fresh_mask) == 4
+    assert fresh_mask[0]
+    assert fresh_mask[3] and fresh_mask[6] and fresh_mask[9]
+
+    controller.observe(4, 2.0, 1.0)
+    controller.observe(7, 1.5, 1.0)
+    learned_mask = controller.recommended_refresh_mask()
+    assert sum(learned_mask) == 4
+    assert learned_mask[0] and learned_mask[4] and learned_mask[7]
+
+
 def test_price_updates_toward_target_refresh_rate():
     controller = _controller(
         budget_refreshes=3, initial_price=0.5, price_learning_rate=0.2)

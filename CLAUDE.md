@@ -530,4 +530,5 @@ use_ttt = use_teacache and ttt_state is not None    # 必须叠加在 TeaCache �
 - **纯辅助**：`run_dit_shared.py` 持有 `_GenerationProfiler` + `_covr_*` canonical JSON / resume / sentinel 纯函数；run_dit 从其中 import 并保持历史 `_covr_*` 名称可导入（scripts/tests 依赖）。
 - **StrategyManifest version_key 对称校验**：forced 与 bandit 两个 mode 都走 `load_strategy_manifest`（错误消息含 "runtime"）。
 - **Bandit 标记 EXPERIMENTAL**：`ConservativeTemplateBandit` 语义冻结，未做算法改动；`--covr-strategy-bandit` help 已标注。
+- **Timestep feedback**：`--covr-timestep-feedback --covr-shadow` 默认只做 selective-label shadow 学习；`--covr-timestep-feedback-active` 才将上一 session 的 timestep risk 转为下一 trajectory 的固定 SpecA refresh mask，仍不是 per-image bandit，实验验证前不得用于质量结论。
 - **VFL 独立**：VFL 是旁路观测/校准，不参与 forward；COVR runtime 与其互不依赖，既有有效组合不变。

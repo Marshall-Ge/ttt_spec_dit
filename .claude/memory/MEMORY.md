@@ -40,6 +40,6 @@
 17	- [COVR contextual+efficiency bandit 已 GPU 验证=负](project_covr_contextual_efficiency_bandit.md) — deferred-commit LinUCB + λ·FLOPs reward；500图首跑两个维度 contextual gain 都≤0（fidelity -6.4e-6, combined -2.6e-4），per-image Pareto 异质性不存在；STOP，不扩大 GPU
 18	- [COVR K8 random-null 配对结果](project_covr_static_k8_random_result_20260818.md) — K=8 mask placement 影响 aggregate FID/IS；uniform 稳定优于确定性布局但对 random null 形成 FID/IS 反向权衡；无多指标静态赢家，reward 未启用，per-image crossover gate 未通过，不启动 bandit
 19	- [timestep feedback shadow 集成 smoke](project_timestep_feedback_shadow_smoke_20260818.md) — 真实 DiT SpecA 16图/4 trajectory 成功产生 25 个 selective contexts、100 labels 并持久化 state；仅验证 wiring，不代表质量或学习收益
-20	- [timestep feedback prequential smoke](project_timestep_feedback_prequential_smoke_20260818.md) — 两 session held-out one-step MSE 0.358→0.027、MAE 0.502→0.113、top-decile recall 0→0.75；仅证明 timestep prior sanity，不代表 FID 或 active policy 收益
+20	- [timestep feedback prequential smoke](project_timestep_feedback_prequential_smoke_20260818.md) — 两 session held-out one-step MSE 0.358→0.027、MAE 0.502→0.113、top-decile recall 0→0.75；与 unweighted one-hot baseline 完全相同，尚无 IPW/UCB 增量收益，不代表 FID 或 active policy 收益
 21	- [简短提供测试命令](feedback_concise_test_commands.md) — 远程测试场景只给从真实入口开始的核心命令
 22	- [input_tokens 错误后自动续做](feedback_resume_after_input_tokens_error.md) — 遇到客户端 token 错误时拆分调用并持续完成任务，不输出空响应

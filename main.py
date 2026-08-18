@@ -224,6 +224,10 @@ Examples:
                         default=False,
                         help="Shadow-only session-level timestep feedback "
                              "learner (one-step defect target)")
+    parser.add_argument("--covr-timestep-feedback-active", action="store_true",
+                        default=False,
+                        help="Use the learned timestep mask for the next "
+                             "trajectory (experimental; requires feedback)")
     parser.add_argument("--covr-timestep-feedback-budget", type=int, default=8,
                         help="Refresh budget for timestep feedback shadow "
                              "controller (default: 8)")

@@ -250,6 +250,52 @@ class TimestepFeedbackController:
         self.trajectories += 1
         return self.price
 
+    def recommended_refresh_mask(
+            self,
+            *,
+            budget_refreshes: Optional[int] = None,
+            include_first: bool = True,
+            ) -> tuple[bool, ...]:
+        """Build a fixed mask for the next trajectory from timestep risk.
+
+        This is session-level schedule adaptation, not per-image contextual
+        selection. With no observations it falls back to an even schedule so a
+        fresh learner does not invent a late-step bias from tied priors.
+        """
+        budget = self.budget_refreshes if budget_refreshes is None else int(
+            budget_refreshes)
+        if not 0 <= budget <= self.num_steps:
+            raise ValueError("budget_refreshes must be in [0, num_steps]")
+        mandatory = set(self.mandatory_steps)
+        if include_first:
+            mandatory.add(0)
+        if len(mandatory) > budget:
+            raise ValueError("mandatory steps exceed refresh budget")
+        selected = set(mandatory)
+        remaining = budget - len(selected)
+        if remaining > 0:
+            observed = sum(stats.observations for stats in self._stats)
+            if observed == 0:
+                denominator = max(budget - 1, 1)
+                candidates = [
+                    int(round(index * (self.num_steps - 1) / denominator))
+                    for index in range(budget)
+                ]
+                ranked = candidates + list(range(self.num_steps))
+            else:
+                ranked = sorted(
+                    range(self.num_steps),
+                    key=lambda step: (self.risk(step)[1], -step),
+                    reverse=True,
+                )
+            for step in ranked:
+                if step not in selected:
+                    selected.add(step)
+                    remaining -= 1
+                    if remaining == 0:
+                        break
+        return tuple(step in selected for step in range(self.num_steps))
+
     def summary(self) -> Dict[str, Any]:
         return {
             "schema_version": TIMESTEP_FEEDBACK_SCHEMA_VERSION,

@@ -60,6 +60,7 @@ def _runtime_args(**overrides):
         "covr_sentinel_horizon": 0,
         "covr_profile_stages": False,
         "covr_timestep_feedback": False,
+        "covr_timestep_feedback_active": False,
         "covr_timestep_feedback_budget": 8,
         "covr_timestep_feedback_state": None,
         "covr_timestep_feedback_p_min": 0.02,
@@ -378,6 +379,19 @@ def test_timestep_feedback_requires_shadow(monkeypatch):
         "--dataset", "imagenet",
         "--method", "speca",
         "--covr-timestep-feedback",
+    )
+
+    assert validate_args(args) is False
+
+
+def test_active_timestep_feedback_requires_learner(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        "--model", "dit",
+        "--task", "c2i",
+        "--dataset", "imagenet",
+        "--method", "speca",
+        "--covr-timestep-feedback-active",
     )
 
     assert validate_args(args) is False

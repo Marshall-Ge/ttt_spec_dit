@@ -1283,6 +1283,7 @@ def covr_requested(args: Any) -> bool:
         or getattr(args, "covr_force_strategy_id", None)
         or getattr(args, "covr_strategy_manifest", None)
         or getattr(args, "covr_timestep_feedback", False)
+        or getattr(args, "covr_timestep_feedback_active", False)
     )
 
 
@@ -1306,6 +1307,11 @@ def validate_covr_capabilities(args: Any) -> None:
         if method != "speca":
             raise ValueError(
                 "timestep feedback shadow requires method='speca'")
+        if (getattr(args, "covr_timestep_feedback_active", False)
+                and getattr(args, "compute_controller", "none") != "none"):
+            raise ValueError(
+                "active timestep feedback cannot combine with "
+                "--compute-controller")
         if (getattr(args, "covr_template_bandit", False)
                 or getattr(args, "covr_strategy_bandit", False)
                 or getattr(args, "covr_force_template_id", None)
@@ -1326,6 +1332,10 @@ def validate_covr_capabilities(args: Any) -> None:
         if not math.isfinite(beta) or beta < 0.0:
             raise ValueError(
                 "--covr-timestep-feedback-beta must be non-negative")
+    elif getattr(args, "covr_timestep_feedback_active", False):
+        raise ValueError(
+            "--covr-timestep-feedback-active requires "
+            "--covr-timestep-feedback")
     if (getattr(args, "covr_template_bandit", False)
             or getattr(args, "covr_force_template_id", None)) and method != "speca":
         raise ValueError(

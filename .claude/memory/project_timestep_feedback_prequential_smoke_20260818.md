@@ -18,3 +18,9 @@ one-step defect prior. It is not evidence of better generation quality, does
 not compare against a frozen one-hot/static baseline, and does not activate the
 learner's decisions in the actual SpecA trajectory. The next gate is active
 budget-matched policy evaluation with final latent/decoded metrics.
+
+After adding the unweighted one-hot timestep baseline, learner and baseline
+metrics were exactly identical on this smoke (`MSE=0.19250`, `MAE=0.30743`,
+top-decile recall `0.375`). Therefore clipped IPW/UCB has no demonstrated
+incremental benefit yet; the observed result is only evidence that a timestep
+prior can be learned online.
