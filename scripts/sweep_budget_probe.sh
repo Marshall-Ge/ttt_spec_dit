@@ -141,6 +141,7 @@ SKIP_NOISE="${SKIP_NOISE:-0}"          # 1 = do not rerun the noise replicas
 REFERENCE="${REFERENCE:-1}"            # 1|0 — run the full-compute reference
 REFERENCE_DIR="${REFERENCE_DIR:-}"     # existing reference dir to reuse (default: OUT_DIR/reference)
 IMG_SAVE_LIMIT="${IMG_SAVE_LIMIT:-}"   # PNGs saved per run (default: N_PROMPTS = all)
+VERSION_PROBE_DIR="${VERSION_PROBE_DIR:-${OUT_DIR}/version_probe}"
 
 case "${REWARD_MODE}" in
   terminal) SENTINEL_HORIZON=0 ;;
@@ -291,6 +292,7 @@ per_budget = n_arms + n_noise
 arm_runs = per_budget * len(budgets)
 arm_units = sum(per_budget * k for k in budgets)  # each run costs K forwards/traj
 ref_units = num_steps if reference else 0
+version_probe_units = num_steps
 threshold_runs = len(thresholds) * threshold_replicas
 mean_k = sum(budgets) / len(budgets)
 print("--- cost / disk budget (before any GPU spend) ---")
@@ -301,8 +303,10 @@ if skip_arms:
     print("    SKIP_ARMS=1 -> forced arms are REUSED from disk, not rerun")
 if skip_noise:
     print("    SKIP_NOISE=1 -> existing noise_* dirs are REUSED, not rerun")
-print(f"  forward-units per trajectory: arms={arm_units}, reference={ref_units}"
-      f"{'' if reference else ' (REFERENCE=0)'}, total={arm_units + ref_units}")
+print(f"  forward-units: arms={arm_units}, reference={ref_units}"
+      f"{'' if reference else ' (REFERENCE=0)'}, "
+      f"version_probe={version_probe_units}, "
+      f"total={arm_units + ref_units + version_probe_units}")
 if reference:
     print(f"  reference = {num_steps / mean_k:.1f} average arm-runs "
           f"({num_steps}/{mean_k:.1f}) and {ref_units}/{arm_units + ref_units} "
@@ -320,6 +324,29 @@ if reference:
     print(f"    (reference itself: {img_limit} imgs = "
           f"{img_limit * 256 * 256 * 3 / 1e9:.2f} GB raw)")
 PY
+
+echo ""
+echo "############################################################"
+echo "########## COVR runtime version probe ########################"
+echo "############################################################"
+echo "  dir: ${VERSION_PROBE_DIR}"
+python main.py --model dit --task c2i --dataset imagenet \
+    --method teacache --metrics latency \
+    --seed "${SEED}" --num_steps "${NUM_STEPS}" --n_prompts 1 \
+    --guidance_scale "${GUIDANCE}" --batch_size 1 \
+    --covr-profile-stages --output_dir "${VERSION_PROBE_DIR}"
+VERSION_KEY="$(python - "${VERSION_PROBE_DIR}/results.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)["config"].get("covr_version_key")
+if not value:
+    raise SystemExit("version probe did not produce config.covr_version_key")
+print(value)
+PY
+)"
+echo "  runtime version key: ${VERSION_KEY}"
 
 # ---- full-compute reference (cross-budget, shared, run once) ----
 echo ""
@@ -352,6 +379,7 @@ for K in "${BUDGET_ARR[@]}"; do
   python scripts/build_budget_manifest.py \
       --num-steps "${NUM_STEPS}" --refresh-count "${K}" \
       --random-count "${RANDOM_COUNT}" --random-seed "${RANDOM_SEED}" \
+      --version-key "${VERSION_KEY}" \
       --output "${MANIFEST}"
 
   ARMS=()
