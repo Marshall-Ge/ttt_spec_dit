@@ -24,3 +24,13 @@ metrics were exactly identical on this smoke (`MSE=0.19250`, `MAE=0.30743`,
 top-decile recall `0.375`). Therefore clipped IPW/UCB has no demonstrated
 incremental benefit yet; the observed result is only evidence that a timestep
 prior can be learned online.
+
+Budget-12 active deployment smoke (session s4, seed 45) confirmed that risk
+adaptation is real: with 2 free refresh slots above the 10-refresh safety
+minimum, the learned mask kept the uniform skeleton [0,5,...,45] and placed
+the extra refreshes at steps 4 and 6 — the second/third highest-risk timesteps
+after step 5 (mean 1.26). 48/200 full steps, no NaN. This is the minimal
+viable evidence chain (feedback -> cross-session learning -> mask placement
+change) but NOT a quality claim: no matched-FLOPs FID/IS paired comparison
+has been run yet. The next gate is exactly that comparison (active-learned
+mask vs static uniform at equal budget, 5 latent offsets, paired sign test).
