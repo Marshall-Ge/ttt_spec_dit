@@ -33,3 +33,9 @@ Two gotchas found while enabling the active mask (`--covr-timestep-feedback-acti
    budget=10 the mask is forced to the even layout [0,5,...,45] and the learned
    risk cannot influence placement. Risk adaptation needs budget strictly
    above the minimum (e.g. 12-14) to have slack.
+
+Active deployment smoke (session s3, seed 44, budget 10) then ran clean:
+40/200 full steps (exactly 10 refreshes per trajectory), skip ratio 0.80,
+FLOPs speedup 5.0x, no NaN, 31 new selective contexts. This validates the
+active-mask wiring only — at the minimum safe budget the mask is structurally
+uniform, so no quality or adaptation claim can be made from it.
