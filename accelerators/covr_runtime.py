@@ -1324,6 +1324,14 @@ def validate_covr_capabilities(args: Any) -> None:
         if budget < 0 or budget > num_steps:
             raise ValueError(
                 "--covr-timestep-feedback-budget must be in [0, num_steps]")
+        if getattr(args, "covr_timestep_feedback_active", False):
+            max_gap = int(getattr(args, "speca_max_taylor_steps", 0))
+            minimum_refreshes = math.ceil(num_steps / (max_gap + 1))
+            if budget < minimum_refreshes:
+                raise ValueError(
+                    "active timestep feedback budget is too small for the "
+                    f"SpecA max Taylor gap: need at least {minimum_refreshes} "
+                    f"refreshes for {num_steps} steps and max gap {max_gap}")
         p_min = float(getattr(args, "covr_timestep_feedback_p_min", 0.0))
         if not math.isfinite(p_min) or not 0.0 < p_min <= 1.0:
             raise ValueError(

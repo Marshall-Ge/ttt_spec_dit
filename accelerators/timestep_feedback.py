@@ -255,6 +255,7 @@ class TimestepFeedbackController:
             *,
             budget_refreshes: Optional[int] = None,
             include_first: bool = True,
+            max_taylor_gap: Optional[int] = None,
             ) -> tuple[bool, ...]:
         """Build a fixed mask for the next trajectory from timestep risk.
 
@@ -266,6 +267,17 @@ class TimestepFeedbackController:
             budget_refreshes)
         if not 0 <= budget <= self.num_steps:
             raise ValueError("budget_refreshes must be in [0, num_steps]")
+        if max_taylor_gap is not None:
+            max_taylor_gap = int(max_taylor_gap)
+            if max_taylor_gap < 0:
+                raise ValueError("max_taylor_gap must be non-negative")
+            minimum_refreshes = math.ceil(
+                self.num_steps / (max_taylor_gap + 1))
+            if budget < minimum_refreshes:
+                raise ValueError(
+                    f"refresh budget {budget} cannot satisfy max_taylor_gap "
+                    f"{max_taylor_gap} for {self.num_steps} steps; "
+                    f"need at least {minimum_refreshes} refreshes")
         mandatory = set(self.mandatory_steps)
         if include_first:
             mandatory.add(0)
@@ -294,6 +306,28 @@ class TimestepFeedbackController:
                     remaining -= 1
                     if remaining == 0:
                         break
+        if max_taylor_gap is not None:
+            while True:
+                longest_start = None
+                longest_length = 0
+                index = 0
+                while index < self.num_steps:
+                    if index in selected:
+                        index += 1
+                        continue
+                    start = index
+                    while index < self.num_steps and index not in selected:
+                        index += 1
+                    if index - start > longest_length:
+                        longest_start = start
+                        longest_length = index - start
+                if longest_length <= max_taylor_gap:
+                    break
+                if len(selected) >= budget:
+                    raise ValueError(
+                        "selected refresh mask cannot satisfy max_taylor_gap "
+                        "within the requested budget")
+                selected.add(longest_start + max_taylor_gap)
         return tuple(step in selected for step in range(self.num_steps))
 
     def summary(self) -> Dict[str, Any]:

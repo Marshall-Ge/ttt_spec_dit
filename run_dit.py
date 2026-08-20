@@ -2005,12 +2005,21 @@ def run_c2i(args) -> Dict:
                         expected_version_key=covr_version.key,
                         seed=int(args.seed),
                     )
-                if (timestep_feedback.num_steps != int(args.num_steps)
-                        or timestep_feedback.budget_refreshes != int(
-                            args.covr_timestep_feedback_budget)):
+                if timestep_feedback.num_steps != int(args.num_steps):
                     raise ValueError(
                         "persisted timestep feedback identity does not match "
-                        "the requested num_steps or refresh budget")
+                        "the requested num_steps")
+                requested_budget = int(args.covr_timestep_feedback_budget)
+                if timestep_feedback.budget_refreshes != requested_budget:
+                    if getattr(args, "covr_timestep_feedback_active", False):
+                        # Risk sufficient statistics remain valid when the
+                        # active deployment budget is upgraded to satisfy the
+                        # SpecA max-gap safety constraint.
+                        timestep_feedback.budget_refreshes = requested_budget
+                    else:
+                        raise ValueError(
+                            "persisted timestep feedback budget does not match "
+                            "the requested budget")
             else:
                 timestep_feedback = TimestepFeedbackController(
                     num_steps=int(args.num_steps),
@@ -2197,7 +2206,8 @@ def run_c2i(args) -> Dict:
         feedback_speca_init_kwargs = speca_init_kwargs
         if (timestep_feedback is not None
                 and getattr(args, "covr_timestep_feedback_active", False)):
-            feedback_mask = timestep_feedback.recommended_refresh_mask()
+            feedback_mask = timestep_feedback.recommended_refresh_mask(
+                max_taylor_gap=int(args.speca_max_taylor_steps))
             feedback_speca_init_kwargs = {
                 **speca_init_kwargs,
                 "refresh_mask": feedback_mask,

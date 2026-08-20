@@ -66,6 +66,7 @@ def _runtime_args(**overrides):
         "covr_timestep_feedback_p_min": 0.02,
         "covr_timestep_feedback_beta": 1.0,
         "num_steps": 50,
+        "speca_max_taylor_steps": 4,
         "seed": 42,
     }
     values.update(overrides)

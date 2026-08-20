@@ -99,6 +99,23 @@ def test_refresh_mask_falls_back_to_even_schedule_then_uses_risk():
     assert learned_mask[0] and learned_mask[4] and learned_mask[7]
 
 
+def test_refresh_mask_rejects_unsafe_budget_and_repairs_gaps():
+    controller = _controller(num_steps=10, budget_refreshes=1)
+    with pytest.raises(ValueError, match="need at least 2 refreshes"):
+        controller.recommended_refresh_mask(max_taylor_gap=4)
+
+    controller = _controller(num_steps=10, budget_refreshes=3)
+    mask = controller.recommended_refresh_mask(max_taylor_gap=4)
+    assert sum(mask) == 3
+    assert mask[0] and mask[-1]
+    longest_gap = 0
+    current_gap = 0
+    for refresh in mask:
+        current_gap = 0 if refresh else current_gap + 1
+        longest_gap = max(longest_gap, current_gap)
+    assert longest_gap <= 4
+
+
 def test_price_updates_toward_target_refresh_rate():
     controller = _controller(
         budget_refreshes=3, initial_price=0.5, price_learning_rate=0.2)
