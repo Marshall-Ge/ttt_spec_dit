@@ -19,3 +19,17 @@ The real sampling loop completed successfully:
 This validates runtime wiring, selective label recording, and state persistence.
 The smoke is not a quality result and is too small to establish online learning
 benefit or trajectory parity beyond successful execution.
+
+Two gotchas found while enabling the active mask (`--covr-timestep-feedback-active`):
+
+1. **NaN crash from unconstrained risk masks**: the first active attempt spent
+   the whole budget on high-risk early steps (1-10), leaving a ~24-step Taylor
+   gap in the second half; SpecA diverged and `transition_defect_batch` raised
+   "transition metrics must be finite and non-negative". Fix: gap safety must
+   be enforced BEFORE risk-driven selection (`recommended_refresh_mask` phase
+   1 repairs all gaps > max_taylor_gap, phase 2 spends leftover budget on risk).
+2. **No adaptation slack at the minimum budget**: with 50 steps and
+   max_taylor_gap=4 the minimum safe refresh count is 10 (ceil(50/5)); at
+   budget=10 the mask is forced to the even layout [0,5,...,45] and the learned
+   risk cannot influence placement. Risk adaptation needs budget strictly
+   above the minimum (e.g. 12-14) to have slack.

@@ -107,7 +107,23 @@ def test_refresh_mask_rejects_unsafe_budget_and_repairs_gaps():
     controller = _controller(num_steps=10, budget_refreshes=3)
     mask = controller.recommended_refresh_mask(max_taylor_gap=4)
     assert sum(mask) == 3
-    assert mask[0] and mask[-1]
+    assert mask[0]
+    longest_gap = 0
+    current_gap = 0
+    for refresh in mask:
+        current_gap = 0 if refresh else current_gap + 1
+        longest_gap = max(longest_gap, current_gap)
+    assert longest_gap <= 4
+
+
+def test_refresh_mask_repairs_gap_before_risk_spends_budget():
+    controller = _controller(num_steps=50, budget_refreshes=10)
+    for step in (1, 3, 4, 5, 6, 8, 9, 10):
+        controller.observe(step, 1.5, 1.0)
+
+    mask = controller.recommended_refresh_mask(max_taylor_gap=4)
+    assert sum(mask) == 10
+    assert mask[0]
     longest_gap = 0
     current_gap = 0
     for refresh in mask:

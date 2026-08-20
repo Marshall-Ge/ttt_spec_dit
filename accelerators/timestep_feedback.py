@@ -284,6 +284,51 @@ class TimestepFeedbackController:
         if len(mandatory) > budget:
             raise ValueError("mandatory steps exceed refresh budget")
         selected = set(mandatory)
+
+        # Phase 1 — gap safety FIRST: repair every gap longer than
+        # ``max_taylor_gap`` before any risk-driven pick spends budget.
+        # Repair positions prefer the highest-risk step inside the window
+        # that keeps both residual gaps within the limit.
+        if max_taylor_gap is not None:
+            while True:
+                longest_start = None
+                longest_end = None
+                longest_length = 0
+                index = 0
+                while index < self.num_steps:
+                    if index in selected:
+                        index += 1
+                        continue
+                    start = index
+                    while index < self.num_steps and index not in selected:
+                        index += 1
+                    if index - start > longest_length:
+                        longest_start = start
+                        longest_end = index
+                        longest_length = index - start
+                if longest_length <= max_taylor_gap:
+                    break
+                if len(selected) >= budget:
+                    raise ValueError(
+                        "selected refresh mask cannot satisfy max_taylor_gap "
+                        "within the requested budget")
+                window_start = max(
+                    longest_start, longest_end - 1 - max_taylor_gap)
+                window_end = min(
+                    longest_end - 1, longest_start + max_taylor_gap)
+                if window_start <= window_end:
+                    window = range(window_start, window_end + 1)
+                    center = (window_start + window_end) / 2.0
+                    selected.add(max(
+                        window,
+                        key=lambda step: (
+                            self.risk(step)[1],
+                            -abs(step - center))))
+                else:
+                    selected.add(longest_start + max_taylor_gap)
+
+        # Phase 2 — spend any leftover budget on the highest-risk steps.
+        # Adding refreshes only shrinks gaps, so gap safety is preserved.
         remaining = budget - len(selected)
         if remaining > 0:
             observed = sum(stats.observations for stats in self._stats)
@@ -306,28 +351,6 @@ class TimestepFeedbackController:
                     remaining -= 1
                     if remaining == 0:
                         break
-        if max_taylor_gap is not None:
-            while True:
-                longest_start = None
-                longest_length = 0
-                index = 0
-                while index < self.num_steps:
-                    if index in selected:
-                        index += 1
-                        continue
-                    start = index
-                    while index < self.num_steps and index not in selected:
-                        index += 1
-                    if index - start > longest_length:
-                        longest_start = start
-                        longest_length = index - start
-                if longest_length <= max_taylor_gap:
-                    break
-                if len(selected) >= budget:
-                    raise ValueError(
-                        "selected refresh mask cannot satisfy max_taylor_gap "
-                        "within the requested budget")
-                selected.add(longest_start + max_taylor_gap)
         return tuple(step in selected for step in range(self.num_steps))
 
     def summary(self) -> Dict[str, Any]:
