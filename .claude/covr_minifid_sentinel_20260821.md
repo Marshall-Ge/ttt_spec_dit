@@ -1,7 +1,13 @@
 # P1' 设计规格：mini-FID 哨兵（session 级小样本 FID 负反馈信号）
 
 > 日期：2026-08-21
-> 状态：**ACTIVE — [P1'-a] 判据已预注册，等 GPU 特征提取后裁决**
+> 状态：**CLOSED — Gate [P1'-a] FAIL（2026-08-21，a2 功率腿）**。
+> n=100 方向正确率 80.5-88.5% < 预注册 90% bar，连 ~5×floor 的
+> back/front pair（ΔFID≈10）都只有 84-86%。死因 = 小样本功率不足
+> （信息轴正确，与 conf 的死法互补）——正是 §4 风险 1 预言、
+> [P1'-a2] 设计要裁决的那个死法。按 §2 预注册规则关闭，不调参。
+> 结论与待补项：`memory/project_minifid_gate_fail_20260821.md`。
+> 骨架（`accelerators/conf_budget_controller.py`）与死因无关，保留。
 > 前驱：P1（conf 信号）Gate [P1-a] FAIL 关闭
 > （`.claude/covr_quality_constrained_budget_20260820.md`、
 > `memory/project_p1_conf_gate_fail_20260821.md`）。本方向是其条目里预告的
