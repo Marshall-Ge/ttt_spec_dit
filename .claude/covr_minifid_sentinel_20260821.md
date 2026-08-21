@@ -2,11 +2,13 @@
 
 > 日期：2026-08-21
 > 状态：**CLOSED — Gate [P1'-a] FAIL（2026-08-21，a2 功率腿）**。
-> n=100 方向正确率 80.5-88.5% < 预注册 90% bar，连 ~5×floor 的
-> back/front pair（ΔFID≈10）都只有 84-86%。死因 = 小样本功率不足
-> （信息轴正确，与 conf 的死法互补）——正是 §4 风险 1 预言、
-> [P1'-a2] 设计要裁决的那个死法。按 §2 预注册规则关闭，不调参。
-> 结论与待补项：`memory/project_minifid_gate_fail_20260821.md`。
+> a1 有效性 PASS（5/5 组 0 排错，mini500 与真 FID 逐位相等——实现
+> 忠实度封顶）；a2 功率 FAIL（85 个 gated pair 中 17 个 acc
+> 80.5-88.5% < 90% bar；geo/back 试金石 5/5 全过 ≥90%）。死因 =
+> n=100 小样本方差（mini100 sd≈4 FID → 单 epoch 检测下限 ~7 FID），
+> 信息轴正确，与 conf 的死法互补——正是 §4 风险 1 预言、[P1'-a2]
+> 设计要裁决的那个死法。按 §2 预注册规则关闭，不调参。
+> 完整数字：`memory/project_minifid_gate_fail_20260821.md`。
 > 骨架（`accelerators/conf_budget_controller.py`）与死因无关，保留。
 > 前驱：P1（conf 信号）Gate [P1-a] FAIL 关闭
 > （`.claude/covr_quality_constrained_budget_20260820.md`、

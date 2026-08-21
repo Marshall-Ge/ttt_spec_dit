@@ -44,6 +44,6 @@
 21	- [timestep feedback active 配对质量结果](project_timestep_feedback_active_paired_result_20260819.md) — K=12 等 FLOPs 配对：risk-learned(4,6) vs uniform(2,47) FID +0.294±0.949、IS -0.153±0.418，全噪声内；三环证据链闭合，learned placement 不改善质量，该方向按质量方法关闭
 22	- [Taylor term 范数信号离线 gate=负](project_taylor_term_norm_signal_offline_20260820.md) — P3 候选信号在 37,808 条 shadow events 上对 defect_{d+1}/爆炸目标的边际 ≤0.03% R²（one-hot step+dist 已解释 99% context 级方差）；切片内 tn2 与 defect 呈 -0.687 负相关，方向相反；离线关闭，不花 GPU；P1（conf 质量约束预算校准）规格见 .claude/covr_quality_constrained_budget_20260820.md
 - [P1 conf 信号 [P1-a] gate 失败](project_p1_conf_gate_fail_20260821.md) — K8 static 6 arm × 5 offsets：conf 完美追踪 IS（5/5 Spearman=1.000）但对 FID 轴致盲（geo/back pair IS 并列、FID 差 4×地板，conf 4/5 排反）；FID-IS decoupling 下 conf 跟 IS 走；P1 按预注册规则关闭；后继候选 = mini-FID 哨兵（同批 PNG 可离线 gate）
-- [mini-FID 哨兵 [P1'-a] gate 失败](project_minifid_gate_fail_20260821.md) — n=100 方向正确率 80.5-88.5% < 预注册 90% bar，连 5×floor 的 back/front（ΔFID≈10）都只有 84-86%；死因=小样本功率不足（信息轴正确，与 conf 死法互补）；方向按预注册关闭；探索性 acc-vs-n 功率曲线可用同一 feats.npz 零成本算，但更大 epoch 哨兵须新预注册
+- [mini-FID 哨兵 [P1'-a] gate 失败](project_minifid_gate_fail_20260821.md) — a1 有效性 PASS（mini500 与真 FID 逐位相等，5/5 组 0 排错；geo/back 试金石 5/5 ≥90%）但 a2 功率 FAIL（85 gated pair 中 17 个 acc 80.5-88.5%<90%）；n=100 单 epoch 检测下限 ~7 FID（mini100 sd≈4）；死因=小样本方差非信息错误，与 conf 死法互补；方向按预注册关闭；acc-vs-n 功率曲线可用同一 feats.npz 零成本探索，更大 epoch 哨兵须新预注册
 23	- [简短提供测试命令](feedback_concise_test_commands.md) — 远程测试场景只给从真实入口开始的核心命令
 24	- [input_tokens 错误后自动续做](feedback_resume_after_input_tokens_error.md) — 遇到客户端 token 错误时拆分调用并持续完成任务，不输出空响应
