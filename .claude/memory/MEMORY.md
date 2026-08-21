@@ -43,5 +43,6 @@
 20	- [timestep feedback prequential smoke](project_timestep_feedback_prequential_smoke_20260818.md) — 两 session held-out one-step MSE 0.358→0.027、MAE 0.502→0.113、top-decile recall 0→0.75；与 unweighted one-hot baseline 完全相同，尚无 IPW/UCB 增量收益，不代表 FID 或 active policy 收益
 21	- [timestep feedback active 配对质量结果](project_timestep_feedback_active_paired_result_20260819.md) — K=12 等 FLOPs 配对：risk-learned(4,6) vs uniform(2,47) FID +0.294±0.949、IS -0.153±0.418，全噪声内；三环证据链闭合，learned placement 不改善质量，该方向按质量方法关闭
 22	- [Taylor term 范数信号离线 gate=负](project_taylor_term_norm_signal_offline_20260820.md) — P3 候选信号在 37,808 条 shadow events 上对 defect_{d+1}/爆炸目标的边际 ≤0.03% R²（one-hot step+dist 已解释 99% context 级方差）；切片内 tn2 与 defect 呈 -0.687 负相关，方向相反；离线关闭，不花 GPU；P1（conf 质量约束预算校准）规格见 .claude/covr_quality_constrained_budget_20260820.md
+- [P1 conf 信号 [P1-a] gate 失败](project_p1_conf_gate_fail_20260821.md) — K8 static 6 arm × 5 offsets：conf 完美追踪 IS（5/5 Spearman=1.000）但对 FID 轴致盲（geo/back pair IS 并列、FID 差 4×地板，conf 4/5 排反）；FID-IS decoupling 下 conf 跟 IS 走；P1 按预注册规则关闭；后继候选 = mini-FID 哨兵（同批 PNG 可离线 gate）
 23	- [简短提供测试命令](feedback_concise_test_commands.md) — 远程测试场景只给从真实入口开始的核心命令
 24	- [input_tokens 错误后自动续做](feedback_resume_after_input_tokens_error.md) — 遇到客户端 token 错误时拆分调用并持续完成任务，不输出空响应

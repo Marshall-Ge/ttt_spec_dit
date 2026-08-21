@@ -40,6 +40,7 @@
 ├── run_ttt_benchmark.py           # TTT 独立 benchmark: 单类/跨类全评估 (FID/IS), plugin 跨 image 持续训练
 ├── ttt_baseline.py                # Phase 1 原型: PixArt 特征探测 + 开环线性推测 baseline (历史遗留, 无 TTT)
 ├── test_checkpoint_manager.py     # VFL checkpoint manager (retention) 单测
+├── test_conf_budget_controller.py # P1 运行时控制器单测 (含与离线 gate 旧内联逻辑的逐 epoch 等价性)
 ├── models/
 │   ├── __init__.py            # 导出 DiTTransformer2D, PixArtTransformer2D
 │   ├── dit.py                 # DiTTransformer2D — 显式 forward, SpecA/TeaCache/TTT 分支可见
@@ -59,6 +60,8 @@
 │   │                          #   Phase 1 仅 DiT 非 TTT 主去噪循环; 禁用时不构造任何对象
 │   ├── covr_viability.py      # Opt-in batch=1 causal-prefix scalar recorder (JSONL)
 │   ├── covr_bandit.py         # ConservativeTemplateBandit (EXPERIMENTAL, 语义冻结) + manifests
+│   ├── conf_budget_controller.py # P1 运行时: Cusum + ConfBudgetController (session 级预算梯决策,
+│   │                          #   无 tensor/模型依赖; 离线 gate harness 消费同一份代码)
 │   └── timestep_feedback.py   # Session-level per-timestep defect learner: clipped IPW, p_min, hard budget, state gate
 ├── verification_feedback_loop/    # VFL 子系统 (三层架构, 详见 §12)
 │   ├── __init__.py            # 导出所有公共符号
@@ -94,6 +97,10 @@
     ├── run_covr_v2_viability_probe.sh # batch=1 causal-prefix OOS viability probe
     ├── analyze_covr_v2_viability.py # machine-readable OOS headroom gate
     ├── analyze_timestep_feedback.py # session-held-out one-step timestep learner analysis
+    ├── extract_inception_feats.py # GPU: PNG -> InceptionV3 2048 特征 npz (mini-FID 哨兵 [P1'-a] 输入,
+    │                          #   real_299 按 (文件名,大小) 去重; 预处理与 eval/fid_is.py 逐位一致)
+    ├── analyze_minifid_rank_validity.py # 纯 numpy [P1'-a] gate: Gram 域谱等价 mini-FID +
+    │                          #   above-floor pair 排序判决 (预注册判据, 内置快/慢路径数值自检)
     └── calibrate_teacache.py  # TeaCache 多项式系数标定脚本
 ```
 

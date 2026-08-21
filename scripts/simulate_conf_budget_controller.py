@@ -40,9 +40,17 @@ import argparse
 import csv
 import json
 import math
+import os
+import sys
 from collections import defaultdict
 
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from accelerators.conf_budget_controller import (  # noqa: E402
+    ConfBudgetController,
+    Cusum,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -80,22 +88,11 @@ def paired_gap(arms, by_img, arm_a, arm_b):
 
 
 # ---------------------------------------------------------------------------
-# CUSUM on standardized -conf
+# CUSUM helpers for detector-only analyses (mode_power). The Cusum class and
+# the full ladder walker live in accelerators/conf_budget_controller.py —
+# the SAME code the online controller runs, so the gate numbers printed here
+# certify the runtime arithmetic bit for bit.
 # ---------------------------------------------------------------------------
-
-class Cusum:
-    """Upward CUSUM on standardized entropy (entropy larger = quality worse;
-    alarm detects degradation). k=delta is the drift allowance in sigma."""
-
-    def __init__(self, mu0, sigma0, delta=0.5, h=5.0):
-        self.mu0, self.s0 = mu0, max(sigma0, 1e-9)
-        self.k, self.h, self.s = delta, h, 0.0
-
-    def update(self, x):
-        z = (x - self.mu0) / self.s0   # z>0 = worse than calibration
-        self.s = max(0.0, self.s + z - self.k)
-        return self.s > self.h
-
 
 def epoch_alarm(cusum, vals):
     return any(cusum.update(v) for v in vals)
@@ -286,39 +283,22 @@ def mode_simulate(arms, args):
           f"{args.n_epochs} epochs ==")
     alarms = 0
     for _ in range(trials):
-        k = ref
+        # the exact runtime controller walks the ladder (calibration epoch
+        # at the top rung -> CUSUM upshift / stable-epoch downshift)
         calib = rng.choice(ref_v, size=args.epoch, replace=True)
-        mu0, s0 = calib.mean(), calib.std(ddof=1)
-        cusum = Cusum(mu0, s0, args.delta, args.h)
-        z_hist = []
+        ctrl = ConfBudgetController.calibrate(
+            ladder, calib, delta=args.delta, h=args.h, eps=args.eps,
+            stable=args.stable, alarm_to_top=bool(args.alarm_to_top))
         for _ep in range(args.n_epochs):
+            k = ctrl.rung
             v = rng.choice(arm_conf(arms, arm_of[k]), size=args.epoch,
                            replace=True)
-            fired = epoch_alarm(cusum, v)
+            decision = ctrl.end_epoch(v)
             tot_imgs += args.epoch
             tot_flops += args.epoch * flops_of[k]
             budget_hist[k] += 1
             mixture[k] += args.epoch
-            if fired:
-                alarms += 1
-                cusum = Cusum(mu0, s0, args.delta, args.h)
-                z_hist.clear()
-                k = ladder[0] if args.alarm_to_top else \
-                    min((b for b in ladder if b > k), default=k)
-            else:
-                z = (mu0 - v) / s0
-                z_hist.append(z.mean())
-                if len(z_hist) >= args.stable:
-                    recent = z_hist[-args.stable:]
-                    se = np.std(recent, ddof=1) / math.sqrt(len(recent))
-                    if np.mean(recent) + 1.645 * se >= -args.eps:
-                        new_k = max((b for b in ladder if b < k), default=k)
-                        if new_k != k:
-                            # the "S clean epochs" clock restarts at the new
-                            # rung — stale epochs from the higher budget must
-                            # not chain into an immediate second downstep
-                            z_hist.clear()
-                            k = new_k
+            alarms += decision.alarmed
     mean_flops = tot_flops / max(tot_imgs, 1)
     saving = 1 - mean_flops / null_flops
     print(f"  mean FLOPs/img = {mean_flops:.3f} T vs null {null_flops:.3f} T "

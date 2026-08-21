@@ -1,12 +1,17 @@
 # P1 设计规格：质量约束的在线预算校准（inception-confidence session 闭环）
 
 > 日期：2026-08-20（工具链更新：2026-08-21）
-> 状态：**SPEC — 离线 gate 待跑**（数据在 GPU 机，本机不可达；
-> 四个脚本已全部就绪并通过本地合成数据冒烟测试，机器恢复即可按 §5 执行）
+> 状态：**CLOSED — Gate [P1-a] FAIL（2026-08-21，5/5 offset 复现）**。
+> conf 在 K8 static 6 arm 上完美追踪 IS（5/5 Spearman(−IS)=1.000）但对
+> FID 轴致盲（FID Spearman 0.31-0.60；geo/back above-floor pair 4/5 排反）。
+> 按 §3 预注册规则整条线停，[P1-b]/[P1-c] 未跑（moot）。
+> 结论与机制：`memory/project_p1_conf_gate_fail_20260821.md`；后继候选
+> （mini-FID 哨兵，同批 PNG 可离线 gate）见该条 Reopen 段。
 > 上游事实：inception_conf 是唯一通过过 [a] validity gate 的信号
 > （k8/k6 内 Spearman(mean_conf, FID)=1.000，Spearman(mean_conf, −IS)=1.000，
 > 见 `memory/project_covr_budget_probe_500_results.md`）。被否决的只是
 > per-image crossover 回收（天花板贴噪声地板），session 级使用从未测过。
+> （事后可知：probe 的 [a] 通过靠的是那 4 臂上 FID-IS 恰好同序。）
 
 ## 1. 问题重定义
 
@@ -127,3 +132,11 @@ python3 scripts/compute_mixture_fid.py plan.json \
 BICUBIC 链路），故混合 FID 与各 run results.json 直接可比；simulate 修复了
 降档后 z_hist 未清空导致的级联降档 bug（回归测试：三档同分布 →
 occupancy {8:2, 6:2, 4:6}）。
+
+控制器已模块化（2026-08-21，gate FAIL 后仍保留——"换信号不换骨架"）：
+决策状态机提炼为 `accelerators/conf_budget_controller.py`
+（`Cusum` + `ConfBudgetController`，无 tensor/模型依赖），
+`simulate_conf_budget_controller.py` 的 power/simulate 两模式直接消费同一份
+代码；`test_conf_budget_controller.py` 10 项单测含与旧内联 gate 逻辑的
+逐 epoch 等价性断言（3 参数配置 × 20 种子，轨迹逐位一致）。任何后继信号
+（如 mini-FID 哨兵）复用该骨架时，离线 gate 数字即认证线上代码。
