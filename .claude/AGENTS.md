@@ -15,7 +15,7 @@
 - **两条在线学习路线**（不影响基础加速器，可叠加）：
   - **TTT** — DiT-only，~0.92M `SessionAdaLNModulator` 插件，蒸馏 teacher 信号改进 TeaCache 的 stale cached state（缓存**内容**）。
   - **VFL/COVR** — 三层反馈环（L1 在线阈值校准 / L2 分层回放 / L3 异步 LoRA）+ 反事实在线学习，改进缓存**决策**。
-- **当前研究状态**：COVR full-context 在线控制器主线已 **STOP**（见 `.claude/covr_spec_research_conclusion.md`），保留 shadow auditor 作为基础设施；推荐转向 timestep-aware 静态/分段预算调度。VFL LoRA 训练信号源存在根因缺陷（见 `memory/project_vfl_signal_source_flaw.md`）。
+- **当前研究状态**（2026-08-20 更新）：COVR full-context 在线控制器主线 **STOP**（`covr_spec_research_conclusion.md`）；timestep feedback active 方向按质量 gate 关闭（2026-08-19，三环证据链闭合）；"Taylor term 范数前兆信号"离线 gate **负**（2026-08-20，`memory/project_taylor_term_norm_signal_offline_20260820.md`）。**当前活跃方向：P1 质量约束的在线预算校准**（inception-confidence session 闭环，规格与 gate 见 `.claude/covr_quality_constrained_budget_20260820.md`；2026-08-21 全链路五脚本定稿并通过本地合成数据冒烟——extract_inception_conf / analyze_conf_rank_validity（三态裁决+精确置换）/ build_conf_costs / simulate_conf_budget_controller（[P1-b]/[P1-c] 判决行+级联降档 bug 修复）/ compute_mixture_fid（与 fid_is.py 逐位一致的混合 FID）——待 GPU 机恢复后按规格 §5 执行三个离线 gate）。VFL LoRA 训练信号源根因缺陷见 `memory/project_vfl_signal_source_flaw.md`。
 
 ## 三类资产分工（避免重复）
 
