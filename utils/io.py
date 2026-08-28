@@ -47,70 +47,73 @@ def load_real_image(path: str, size: int = 299) -> torch.Tensor:
     return pil_to_tensor(pil)
 
 
-def ensure_real_299(ds, output_dir: str, n: int) -> str:
+def ensure_real_299(ds, output_dir: str, n: int,
+                   start_index: int = 0) -> str:
     """Ensure real images at 299×299 exist for FID.
 
-    Pre-processes all dataset images to 299×299 once into a flat directory,
-    then creates a lightweight subset via symlinks for the current run's
-    shuffle order and sample count.
+    Pre-processes dataset images to 299×299 once into a flat cache keyed by
+    SOURCE PATH (not dataset index), so different ``--seed`` shuffle orders
+    share the same cache. The run-specific subset links them under names
+    prefixed by the ABSOLUTE dataset index (``start_index + i``), which keeps
+    resume/dataset-window runs stable.
 
-    Returns path to the subset directory (symlinks into the pre-processed cache).
+    Raises RuntimeError when the linked subset is incomplete (missing source
+    images must be fatal — a silent skip would produce NaN FID).
     """
     import os as _os
     from tqdm import tqdm as _tqdm
 
-    # Determine cache path from dataset root and set name
     val_dir = getattr(ds, 'val_dir', None)
     if val_dir is None:
         val_dir = _os.path.dirname(ds[0][0]) if len(ds) > 0 else "/tmp"
     cache_dir = _os.path.join(_os.path.dirname(val_dir) or val_dir, "val_299_cache")
     _os.makedirs(cache_dir, exist_ok=True)
 
-    # Pre-process all dataset images once (including class name in filename)
+    # 1) Pre-process each source image once, keyed by its path stem.
     existing = set(_os.listdir(cache_dir))
-    total_items = len(ds.items) if hasattr(ds, 'items') else len(ds)
-    need_preprocess = sum(1 for i in range(total_items)
-                          if not any(f.startswith(f"{i:06d}_") for f in existing))
+    for i in _tqdm(range(len(ds)), desc="preprocess real 299", ncols=80):
+        item = ds[i]
+        img_path = item[0] if isinstance(item, (tuple, list)) else item
+        if not _os.path.exists(img_path):
+            continue
+        stem = _os.path.splitext(_os.path.basename(img_path))[0]
+        cache_name = f"src_{stem}.png"
+        out_path = _os.path.join(cache_dir, cache_name)
+        if cache_name in existing or _os.path.exists(out_path):
+            continue
+        pil_img = Image.open(img_path).convert("RGB")
+        pil_img = pil_img.resize((299, 299), Image.BICUBIC)
+        pil_img.save(out_path)
 
-    if need_preprocess > 0:
-        print(f"  [FID] Pre-processing {need_preprocess} real images to 299×299 "
-              f"(one-time, cached in {cache_dir})...")
-        for idx in _tqdm(range(total_items), desc="preprocess real 299", ncols=80):
-            # Get class name from dataset prompt
-            if hasattr(ds, '__getitem__'):
-                _, prompt, _ = ds[idx]
-                cls_name = prompt.replace("a photo of a ", "").replace(" ", "_")
-            else:
-                cls_name = "unknown"
-            fname = f"{idx:06d}_{cls_name}.png"
-            out_path = _os.path.join(cache_dir, fname)
-            if _os.path.exists(out_path):
-                continue
-            img_path = ds[idx][0] if hasattr(ds, '__getitem__') else ds.items[idx][0]
-            if not _os.path.exists(img_path):
-                continue
-            pil_img = Image.open(img_path).convert("RGB")
-            pil_img = pil_img.resize((299, 299), Image.BICUBIC)
-            pil_img.save(out_path)
-
-    # Create run-specific subset via symlinks (match cache filename format)
+    # 2) Link the run-specific subset with absolute-index names.
     subset_dir = _os.path.join(output_dir, "real_299")
     _os.makedirs(subset_dir, exist_ok=True)
-
-    # Clean previous symlinks
     for f in _os.listdir(subset_dir):
         p = _os.path.join(subset_dir, f)
         if _os.path.islink(p) or f.endswith('.png'):
             _os.remove(p)
 
-    for idx in range(n):
-        _, prompt, _ = ds[idx] if hasattr(ds, '__getitem__') else (None, "unknown", None)
-        cls_name = prompt.replace("a photo of a ", "").replace(" ", "_")
-        fname = f"{idx:06d}_{cls_name}.png"
-        src = _os.path.join(cache_dir, fname)
-        dst = _os.path.join(subset_dir, fname)
+    linked = 0
+    for i in range(n):
+        item = ds[i]
+        img_path = item[0] if isinstance(item, (tuple, list)) else item
+        if not _os.path.exists(img_path):
+            continue
+        stem = _os.path.splitext(_os.path.basename(img_path))[0]
+        cls_name = str(item[1]).replace("a photo of a ", "").replace(" ", "_") \
+            if isinstance(item, (tuple, list)) and len(item) > 1 else "unknown"
+        abs_idx = start_index + i
+        link_name = f"{abs_idx:06d}_source_{abs_idx}_{cls_name}.png"
+        src = _os.path.join(cache_dir, f"src_{stem}.png")
+        dst = _os.path.join(subset_dir, link_name)
         if _os.path.exists(src):
             _os.symlink(src, dst)
+            linked += 1
+
+    if linked != n:
+        raise RuntimeError(
+            f"real_299 incomplete: linked {linked}/{n} "
+            f"(missing source images in {val_dir})")
 
     print(f"  [FID] real_299 ready: {n} symlinks → {cache_dir}")
     return subset_dir

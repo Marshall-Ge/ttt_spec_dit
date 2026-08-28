@@ -18,7 +18,7 @@ from accelerators.covr_bandit import (
     TemplateManifest,
     TimestepSafetyPrior,
 )
-from experiments.covr_analysis import build_template_manifest
+from scripts.analyze.covr_analysis import build_template_manifest
 
 
 def _manifest():
@@ -232,7 +232,7 @@ def test_manifest_cli_writes_loadable_manifest(tmp_path):
 
     completed = subprocess.run(
         [
-            sys.executable, "scripts/build_covr_manifest.py", str(audits),
+            sys.executable, "scripts/analyze/build_covr_manifest.py", str(audits),
             "--output", str(output), "--num-layers", "2",
             "--template-count", "3", "--mandatory-prefix", "2",
             "--max-taylor-gap", "3",

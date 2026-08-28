@@ -23,7 +23,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
 
 from config import PIXART_REPO, DIT_REPO, HF_CACHE_DIR

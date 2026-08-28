@@ -152,7 +152,7 @@ PY
   fi
 
   echo "[2/3] Building TeaCache threshold and fixed-mask arms"
-  python scripts/experiment/build_budget_manifest.py "${manifest_args[@]}"
+  python scripts/analyze/build_budget_manifest.py "${manifest_args[@]}"
 else
   echo "COVR TeaCache bandit resume root: ${ROOT}"
 fi

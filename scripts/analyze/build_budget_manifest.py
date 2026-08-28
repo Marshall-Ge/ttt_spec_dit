@@ -35,7 +35,7 @@ import random
 import sys
 from typing import List, Tuple
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from accelerators.covr_bandit import AccelerationStrategy, StrategyManifest
 

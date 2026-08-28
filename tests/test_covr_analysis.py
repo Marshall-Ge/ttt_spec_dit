@@ -11,7 +11,7 @@ from accelerators.covr import (
     CounterfactualEvent,
     TransitionDefectBatch,
 )
-from experiments.covr_analysis import (
+from scripts.analyze.covr_analysis import (
     evaluate_gate_a,
     evaluate_gate_b,
     evaluate_action_aligned_timestep,

@@ -28,7 +28,7 @@ import os
 import sys
 from typing import Sequence
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from accelerators.covr_bandit import AccelerationStrategy, StrategyManifest
 

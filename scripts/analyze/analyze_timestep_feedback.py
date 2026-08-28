@@ -17,7 +17,7 @@ import sys
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from accelerators.covr import COVRAction, read_action_audits  # noqa: E402
 from accelerators.timestep_feedback import (  # noqa: E402

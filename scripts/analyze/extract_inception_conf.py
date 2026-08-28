@@ -31,8 +31,8 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from analyze_crossover import _entropy_from_logits, _inception_features  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from scripts.analyze.analyze_crossover import _entropy_from_logits, _inception_features  # noqa: E402
 
 _PNG_NAME = re.compile(r"^(\d{6})_(.+)\.png$")
 

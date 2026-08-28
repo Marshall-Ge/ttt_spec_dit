@@ -14,10 +14,7 @@ import numpy as np
 import pytest
 import torch
 
-sys.path.insert(0, os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
-
-import analyze_crossover as ac  # noqa: E402
+from scripts.analyze import analyze_crossover as ac  # noqa: E402
 
 
 class _StubExtractor(torch.nn.Module):

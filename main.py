@@ -275,6 +275,25 @@ Examples:
                              "conservative late). Validated: same skip rate, "
                              "latent MSE -17%; late-limited -37% at -6% skip. "
                              "Requires --method speca.")
+    parser.add_argument("--covr-timestep-feedback", action="store_true",
+                        default=False,
+                        help="Shadow-only session-level timestep feedback "
+                             "learner (one-step defect target)")
+    parser.add_argument("--covr-timestep-feedback-active", action="store_true",
+                        default=False,
+                        help="Use the learned timestep mask for the next "
+                             "trajectory (experimental; requires feedback)")
+    parser.add_argument("--covr-timestep-feedback-budget", type=int, default=8,
+                        help="Refresh budget for timestep feedback shadow "
+                             "controller (default: 8)")
+    parser.add_argument("--covr-timestep-feedback-state", type=str, default=None,
+                        help="Persisted timestep feedback state path")
+    parser.add_argument("--covr-timestep-feedback-p-min", type=float, default=0.02,
+                        help="Minimum refresh exploration propensity")
+    parser.add_argument("--covr-timestep-feedback-beta", type=float, default=1.0,
+                        help="Timestep feedback UCB coefficient")
+    # ---- TTT (Test-Time Training plugin, DiT-only) ----
+
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
     parser.add_argument("--guidance_scale", type=float, default=DEFAULT_GUIDANCE_SCALE,

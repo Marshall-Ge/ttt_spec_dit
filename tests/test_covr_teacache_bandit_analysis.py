@@ -10,7 +10,7 @@ from scripts.analyze.analyze_covr_teacache_bandit import analyze_state
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "scripts" / "analyze_covr_teacache_bandit.py"
+SCRIPT = ROOT / "scripts" / "analyze" / "analyze_covr_teacache_bandit.py"
 
 
 def _fixtures():

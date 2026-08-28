@@ -115,10 +115,14 @@ class TestOnlineCalibrator:
             event = _make_event(layer_id=5, timestep_bucket=1, error_value=error)
             cal.update(event)
 
+        # Conservative mode: static default acts as a floor
         thresh = cal.get_threshold(5, 1, default=0.25)
-        # Should no longer be the default
+        assert thresh == 0.25
+
+        # Exploit mode: online threshold (mean + k*std ~ 0.05) is returned
+        cal.set_exploit_mode(True)
+        thresh = cal.get_threshold(5, 1, default=0.25)
         assert thresh != 0.25
-        # Should be positive and reasonable
         assert 0.001 <= thresh <= 1.0, f"threshold={thresh}"
 
     def test_multi_stratum_isolation(self):
@@ -158,7 +162,7 @@ class TestOnlineCalibrator:
 
     def test_get_stats(self):
         cal = OnlineCalibrator()
-        for _ in range(20):
+        for _ in range(60):  # >= is_ready threshold (50 updates)
             cal.update(_make_event(layer_id=5, timestep_bucket=1, error_value=0.05))
 
         stats = cal.get_stats(5, 1)

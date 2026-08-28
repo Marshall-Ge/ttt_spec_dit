@@ -55,10 +55,10 @@ import random
 import sys
 from typing import Dict, List, Optional, Tuple
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from analyze_teacache_sweeps import _load          # noqa: E402
-from analyze_budget_probe import _budget_dirs, _f  # noqa: E402
+from scripts.analyze.analyze_teacache_sweeps import _load          # noqa: E402
+from scripts.analyze.analyze_budget_probe import _budget_dirs, _f  # noqa: E402
 
 # Terminal and H-step reward fields in aggregate.covr_reward_telemetry.
 _REWARD_FIELDS = {

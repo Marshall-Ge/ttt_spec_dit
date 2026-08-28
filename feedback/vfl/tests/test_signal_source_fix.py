@@ -526,7 +526,6 @@ def test_backward_compat_no_block_input():
             transformer,
             curvature_events=[event],
             anchor_samples=None,
-            lambda_curvature=0.0,
             lambda_anchor=0.0,
         )
 

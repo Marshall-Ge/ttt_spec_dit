@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "scripts" / "build_paired_masks.py"
+SCRIPT = ROOT / "scripts" / "analyze" / "build_paired_masks.py"
 
 
 def _run(tmp_path, *args):

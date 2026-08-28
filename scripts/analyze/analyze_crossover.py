@@ -192,12 +192,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from PIL import Image
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from analyze_teacache_sweeps import _load          # noqa: E402
-from analyze_budget_probe import _budget_dirs, _f  # noqa: E402
-from analyze_reward_proxy import _average_ranks, _spearman  # noqa: E402
+from scripts.analyze.analyze_teacache_sweeps import _load          # noqa: E402
+from scripts.analyze.analyze_budget_probe import _budget_dirs, _f  # noqa: E402
+from scripts.analyze.analyze_reward_proxy import _average_ranks, _spearman  # noqa: E402
 
 # uint8 rounding floor, per-pixel MSE in [0,1] units.
 # Rounding to nearest on an 8-bit grid has error uniform in +-0.5/255, variance

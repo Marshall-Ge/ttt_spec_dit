@@ -54,7 +54,7 @@ PY
 echo "      version_key=${VERSION_KEY}"
 
 echo "[2/5] Building external TeaCache strategy manifest"
-python scripts/experiment/build_budget_manifest.py \
+python scripts/analyze/build_budget_manifest.py \
   --output "${MANIFEST}" \
   --method teacache \
   --num-steps "${NUM_STEPS}" \

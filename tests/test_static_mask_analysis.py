@@ -9,8 +9,9 @@ import pytest
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 
-import analyze_static_masks as asm  # noqa: E402
-from analyze_teacache_sweeps import analyze_equalflops_sweep  # noqa: E402
+from scripts.analyze.analyze_static_masks import *  # noqa: E402
+from scripts.analyze import analyze_static_masks as asm  # noqa: E402
+from scripts.analyze.analyze_teacache_sweeps import analyze_equalflops_sweep  # noqa: E402
 
 
 def _write_result(path, *, offset=0, fid=100.0, is_mean=30.0,

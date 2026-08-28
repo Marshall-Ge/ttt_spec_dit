@@ -126,7 +126,7 @@ def test_buffer_ready_empty_vs_full():
     cfg = VFLConfig()
     # Use small thresholds so the test doesn't need to add thousands of events
     cfg.buffer_ready_min_strata = 3
-    cfg.buffer_ready_min_total_samples = 10
+    cfg.buffer_ready_min_total_samples = 6
     cfg.buffer_ready_min_anchors = 2
 
     buf = StratifiedReplayBuffer(capacity_per_stratum=100)
@@ -317,6 +317,10 @@ def test_train_once_crash_does_not_poison_worker():
     buf.add_anchor(_make_anchor())
 
     transformer = _StubTransformer(num_layers=4, dim=16)
+    # Mirror the production path (run_dit.py attaches LoRA to the inference
+    # model first; the worker's deepcopy then carries the wrappers).
+    attach_lora_all_layers(transformer, rank=4, alpha=1.0,
+                           time_conditioned=False)
     with tempfile.TemporaryDirectory() as outdir:
         worker = AsyncTrainingWorker(
             transformer, buf, config=cfg, output_dir=outdir,

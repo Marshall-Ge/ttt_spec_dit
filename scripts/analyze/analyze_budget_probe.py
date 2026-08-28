@@ -31,9 +31,9 @@ import re
 import sys
 from typing import List, Optional, Tuple
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from analyze_teacache_sweeps import _spread, analyze_equalflops_sweep
+from scripts.analyze.analyze_teacache_sweeps import _spread, analyze_equalflops_sweep
 
 
 def _budget_dirs(root: str) -> List[Tuple[int, str]]:

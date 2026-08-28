@@ -7,10 +7,10 @@ import json
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from accelerators.covr import read_action_audits, read_events
-from experiments.covr_analysis import run_all_gates, run_phase0_analysis
+from scripts.analyze.covr_analysis import run_all_gates, run_phase0_analysis
 
 
 def parse_args():

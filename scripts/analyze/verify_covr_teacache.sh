@@ -71,7 +71,7 @@ python -m pytest tests/test_teacache_forced_schedule.py tests/test_covr_strategy
 # =============================================================================
 echo ""
 echo "########## [2/5] 构建等-FLOPs teacache-mask manifest ##########"
-python scripts/experiment/build_covr_manifest.py "${AUDIT}" \
+python scripts/analyze/build_covr_manifest.py "${AUDIT}" \
     --method teacache-mask --output "${MANIFEST}" \
     --template-count "${TEMPLATE_COUNT}" --num-layers 28 \
     --mandatory-prefix 3 --max-taylor-gap 5 --num-steps "${NUM_STEPS}"

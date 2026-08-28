@@ -1,4 +1,4 @@
-"""The out-of-sample gate in ``scripts/analyze_crossover.py``.
+"""The out-of-sample gate in ``scripts/analyze/analyze_crossover.py``.
 
 The gate decides whether COVR gets GPU budget, so its two failure modes both
 need pinning down: it must not declare a crossover where none exists, and it
@@ -13,10 +13,7 @@ import sys
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
-
-import analyze_crossover as ac  # noqa: E402
+from scripts.analyze import analyze_crossover as ac  # noqa: E402
 
 _ARM_LEVELS = np.array([2.072, 2.912, 3.148, 3.415])  # observed k6 mean_conf
 _TILT = np.array([-1.0, -0.3, 0.3, 1.0])

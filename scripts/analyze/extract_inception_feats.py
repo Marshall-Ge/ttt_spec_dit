@@ -40,8 +40,8 @@ import time
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from analyze_crossover import _inception_features  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from scripts.analyze.analyze_crossover import _inception_features  # noqa: E402
 
 
 def _load_299_uint8(path):

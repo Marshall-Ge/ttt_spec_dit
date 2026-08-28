@@ -23,7 +23,7 @@ import math
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from accelerators.covr import read_action_audits
 from accelerators.covr_bandit import (
@@ -31,7 +31,7 @@ from accelerators.covr_bandit import (
     StrategyManifest,
     TemplateManifest,
 )
-from experiments.covr_analysis import build_template_manifest
+from scripts.analyze.covr_analysis import build_template_manifest
 
 
 def parse_args():
