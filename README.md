@@ -331,6 +331,38 @@ python scripts/experiment/run_speca_bucket_schedule.py --n_images 20
 python scripts/experiment/run_teacache_residual_variants.py --n_images 12
 ```
 
+**⑧ COVR 在线策略控制(DiT + 加速器之上,可选)**
+
+```bash
+# 一键 forced COVR smoke(manifest 构建 → 实际生成 → 结果/策略校验)
+bash scripts/experiment/run_covr_forced_smoke.sh uniform
+
+# experimental bandit 持久化/恢复 smoke(2+2 张)
+bash scripts/experiment/run_covr_bandit_resume_smoke.sh
+
+# COVR shadow 审计(记录 counterfactual events,不影响决策)
+python main.py --model dit --task c2i --dataset imagenet \
+    --method speca --metrics latency flops speed \
+    --covr-shadow --covr-output-dir ./covr_audit \
+    --num_steps 50 --n_prompts 20 --batch_size 4
+
+# forced 策略(指定 manifest 中的 arm)
+python main.py --model dit --task c2i --dataset imagenet \
+    --method teacache --metrics latency flops speed \
+    --covr-strategy-manifest /tmp/covr_forced_smoke/teacache_k8.json \
+    --covr-force-strategy-id uniform \
+    --num_steps 50 --n_prompts 8 --batch_size 1
+
+# timestep feedback shadow 学习(session 级缺陷学习者)
+python main.py --model dit --task c2i --dataset imagenet \
+    --method speca --metrics latency flops speed \
+    --covr-shadow --covr-timestep-feedback \
+    --num_steps 50 --n_prompts 20 --batch_size 4
+```
+
+> COVR 边界:Phase 1 仅 DiT 非 TTT 主去噪循环;禁用时不构造任何对象、
+> 不产生 aggregate.covr_* 字段、零开销。Bandit 标记 EXPERIMENTAL。
+
 ### TeaCache 系数标定
 
 **改 `--num_steps` 必跑**(多项式在标定范围外会振荡):
