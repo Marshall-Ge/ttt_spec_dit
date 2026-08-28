@@ -38,44 +38,41 @@ Accelerating [DiT-2-256](https://arxiv.org/abs/2212.09748) and [PixArt-α](https
 
 ## Directory Structure
 
+> 完整分层规范见 `.claude/project-structure.md`(强制)。
+
 ```
 ~/ttt_spec_dit/
-├── config.py                  # Global paths, defaults, coefficient loading
-├── main.py                    # CLI entry: parse_args() → validate_args() → dispatch
-├── utils.py                   # CudaTimer, VAE decode, PIL↔tensor, FID preprocessing
-├── run_dit.py                 # DiTGenerator + run_c2i() — DiT orchestrator & sampling
-├── run_pixart.py              # PixArtGenerator + run_t2i() + run_c2i()
-├── dit_coef.json              # DiT TeaCache calibrated coefficients (poly4, 50-step)
-├── pixart_coef.json           # PixArt TeaCache calibrated coefficients
-│
-├── models/                    # Explicit transformer implementations
-│   ├── __init__.py            # Re-exports DiTTransformer2D, PixArtTransformer2D
-│   ├── dit.py                 # DiTTransformer2D — forward() with SpecA/TeaCache branches
-│   └── pixart.py              # PixArtTransformer2D — forward() with 3-submodule dispatch
-│
-├── accelerators/              # Pure-function acceleration logic (no classes, no monkeypatching)
-│   ├── __init__.py            # Re-exports all public functions
-│   ├── teacache.py            # TeaCache: init → decide → cache/apply residual → step → reset
-│   └── speca.py               # SpecA: init → cal_type → taylor_cache → derivative → predict → error_gate
-│
-├── eval/                      # Metrics (read-only reference — do not modify)
-│   ├── fid_is.py              # FIDISComputer: torch-fidelity wrapper, add()→compute()→cleanup()
-│   ├── latency.py             # FLOPsMetric (profiles tail FLOPs), LatencyMetric, SpeedupMetric
-│   ├── clip_score.py, lpips.py, mse.py, image_reward.py, gen_eval.py
-│   └── base.py                # Metric ABC
-│
-├── dataset/                   # Dataset loaders (read-only reference — do not modify)
-│   ├── imagenet.py            # ImageNetDataset: ILSVRC2012_ID → DiT class_id auto-translation
-│   ├── coco.py, drawbench.py, geneval.py
-│   └── base.py
-│
-└── scripts/
-    ├── run.sh                 # 20-combo benchmark (DiT×4 + PixArt c2i×8 + PixArt t2i×8)
-    ├── run_full_smoke.sh      # Full smoke test (smaller N for quick validation)
-    └── calibrate_teacache.py  # TeaCache poly4 coefficient calibration
+├── config.py                  # 全局路径、默认超参、系数加载
+├── main.py                    # CLI 入口(薄): parse_args → validate_args → dispatch
+├── run_dit.py / run_pixart.py # 顶层编排入口(run_c2i / run_t2i;Generator 在 pipelines/)
+├── pipelines/                 # 编排层
+│   ├── dit.py                 #   DiTGenerator(类条件;含 TTT 训练路径)
+│   ├── pixart.py              #   PixArtGenerator(t2i/c2i;T5 编码)
+│   └── hooks/covr_hook.py     #   COVR 采样循环钩子(需要 transformer/scheduler 的 _covr_* 函数)
+├── utils/                     # 通用工具包(纯函数,最底层)
+│   ├── io.py / timing.py      #   图像 I/O、计时/Profiler
+│   ├── serialization.py       #   JSON 安全化、_covr_* 哈希/哨兵/记账
+│   ├── common.py              #   latent_seed_for_index、VFL checkpoint 辅助
+│   └── flops.py               #   tail-only FLOPs 剖析
+├── models/                    # 显式 Transformer 实现(无 monkeypatch)
+│   ├── dit.py / pixart.py     #   forward() 内 SpecA/TeaCache/TTT 分支
+│   └── ttt_plugin.py          #   SessionAdaLNModulator(0.92M, TTT)
+├── accelerators/              # 加速器(纯函数 + 显式状态)
+│   ├── speca.py / teacache.py #   SpecA(Taylor 缓存) / TeaCache(残差缓存,residual_mode)
+│   ├── covr*.py               #   COVR runtime / bandit / viability
+│   ├── registry.py            #   加速器适配器注册表(COVR init/reward/flops 三职责)
+│   └── strategy_dispatch.py   #   AccelerationStrategy → 加速器状态 分发
+├── feedback/vfl/              # VFL 在线学习子系统(L1 阈值校准 / L2 回放缓冲 / L3 LoRA)
+├── eval/                      # 指标:FID/IS, CLIP, LPIPS, MSE, ImageReward, GenEval, Latency, FLOPs
+├── dataset/                   # 数据集:ImageNet(类 ID 翻译), COCO, DrawBench, GenEval
+├── scripts/                   # 脚本按用途分类
+│   ├── calibrate/             #   TeaCache 系数标定
+│   ├── diagnose/              #   误差-距离诊断、预测器族谱、token 长尾、类偏移探针
+│   ├── experiment/            #   20-combo benchmark、COVR smoke、时间桶/残差变体验证
+│   └── analyze/               #   COVR 分析、manifest 构建、P1 gate 工具链
+├── tests/                     # 单元测试
+└── docs/                      # 文档(教师报告、方法总结、诊断报告)
 ```
-
----
 
 ## Architecture
 
@@ -230,61 +227,124 @@ Simple step-count reduction. Uses DDIMScheduler with `num_steps` steps. No cachi
 
 ## Quick Start
 
-### Prerequisites
+### 环境
 
 ```bash
-pip install torch diffusers transformers pillow tqdm numpy
-pip install torch-fidelity  # for FID/IS
+# conda 环境(远程 AutoDL 已配置 realpde)
+conda activate realpde
+# 权重路径在 config.py 中配置(DIT_REPO / PIXART_REPO / IMAGENET_DIR)
 ```
 
-### Single-Run Examples
+### 典型启动方式
+
+**① 快速验证单组合(小规模,无 FID)**
 
 ```bash
-# DiT baseline (ImageNet class-conditional)
+# DiT + TeaCache(默认 γ=0.25)
 python main.py --model dit --task c2i --dataset imagenet \
-    --method baseline --metrics fid is latency flops speed \
-    --seed 42 --num_steps 20 --n_prompts 80 \
-    --guidance_scale 4.5 --batch_size 32
+    --method teacache --metrics latency flops speed \
+    --num_steps 50 --n_prompts 8 --batch_size 8 --img_save_limit 2
 
-# DiT with TeaCache
+# DiT + SpecA
 python main.py --model dit --task c2i --dataset imagenet \
-    --method teacache --thresh 0.25 \
-    --metrics fid is latency flops speed \
-    --num_steps 50 --n_prompts 80 --batch_size 32
+    --method speca --metrics latency flops speed \
+    --num_steps 50 --n_prompts 8 --batch_size 8 --img_save_limit 2
 
-# DiT with SpecA
-python main.py --model dit --task c2i --dataset imagenet \
-    --method speca \
-    --speca_base_threshold 0.01 --speca_decay_rate 0.01 \
-    --speca_min_taylor_steps 1 --speca_max_taylor_steps 4 \
-    --speca_error_metric cosine_similarity \
-    --metrics fid is latency flops speed \
-    --num_steps 20 --n_prompts 80 --batch_size 32
-
-# PixArt text-to-image with TeaCache
+# PixArt t2i(DrawBench)
 python main.py --model pixart --task t2i --dataset drawbench \
-    --method teacache --thresh 0.25 \
-    --metrics imagereward latency flops speed \
-    --num_steps 20 --n_prompts 50
-
-# PixArt class-to-image (COCO) with SpecA
-python main.py --model pixart --task c2i --dataset coco \
-    --method speca \
-    --speca_error_metric cosine_similarity \
-    --metrics fid is latency flops speed \
-    --num_steps 20 --n_prompts 100
+    --method teacache --metrics imagereward latency flops speed \
+    --num_steps 20 --n_prompts 10
 ```
 
-### TeaCache Calibration
-
-**Required whenever you change `--num_steps`:**
+**② 完整质量评估(5k/50k, 含 FID/IS)**
 
 ```bash
-python scripts/calibrate_teacache.py --model dit --num_steps 50 --num_runs 10
-python scripts/calibrate_teacache.py --model pixart --num_steps 20 --num_runs 10
+# DiT + TeaCache 50k FID
+python main.py --model dit --task c2i --dataset imagenet \
+    --method teacache --thresh 0.25 \
+    --metrics fid is latency flops speed \
+    --seed 42 --num_steps 50 --n_prompts 50000 --batch_size 32
 ```
 
-This collects raw_diff sequences from N denoising trajectories and fits a 4th-order polynomial. The coefficients are saved to `dit_coef.json` / `pixart_coef.json`.
+**③ 新特性 1:杠杆再造(TeaCache 残差线性漂移)——已验证严格支配原版**
+
+```bash
+# 同速度下质量更好(skip 32%→70%, FID 34.82→34.40, 速度×2)
+python main.py --model dit --task c2i --dataset imagenet \
+    --method teacache --thresh 0.70 --teacache-residual-mode linear \
+    --metrics fid is latency flops speed \
+    --seed 42 --num_steps 50 --n_prompts 5000 --batch_size 32
+
+# 变体:damped(Hermite 阻尼漂移)/ plain(原版)
+#   --teacache-residual-mode damped | plain
+```
+
+**④ 新特性 2:结构感知调度(SpecA 时间桶差异化 max_taylor)**
+
+```bash
+# 同预算 latent MSE -17%(晚期误差主导的机制驱动设计)
+python main.py --model dit --task c2i --dataset imagenet \
+    --method speca --speca-bucket-schedule 8,4,2 \
+    --metrics latency flops speed \
+    --num_steps 50 --n_prompts 20 --batch_size 16
+# schedule 格式:(early, mid, late) 三个桶的 max_taylor_steps
+```
+
+**⑤ 新特性 3:per-class γ 查表(离线标定,零开销)**
+
+```bash
+python main.py --model dit --task c2i --dataset imagenet \
+    --method teacache --thresh 0.25 --per-class-gamma dit_per_class_gamma.json \
+    --metrics latency flops speed --num_steps 50 --n_prompts 100
+```
+
+**⑥ 在线学习扩展**
+
+```bash
+# TTT 插件(DiT-only, 叠加在 TeaCache 上)
+python main.py --model dit --task c2i --dataset imagenet \
+    --method teacache --metrics fid is latency flops speed \
+    --ttt --ttt_lr 1e-4 --ttt_micro_epochs 3 \
+    --num_steps 50 --n_prompts 80
+
+# VFL(SpecA + 在线阈值校准;--vfl-no-train 仅 L1,零训练开销)
+python main.py --model dit --task c2i --dataset imagenet \
+    --method speca --metrics fid is latency flops speed \
+    --vfl --vfl-no-train \
+    --num_steps 50 --n_prompts 80
+```
+
+**⑦ 诊断脚本(机制分析,不跑完整评估)**
+
+```bash
+# 误差-距离曲线(判断加速器属于外推型还是复用型)
+python scripts/diagnose/diag_error_vs_distance.py --n_images 4 --num_steps 50
+
+# 预测器族谱(0阶/1阶/2阶 Taylor vs 残差复用/线性/阻尼)
+python scripts/diagnose/diag_predictor_family.py --n_images 6 --num_steps 50
+
+# 类分布偏移探针(静态 γ 在类子集上的失衡证据)
+python scripts/diagnose/probe_class_shift_gamma.py --n_per_class 30 --gammas 0.15,0.25,0.40
+
+# 时间桶调度 / 残差变体验证(closed-loop)
+python scripts/experiment/run_speca_bucket_schedule.py --n_images 20
+python scripts/experiment/run_teacache_residual_variants.py --n_images 12
+```
+
+### TeaCache 系数标定
+
+**改 `--num_steps` 必跑**(多项式在标定范围外会振荡):
+
+```bash
+python scripts/calibrate/calibrate_teacache.py --model dit --num_steps 50 --num_runs 10
+python scripts/calibrate/calibrate_teacache.py --model pixart --num_steps 20 --num_runs 10
+```
+
+### 20 组合全量 benchmark
+
+```bash
+N_PROMPTS=50 bash scripts/experiment/run.sh
+```
 
 ---
 

@@ -6,6 +6,8 @@ by running a forward that skips all transformer blocks. Used by
 ``eval/latency.py``'s FLOPsMetric to estimate the cost of a TeaCache skip step.
 """
 
+import torch
+
 # ---------------------------------------------------------------------------
 # Tail profilers (PixArt / DiT)
 # ---------------------------------------------------------------------------

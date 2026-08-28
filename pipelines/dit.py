@@ -20,13 +20,12 @@ from diffusers import DDIMScheduler
 from config import DIT_REPO, IMAGENET_DIR, OUTPUT_DIR, load_coefficients
 from utils import (
     decode_latent, save_image, pil_to_tensor, ensure_real_299,
-    latent_seed_for_index, prune_checkpoints,
+    latent_seed_for_index, prune_checkpoints, _covr_hash_sample,
 )
 from pipelines.hooks.covr_hook import (
     _cache_scheduler_timestep_values,
     _covr_context,
     _covr_full_rollout,
-    _covr_hash_sample,
     _covr_scheduler_pair,
     _covr_shadow_full,
     _covr_teacache_terminal_skip,
@@ -40,12 +39,11 @@ from accelerators.teacache import (
 from accelerators.covr_viability import (
     COVRViabilityRecorder,
     extract_prefix_features,
-    flatten_prefix_features,
 )
+from accelerators.covr_runtime import COVRRuntime, COVRTrajectoryAssignment, flatten_prefix_features
 from accelerators.speca import SpecACache, SpecAState, speca_init
 from accelerators.strategy_dispatch import apply_strategy
 from accelerators.registry import get_adapter, is_registered
-from accelerators.covr_runtime import COVRRuntime, COVRTrajectoryAssignment
 from accelerators.covr import (
     ActionAuditEvent,
     COVRAction,
@@ -74,6 +72,12 @@ from feedback.vfl.lora_adapter import (
     set_lora_t_emb,
     clear_lora_t_emb,
 )
+
+# DiT constants (moved from run_dit.py with the class)
+DIT_IMAGE_SIZE = 256
+DIT_LATENT_SIZE = 32
+DIT_NULL_CLASS = 1000
+
 
 class DiTGenerator:
     """Orchestrator for DiT-2-256 class-conditional generation.
