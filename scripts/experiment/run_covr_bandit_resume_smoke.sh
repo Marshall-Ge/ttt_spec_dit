@@ -78,7 +78,7 @@ PY
 echo "      version_key=${VERSION_KEY}"
 
 echo "[2/6] Building external TeaCache strategy manifest"
-python scripts/build_budget_manifest.py \
+python scripts/experiment/build_budget_manifest.py \
   --output "${MANIFEST}" \
   --method teacache \
   --num-steps "${NUM_STEPS}" \
@@ -112,7 +112,7 @@ python main.py "${COMMON_ARGS[@]}" "${BANDIT_ARGS[@]}" \
   --output_dir "${RESUMED_RUN_DIR}"
 
 echo "[6/6] Validating bandit persistence and resume"
-python scripts/check_covr_bandit_resume_smoke.py "${ROOT}" \
+python scripts/analyze/check_covr_bandit_resume_smoke.py "${ROOT}" \
   --manifest "${MANIFEST}" \
   --state "${STATE}" \
   --first-state "${FIRST_STATE}" \

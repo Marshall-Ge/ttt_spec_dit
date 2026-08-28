@@ -25,20 +25,27 @@
 
 ## 3. 目录结构和各文件职责
 
+> ⚠️ **结构规范**:代码分层、命名、依赖方向与新增功能流程见 `.claude/project-structure.md`(强制,agent 开工前必读)。本节只做速查。
+
 ```
 ~/ttt_spec_dit/
 ├── config.py                  # 全局路径、默认超参 (DIT_REPO, IMAGENET_DIR, SPECA_DEFAULTS...)
-├── main.py                    # CLI 入口: parse_args() + validate_args() → 分发到 run_dit/run_pixart
-├── utils.py                   # CudaTimer, VAE decode, save_image, ensure_real_299()
-├── run_dit.py                 # DiTGenerator + run_c2i(args) — DiT 编排器/采样入口，集成 TTT/VFL
-├── run_dit_shared.py          # 纯生命周期辅助: _GenerationProfiler + _covr_* canonical JSON / resume / sentinel (被 run_dit 与 COVR runtime 共享)
+├── main.py                    # CLI 入口(薄): parse_args() + validate_args() → 分发
+├── utils/                     # 通用工具包(纯函数,最底层)
+│   ├── io.py                  #   VAE decode, save_image, pil_to_tensor, ensure_real_299()
+│   ├── timing.py              #   CudaTimer, _GenerationProfiler, _record_profile_stage
+│   ├── serialization.py       #   _clean, _covr_* canonical JSON / hash / sentinel / accounting
+│   └── common.py             #   latent_seed_for_index, get_vfl_checkpoint_dir, prune_checkpoints
+├── pipelines/                 # 编排层(结构规范 §2;Generator 迁移中)
+│   └── hooks/covr_hook.py     #   COVR 采样循环钩子(需要 transformer/scheduler 的 _covr_* 函数)
+├── run_dit.py                 # DiTGenerator + run_c2i(args) — DiT 编排器/采样入口，集成 TTT/VFL/COVR
+├── run_dit_shared.py          # 兼容 shim: 历史 _covr_* / _GenerationProfiler 名字 re-export(新代码 import utils)
 ├── run_pixart.py              # PixArtGenerator + run_t2i/run_c2i — 集成 VFL（无 TTT）
 ├── dit_coef.json              # DiT TeaCache 标定系数 (poly4, 50 步标定)
 ├── pixart_coef.json           # PixArt TeaCache 标定系数
 ├── continual_inference_runner.py  # Session 3 入口: 单类 N 图流 TTT session, γ 课表 + CSV 遥测
 ├── run_session2_flywheel.py       # Session 2 入口: 加载 Session 1 LoRA + VFL exploit 模式 + SpecA 推理
 ├── run_ttt_benchmark.py           # TTT 独立 benchmark: 单类/跨类全评估 (FID/IS), plugin 跨 image 持续训练
-├── ttt_baseline.py                # Phase 1 原型: PixArt 特征探测 + 开环线性推测 baseline (历史遗留, 无 TTT)
 ├── test_checkpoint_manager.py     # VFL checkpoint manager (retention) 单测
 ├── test_conf_budget_controller.py # P1 运行时控制器单测 (含与离线 gate 旧内联逻辑的逐 epoch 等价性)
 ├── models/
@@ -54,16 +61,18 @@
 │   │                          #   derivative_approximation, taylor_formula, cache_step_dit/pixart,
 │   │                          #   compute_error_gate (cosine/l1/l2/relative_l1/relative_l2)
 │   ├── teacache.py            # TeaCache: teacache_init/decide/cache_residual/apply_residual/step/reset
-│   │                          #   + compute_modulated_input(_dit) — 调制信号提取
+│   │                          #   + compute_modulated_input(_dit) — 调制信号提取; residual_mode
 │   ├── covr_runtime.py        # COVR runtime 边界 (可选插件): COVRMode/COVRRuntimeConfig/
 │   │                          #   COVRRuntime facade + Forced/ExperimentalBandit backend + recorder
 │   │                          #   Phase 1 仅 DiT 非 TTT 主去噪循环; 禁用时不构造任何对象
 │   ├── covr_viability.py      # Opt-in batch=1 causal-prefix scalar recorder (JSONL)
 │   ├── covr_bandit.py         # ConservativeTemplateBandit (EXPERIMENTAL, 语义冻结) + manifests
+│   ├── registry.py            # AcceleratorAdapter 注册表 (COVR 的 init/reward/flops 三职责)
+│   ├── strategy_dispatch.py   # AccelerationStrategy → 加速器状态 分发
 │   ├── conf_budget_controller.py # P1 运行时: Cusum + ConfBudgetController (session 级预算梯决策,
 │   │                          #   无 tensor/模型依赖; 离线 gate harness 消费同一份代码)
 │   └── timestep_feedback.py   # Session-level per-timestep defect learner: clipped IPW, p_min, hard budget, state gate
-├── verification_feedback_loop/    # VFL 子系统 (三层架构, 详见 §12)
+├── verification_feedback_loop/    # VFL 子系统 (三层架构, 详见 §12; 计划迁至 feedback/vfl/)
 │   ├── __init__.py            # 导出所有公共符号
 │   ├── config.py              # VFLConfig: accept_sample_rate, buffer_capacity_per_stratum, loRA_rank...
 │   ├── verification_hook.py   # VerificationEvent + record_event + make_timestep_bucket (3 桶)
@@ -87,21 +96,17 @@
 │   ├── imagenet.py            # ImageNetDataset: 自动加载 ilsvrc2012_to_dit_id.json 做类 ID 翻译
 │   ├── coco.py, drawbench.py, geneval.py
 │   └── base.py
-└── scripts/
-    ├── run.sh                 # 20 combo benchmark 脚本
-    ├── run_full_smoke.sh      # 完整冒烟测试
-    ├── run_covr_forced_smoke.sh # 一键生成 manifest 并执行 forced COVR smoke
-    ├── check_covr_forced_smoke.py # 检查 forced smoke 的结果与 schema
-    ├── run_covr_bandit_resume_smoke.sh # experimental bandit 首段+恢复段 smoke
-    ├── check_covr_bandit_resume_smoke.py # 检查 state 连续性/resume window/schema
-    ├── run_covr_v2_viability_probe.sh # batch=1 causal-prefix OOS viability probe
-    ├── analyze_covr_v2_viability.py # machine-readable OOS headroom gate
-    ├── analyze_timestep_feedback.py # session-held-out one-step timestep learner analysis
-    ├── extract_inception_feats.py # GPU: PNG -> InceptionV3 2048 特征 npz (mini-FID 哨兵 [P1'-a] 输入,
-    │                          #   real_299 按 (文件名,大小) 去重; 预处理与 eval/fid_is.py 逐位一致)
-    ├── analyze_minifid_rank_validity.py # 纯 numpy [P1'-a] gate: Gram 域谱等价 mini-FID +
-    │                          #   above-floor pair 排序判决 (预注册判据, 内置快/慢路径数值自检)
-    └── calibrate_teacache.py  # TeaCache 多项式系数标定脚本
+└── scripts/                  # 按用途分类(规范 §2): calibrate / diagnose / experiment / analyze
+    ├── calibrate/             #   calibrate_teacache.py — TeaCache poly4 系数标定
+    ├── diagnose/              #   diag_error_vs_distance{,_v2,_v3}.py, diag_predictor_family.py,
+    │                          #   diag_token_longtail.py, probe_class_shift_gamma.py
+    ├── experiment/            #   run.sh(20 combo), run_full_smoke.sh, run_speca_bucket_schedule.py,
+    │                          #   run_teacache_residual_variants.py, run_covr_* smoke/bandit/probe,
+    │                          #   run_p1_offline_gates.sh, run_static_k8_threshold_replicas.sh
+    └── analyze/               #   analyze_covr*.py, analyze_timestep_feedback.py, check_covr_*.py,
+                               #   build_*_manifest.py, extract_inception_feats.py,
+                               #   analyze_minifid_rank_validity.py(P1 工具链: extract_inception_conf /
+                               #   simulate_conf_budget_controller / build_conf_costs / compute_mixture_fid)
 ```
 
 ## 4. 架构核心原则
@@ -252,7 +257,7 @@ if should_calc: accumulated = 0
 
 ### 7.5 系数标定
 
-`scripts/calibrate_teacache.py --model dit --num_steps 50 --num_runs 10`
+`scripts/calibrate/calibrate_teacache.py --model dit --num_steps 50 --num_runs 10`
 
 脚本收集 N 条 denoising trajectory 的 raw_diff 序列，拟合 poly4 使 rescale 缩放后 accumulation 达到 target skip rate。**步数必须与推理一致**，否则多项式在训练范围外振荡产生负值。
 
@@ -311,7 +316,7 @@ Cross-attention 入口是 raw hidden_states（不是 norm2 调制后的），输
 `replay_buffer.py:163`：`max_encoder_hidden_states_events=200` 限制 PixArt 的 T5 hidden states（约 600KB/event）写入数量。超过后新 event 丢弃 `encoder_hidden_states`。如果 L3 训练需要完整 context，注意这个上限。
 
 ### 8.16 TeaCache coefficients 对步数敏感
-`continual_inference_runner.py:196-198`：换 `num_steps` 需重新跑 `scripts/calibrate_teacache.py`。多项式在训练范围外振荡产生负值，会导致 rescaled accumulation 异常。
+`continual_inference_runner.py:196-198`：换 `num_steps` 需重新跑 `scripts/calibrate/calibrate_teacache.py`。多项式在训练范围外振荡产生负值，会导致 rescaled accumulation 异常。
 
 ## 9. 已验证的组合
 
@@ -342,7 +347,7 @@ Cross-attention 入口是 raw hidden_states（不是 norm2 调制后的），输
 
 ```bash
 # 标定 TeaCache 系数（改步数必跑）
-python scripts/calibrate_teacache.py --model dit --num_steps 50 --num_runs 10
+python scripts/calibrate/calibrate_teacache.py --model dit --num_steps 50 --num_runs 10
 
 # 单组合验证
 python main.py --model dit --task c2i --dataset imagenet \
@@ -351,13 +356,13 @@ python main.py --model dit --task c2i --dataset imagenet \
     --guidance_scale 4.5 --batch_size 32
 
 # 一键生成 version-key/manifest 并执行 forced COVR smoke
-bash scripts/run_covr_forced_smoke.sh uniform
+bash scripts/experiment/run_covr_forced_smoke.sh uniform
 
 # 检查已完成的 forced COVR smoke（不重新跑 GPU）
-python scripts/check_covr_forced_smoke.py /tmp/covr_forced_smoke
+python scripts/analyze/check_covr_forced_smoke.py /tmp/covr_forced_smoke
 
 # experimental bandit 持久化/恢复 smoke（默认 2+2 张；不评估自适应有效性）
-bash scripts/run_covr_bandit_resume_smoke.sh
+bash scripts/experiment/run_covr_bandit_resume_smoke.sh
 
 # 全 20 组合 benchmark
 N_PROMPTS=50 bash scripts/run.sh
@@ -391,7 +396,7 @@ python continual_inference_runner.py --help
 
 ```bash
 # 默认 128 图、batch=1、K=8、共同前缀 3；自动生成 manifest、四个 forced arms、full reference 和 OOS report
-bash scripts/run_covr_v2_viability_probe.sh
+bash scripts/experiment/run_covr_v2_viability_probe.sh
 ```
 
 该 probe 只记录 TeaCache forced mask 的 shared-prefix causal scalar features，并在
@@ -462,9 +467,8 @@ use_ttt = use_teacache and ttt_state is not None    # 必须叠加在 TeaCache �
 | `run_ttt_benchmark.py` | 独立 benchmark：单类/跨类 TTT 全评估 (FID/IS)，plugin 跨所有 image 持续训练 |
 | `continual_inference_runner.py` | Session 3：单类 N 图流 TTT session，γ 课表 (0.35→0.55→0.75)，baseline 参考预缓存，CSV 遥测 |
 | `run_session2_flywheel.py` | Session 2：加载 Session 1 LoRA + VFL exploit-mode + SpecA 推理（**不含 TTT**，是 VFL 飞轮流水线） |
-| `ttt_baseline.py` | Phase 1 原型：PixArt 特征探测 + 开环线性推测 baseline，历史遗留代码（无 TTT） |
 
-四个文件都有独立 `main()` / `parse_args()`，是 main.py 之外的并行入口。
+三个文件都有独立 `main()` / `parse_args()`，是 main.py 之外的并行入口。
 
 ## 12. VFL (Verification Feedback Loop) 实现细节
 
@@ -534,7 +538,7 @@ use_ttt = use_teacache and ttt_state is not None    # 必须叠加在 TeaCache �
 - **Phase 1 范围**：仅 DiT 非 TTT 主去噪循环。PixArt / TTT 在 `validate_covr_capabilities` 提前失败（main.py 校验层）。
 - **Runtime 职责**：初始化（version/resume/backend/recorder）、trajectory begin/end（sentinel 选择、assignment、feedback 物化、bandit update/persist）、adapter FLOPs、aggregate/config payload。
 - **采样循环职责**：保持 tensor 计算在 run_dit；terminal/H-step/safety/audit 反馈仍写在 loop 内（写入 `COVRTrajectoryAssignment.feedback`）。
-- **纯辅助**：`run_dit_shared.py` 持有 `_GenerationProfiler` + `_covr_*` canonical JSON / resume / sentinel 纯函数；run_dit 从其中 import 并保持历史 `_covr_*` 名称可导入（scripts/tests 依赖）。
+- **纯辅助**：`utils/serialization.py` + `utils/timing.py` 持有 `_GenerationProfiler` + `_covr_*` canonical JSON / resume / sentinel 纯函数；`run_dit_shared.py` 是兼容 shim（re-export 历史 `_covr_*` 名称，scripts/tests 依赖）。
 - **StrategyManifest version_key 对称校验**：forced 与 bandit 两个 mode 都走 `load_strategy_manifest`（错误消息含 "runtime"）。
 - **Bandit 标记 EXPERIMENTAL**：`ConservativeTemplateBandit` 语义冻结，未做算法改动；`--covr-strategy-bandit` help 已标注。
 - **Timestep feedback**：`--covr-timestep-feedback --covr-shadow` 默认只做 selective-label shadow 学习；`--covr-timestep-feedback-active` 才将上一 session 的 timestep risk 转为下一 trajectory 的固定 SpecA refresh mask，仍不是 per-image bandit，实验验证前不得用于质量结论。

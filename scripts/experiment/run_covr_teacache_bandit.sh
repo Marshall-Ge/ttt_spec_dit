@@ -1,27 +1,18 @@
 #!/usr/bin/env bash
-# Per-image COVR *contextual* strategy-bandit experiment for TeaCache.
-#
-# Layers deferred-commit contextual LinUCB selection on top of the plain
-# strategy-bandit runner (run_covr_teacache_bandit.sh). Each trajectory runs a
-# forced-calc prefix of K steps, then commits an arm using causal-prefix
-# features as the LinUCB context, with an efficiency-aware reward
-# (terminal_MSE + lambda * measured_flops).
+# Per-image COVR strategy-bandit experiment for TeaCache.
 #
 # This is a learning/telemetry experiment. It intentionally does not run FID/IS.
 # The default 1,000-image segment uses batch size 1, a 10% terminal-fidelity
-# sentinel, no SpecA safety shadow, and a persisted state (schema v2) that can
-# be resumed. A v1 (non-contextual) state cannot resume into this script.
+# sentinel, no SpecA safety shadow, and a persisted state that can be resumed.
 #
 # Fresh run:
-#   bash scripts/run_covr_teacache_contextual.sh
+#   COVR_OUTPUT_ROOT=/path/to/run bash scripts/run_covr_teacache_bandit.sh
 # Resume to a larger cumulative target:
-#   MODE=resume N_PROMPTS=2000 \
-#     bash scripts/run_covr_teacache_contextual.sh
+#   MODE=resume N_PROMPTS=2000 COVR_OUTPUT_ROOT=/path/to/run \
+#     bash scripts/run_covr_teacache_bandit.sh
 # Analyze without GPU work:
-#   MODE=analyze bash scripts/run_covr_teacache_contextual.sh
-# Sweep lambda (separate roots):
-#   COVR_EFFICIENCY_LAMBDA=1e-4 COVR_OUTPUT_ROOT=output/covr_teacache/ctx_1e-4 \
-#     bash scripts/run_covr_teacache_contextual.sh
+#   MODE=analyze COVR_OUTPUT_ROOT=/path/to/run \
+#     bash scripts/run_covr_teacache_bandit.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -38,31 +29,16 @@ EPSILON="${COVR_EPSILON:-0.20}"
 PRIOR_PENALTY="${COVR_PRIOR_PENALTY:-0.0}"
 SENTINEL_RATE="${COVR_SENTINEL_RATE:-0.10}"
 WINDOW_SIZE="${COVR_ANALYSIS_WINDOW_SIZE:-100}"
-SESSION_ID="${COVR_SESSION_ID:-covr-teacache-contextual-seed${SEED}}"
-# Output lands under the canonical output/covr_teacache namespace (relative to
-# the repo root). Override COVR_OUTPUT_ROOT for lambda/alpha sweeps.
-ROOT="${COVR_OUTPUT_ROOT:-output/covr_teacache/contextual_seed${SEED}}"
-
-# Contextual knobs.
-# K = forced-calc prefix steps before the deferred arm commit. 3 matches the
-# viability probe default and the mandatory prefix used by the manifest.
-PREFIX_STEPS="${COVR_PREFIX_STEPS:-3}"
-# LinUCB exploration alpha (LCB bonus weight). 1.0 is the standard default.
-LINUCB_ALPHA="${COVR_LINUCB_ALPHA:-1.0}"
-# Efficiency reward weight: combined = terminal_MSE + LAMBDA * cost, with
-# cost = measured_flops / vanilla_flops in [0,1]. Set to 0.0 for a pure
-# contextual-fidelity probe (isolates contextual selection from the efficiency
-# term); 1e-3 is the canonical efficiency-aware setting.
-LAMBDA="${COVR_EFFICIENCY_LAMBDA:-1e-3}"
+SESSION_ID="${COVR_SESSION_ID:-covr-teacache-bandit-seed${SEED}}"
+ROOT="${COVR_OUTPUT_ROOT:-/tmp/covr_teacache_bandit_seed${SEED}}"
 
 # Format: threshold:expected_skip_rate. The rates are planning estimates used
 # only as cost metadata; calibrate them from local TeaCache sweeps when possible.
 THRESHOLD_ARMS="${COVR_THRESHOLD_ARMS:-0.15:0.30 0.25:0.48 0.40:0.60 0.60:0.70 1.00:0.80}"
+# K=8 is the existing viability budget. Add budgets (for example "8 10 13")
+# only after the first segment shows stable feedback and non-degenerate shares.
+REFRESH_COUNTS="${COVR_REFRESH_COUNTS:-8}"
 BASELINE_ARM="${COVR_BASELINE_ARM:-threshold_0p25}"
-# NOTE: contextual deferred-commit supports threshold arms ONLY. commit_arm
-# drops refresh_mask and switches onto the rel_l1_thresh dynamic path, so a
-# fixed-mask (refresh-count) arm cannot be committed — the bandit rejects mixed
-# manifests at construction. Do NOT add --refresh-counts here.
 
 case "${MODE}" in
   run|resume|analyze) ;;
@@ -73,14 +49,6 @@ case "${MODE}" in
 esac
 if [[ "${BATCH_SIZE}" != "1" ]]; then
   echo "BATCH_SIZE must be 1 for per-image COVR trajectories" >&2
-  exit 2
-fi
-if ! [[ "${PREFIX_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "COVR_PREFIX_STEPS must be a positive integer (>=1)" >&2
-  exit 2
-fi
-if (( PREFIX_STEPS >= NUM_STEPS )); then
-  echo "COVR_PREFIX_STEPS (${PREFIX_STEPS}) must be < NUM_STEPS (${NUM_STEPS})" >&2
   exit 2
 fi
 if ! [[ "${N_PROMPTS}" =~ ^[1-9][0-9]*$ ]]; then
@@ -103,7 +71,7 @@ analyze() {
     echo "analysis requires ${STATE} and ${MANIFEST}" >&2
     exit 2
   fi
-  python scripts/analyze_covr_teacache_bandit.py "${STATE}" \
+  python scripts/analyze/analyze_covr_teacache_bandit.py "${STATE}" \
     --manifest "${MANIFEST}" \
     --output-dir "${REPORT_DIR}" \
     --window-size "${WINDOW_SIZE}"
@@ -146,8 +114,7 @@ COMMON_ARGS=(
 )
 
 if [[ "${MODE}" == "run" ]]; then
-  echo "COVR TeaCache contextual bandit root: ${ROOT}"
-  echo "  prefix_steps=${PREFIX_STEPS} linucb_alpha=${LINUCB_ALPHA} lambda=${LAMBDA}"
+  echo "COVR TeaCache bandit root: ${ROOT}"
   echo "[1/3] Probing runtime version identity"
   python main.py "${COMMON_ARGS[@]}" \
     --metrics latency \
@@ -168,6 +135,7 @@ PY
 )"
 
   read -r -a threshold_specs <<< "${THRESHOLD_ARMS}"
+  read -r -a refresh_counts <<< "${REFRESH_COUNTS}"
   manifest_args=(
     --output "${MANIFEST}"
     --method teacache
@@ -179,11 +147,14 @@ PY
   for spec in "${threshold_specs[@]}"; do
     manifest_args+=(--threshold-arm "${spec}")
   done
+  if ((${#refresh_counts[@]})); then
+    manifest_args+=(--refresh-counts "${refresh_counts[@]}")
+  fi
 
   echo "[2/3] Building TeaCache threshold and fixed-mask arms"
-  python scripts/build_budget_manifest.py "${manifest_args[@]}"
+  python scripts/experiment/build_budget_manifest.py "${manifest_args[@]}"
 else
-  echo "COVR TeaCache contextual bandit resume root: ${ROOT}"
+  echo "COVR TeaCache bandit resume root: ${ROOT}"
 fi
 
 if [[ "${MODE}" == "run" ]]; then
@@ -197,10 +168,6 @@ python main.py "${COMMON_ARGS[@]}" \
   --covr-profile-stages \
   --covr-strategy-manifest "${MANIFEST}" \
   --covr-strategy-bandit \
-  --covr-contextual-bandit \
-  --covr-prefix-steps "${PREFIX_STEPS}" \
-  --covr-linucb-alpha "${LINUCB_ALPHA}" \
-  --covr-efficiency-lambda "${LAMBDA}" \
   --covr-bandit-state "${STATE}" \
   --covr-session-id "${SESSION_ID}" \
   --covr-bandit-epsilon "${EPSILON}" \

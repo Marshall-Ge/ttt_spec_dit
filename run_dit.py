@@ -35,6 +35,20 @@ from config import (
 from utils import (
     decode_latent, save_image, pil_to_tensor, ensure_real_299,
     get_vfl_checkpoint_dir, prune_checkpoints, latent_seed_for_index,
+    _clean,
+    _compute_generated_fid_is,
+    _covr_bandit_sentinel_selection,
+    _covr_forced_sentinel_selection,
+    _covr_hash_index,
+    _covr_hash_sample,
+    _covr_log_snr,
+    _covr_online_accounting,
+    _covr_scalar,
+    _covr_scheduler_config_json,
+    _covr_sentinel_selection,
+    _dataset_generation_window,
+    _load_forced_covr_template,
+    _record_profile_stage,
 )
 
 # Shared pure lifecycle helpers (version/resume/profiler/canonical-JSON).
@@ -47,6 +61,18 @@ from run_dit_shared import (
     _covr_scheduler_config_json,
     _covr_sentinel_selection,
 )  # noqa: F401  (re-exported compatibility surface)
+
+# COVR sampling-loop hooks (functions needing transformer/scheduler access).
+from pipelines.hooks.covr_hook import (  # noqa: F401  (re-exported surface)
+    _cache_scheduler_timestep_values,
+    _covr_context,
+    _covr_full_rollout,
+    _covr_scheduler_alphas,
+    _covr_scheduler_pair,
+    _covr_shadow_full,
+    _covr_teacache_terminal_skip,
+    _covr_transition_components,
+)
 
 from models.dit import (
     DiTTransformer2D, set_vfl_step_info, get_vfl_buffer, set_vfl_sample_id,
@@ -107,366 +133,6 @@ DIT_LATENT_SIZE = 32
 DIT_NULL_CLASS = 1000
 
 
-def _cache_scheduler_timestep_values(scheduler) -> None:
-    timesteps = scheduler.timesteps
-    if torch.is_tensor(timesteps):
-        values = timesteps.detach().to("cpu").tolist()
-    else:
-        values = timesteps
-    setattr(scheduler, "_host_timestep_values", tuple(
-        int(timestep) for timestep in values))
-
-
-def _covr_log_snr(scheduler, timestep) -> float:
-    alphas_cumprod = getattr(scheduler, "alphas_cumprod", None)
-    if alphas_cumprod is None:
-        return 0.0
-    index = int(timestep.item()) if torch.is_tensor(timestep) else int(timestep)
-    alpha = float(alphas_cumprod[index].detach().float().item())
-    alpha = min(max(alpha, 1e-8), 1.0 - 1e-8)
-    return float(np.log(alpha / (1.0 - alpha)))
-
-
-def _covr_scalar(value) -> float:
-    if torch.is_tensor(value):
-        return float(value.detach().float().item())
-    return float(value)
-
-
-def _covr_hash_sample(session_id: str, trajectory_id: int,
-                      step_idx: int, rate: float, purpose: str) -> bool:
-    if rate <= 0.0:
-        return False
-    if rate >= 1.0:
-        return True
-    payload = f"{purpose}:{session_id}:{trajectory_id}:{step_idx}".encode("utf-8")
-    value = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
-    return value / float(1 << 64) < rate
-
-
-def _covr_hash_index(session_id: str, trajectory_id: int,
-                     purpose: str, size: int) -> int:
-    if size <= 0:
-        raise ValueError("hash index size must be positive")
-    payload = f"{purpose}:{session_id}:{trajectory_id}".encode("utf-8")
-    value = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
-    return value % size
-
-
-def _covr_sentinel_selection(session_id: str, trajectory_id: int,
-                             rate: float, horizon: int, num_steps: int,
-                             mandatory_prefix: int = 0) -> Tuple[bool, Optional[int]]:
-    """Determine whether a trajectory is a sentinel and, if so, where its
-    H-step reference rollout starts.
-
-    Shared by the bandit and forced-strategy paths so both make the same
-    deterministic decision: hashed by (session_id, trajectory_id) with the
-    "delayed_sentinel" purpose string, so a trajectory is selected (or not)
-    identically under both modes.
-
-    Returns ``(selected, start_idx)`` where:
-      * ``selected`` is ``_covr_hash_sample(session_id, trajectory_id, -1,
-        rate, "delayed_sentinel")`` (strict 0.0/1.0 short-circuits, same as
-        the hash helper);
-      * ``start_idx`` is None when ``selected`` is False, ``horizon <= 0``,
-        or ``horizon >= num_steps`` (no interior H-step window);
-      * otherwise ``start_idx`` is a deterministic random index inside
-        ``[min(mandatory_prefix, max_start), max_start]`` with
-        ``max_start = num_steps - horizon`` (the bandit's existing formula).
-    """
-    selected = _covr_hash_sample(
-        session_id, trajectory_id, -1, rate, "delayed_sentinel")
-    start_idx = None
-    if selected and 0 < horizon < num_steps:
-        max_start = num_steps - horizon
-        min_start = min(int(mandatory_prefix), max_start)
-        start_idx = min_start + _covr_hash_index(
-            session_id, trajectory_id, "sentinel_start",
-            max_start - min_start + 1)
-    return selected, start_idx
-
-
-def _covr_bandit_sentinel_selection(covr_bandit, trajectory_id: int,
-                                    rate: float, horizon: int,
-                                    num_steps: int) -> Tuple[bool, Optional[int]]:
-    """Bandit-path wrapper over ``_covr_sentinel_selection`` (identity logic)."""
-    from run_dit_shared import _covr_sentinel_selection
-    return _covr_sentinel_selection(
-        covr_bandit.session_id, trajectory_id, rate, horizon, num_steps,
-        int(getattr(covr_bandit.manifest, "mandatory_prefix", 0)))
-
-
-def _covr_forced_sentinel_selection(covr_session_id: Optional[str],
-                                    covr_forced_manifest, trajectory_id: int,
-                                    rate: float, horizon: int,
-                                    num_steps: int) -> Tuple[bool, Optional[int]]:
-    """Forced-strategy wrapper over ``_covr_sentinel_selection`` (identity
-    logic; ``covr_session_id`` is None when no COVR mode is active, which
-    only happens when no forced strategy was requested)."""
-    from run_dit_shared import _covr_sentinel_selection
-    return _covr_sentinel_selection(
-        str(covr_session_id) if covr_session_id is not None else "",
-        trajectory_id, rate, horizon, num_steps,
-        int(getattr(covr_forced_manifest, "mandatory_prefix", 0)))
-
-
-def _covr_scheduler_alphas(scheduler, timesteps, step_idx: int, timestep):
-    config = getattr(scheduler, "config", None)
-    prediction_type = getattr(config, "prediction_type", None)
-    if prediction_type is None and hasattr(config, "get"):
-        prediction_type = config.get("prediction_type")
-    if prediction_type != "epsilon":
-        raise ValueError(
-            "COVR action audits require a DDIM epsilon-prediction scheduler")
-
-    alphas_cumprod = getattr(scheduler, "alphas_cumprod", None)
-    if alphas_cumprod is None:
-        raise ValueError("COVR action audits require scheduler alphas_cumprod")
-    timestep_index = int(_covr_scalar(timestep))
-    alpha_t = _covr_scalar(alphas_cumprod[timestep_index])
-
-    if step_idx + 1 < len(timesteps):
-        previous_index = int(_covr_scalar(timesteps[step_idx + 1]))
-        alpha_prev = _covr_scalar(alphas_cumprod[previous_index])
-    else:
-        final_alpha = getattr(scheduler, "final_alpha_cumprod", None)
-        if final_alpha is None:
-            raise ValueError(
-                "COVR action audits require scheduler final_alpha_cumprod")
-        alpha_prev = _covr_scalar(final_alpha)
-    return alpha_t, alpha_prev
-
-
-def _covr_scheduler_pair(scheduler, noise_approx, noise_full, timestep, latents):
-    approx_scheduler = copy.deepcopy(scheduler)
-    full_scheduler = copy.deepcopy(scheduler)
-    x_prev_approx = approx_scheduler.step(
-        noise_approx.detach(), timestep, latents.detach(), return_dict=False)[0]
-    x_prev_full = full_scheduler.step(
-        noise_full.detach(), timestep, latents.detach(), return_dict=False)[0]
-    return x_prev_approx, x_prev_full
-
-
-def _covr_transition_components(x_prev_approx, x_prev_full, x_t):
-    approx = x_prev_approx.detach().float().flatten(1)
-    full = x_prev_full.detach().float().flatten(1)
-    current = x_t.detach().float().flatten(1)
-    numerator = (approx - full).square().mean(dim=1).sqrt()
-    denominator = (full - current).square().mean(dim=1).sqrt()
-    return numerator, denominator
-
-
-def _covr_shadow_full(transformer, latent_input, timestep, class_labels,
-                      guidance_scale):
-    if guidance_scale > 1.0:
-        return transformer.forward_with_cfg(
-            latent_input, timestep,
-            current=None, cache_dic=None, teacache_state=None,
-            class_labels=class_labels, cfg_scale=guidance_scale,
-        )
-    return transformer(
-        latent_input, timestep=timestep,
-        current=None, cache_dic=None, teacache_state=None,
-        class_labels=class_labels, return_dict=False,
-    )[0]
-
-
-def _covr_teacache_terminal_skip(
-        transformer, latent_input, timestep, class_labels, guidance_scale,
-        teacache_state):
-    """Evaluate one isolated forced-skip candidate from the stale residual."""
-    shadow_state = dict(teacache_state)
-    for key, value in teacache_state.items():
-        if isinstance(value, list):
-            shadow_state[key] = list(value)
-    boundary_probe = teacache_state.get("boundary_probe")
-    if boundary_probe is not None:
-        shadow_state["boundary_probe"] = dict(boundary_probe)
-        shadow_state["boundary_probe"]["rows"] = list(
-            boundary_probe.get("rows", ()))
-
-    num_steps = int(shadow_state["num_steps"])
-    cnt = int(shadow_state["cnt"])
-    refresh_mask = [True] * num_steps
-    refresh_mask[cnt] = False
-    shadow_state["refresh_mask"] = tuple(refresh_mask)
-
-    if guidance_scale > 1.0:
-        return transformer.forward_with_cfg(
-            latent_input, timestep,
-            current=None, cache_dic=None, teacache_state=shadow_state,
-            class_labels=class_labels, cfg_scale=guidance_scale,
-        )
-    return transformer(
-        latent_input, timestep=timestep,
-        current=None, cache_dic=None, teacache_state=shadow_state,
-        class_labels=class_labels, return_dict=False,
-    )[0]
-
-
-def _covr_full_rollout(transformer, scheduler, timesteps, start_idx: int,
-                       horizon: int, latents, class_labels, guidance_scale,
-                       in_channels: int):
-    if horizon <= 0 or start_idx < 0 or start_idx + horizon > len(timesteps):
-        raise ValueError("invalid COVR sentinel rollout interval")
-    branch_scheduler = copy.deepcopy(scheduler)
-    branch_latents = latents.detach().clone()
-    for branch_idx in range(start_idx, start_idx + horizon):
-        timestep = timesteps[branch_idx]
-        timestep_batch = timestep.expand(branch_latents.shape[0]).to(torch.int64)
-        latent_input = branch_scheduler.scale_model_input(
-            branch_latents, timestep)
-        noise_pred = _covr_shadow_full(
-            transformer, latent_input, timestep_batch, class_labels,
-            guidance_scale)
-        noise_pred = noise_pred[:, :in_channels]
-        branch_latents = branch_scheduler.step(
-            noise_pred, timestep, branch_latents, return_dict=False)[0]
-    return branch_latents
-
-
-def _compute_generated_fid_is(metric: FIDISComputer) -> Dict[str, float]:
-    real_dir, gen_dir = metric.real_dir, metric.gen_dir
-    try:
-        metric.real_dir, metric.gen_dir = gen_dir, real_dir
-        return metric.compute()
-    finally:
-        metric.real_dir, metric.gen_dir = real_dir, gen_dir
-
-
-def _dataset_generation_window(dataset_start_index: int, target_samples: int,
-                               processed_samples: int,
-                               loaded_samples: int) -> Tuple[int, int]:
-    if dataset_start_index < 0 or target_samples <= 0 or processed_samples < 0:
-        raise ValueError("invalid deterministic dataset window")
-    if processed_samples >= target_samples:
-        raise ValueError("resume state has consumed the requested dataset slice")
-    if loaded_samples < dataset_start_index + target_samples:
-        raise ValueError("requested dataset slice exceeds the available dataset")
-    return dataset_start_index + processed_samples, target_samples - processed_samples
-
-
-def _covr_online_accounting(
-        online_wall_times: List[float], safety_wall_times: List[float],
-        n_images: int, safety_full_steps: int,
-        candidate_flops_T: Optional[float] = None,
-        vanilla_flops_T: Optional[float] = None,
-        full_step_flops: Optional[float] = None,
-        terminal_wall_times: Optional[List[float]] = None,
-        terminal_full_steps: int = 0,
-        control_wall_times: Optional[List[float]] = None) -> Dict[str, float]:
-    if terminal_wall_times is None:
-        terminal_wall_times = [0.0] * len(online_wall_times)
-    if control_wall_times is None:
-        control_wall_times = [0.0] * len(online_wall_times)
-    if (len(online_wall_times) != len(safety_wall_times) or
-            len(online_wall_times) != len(terminal_wall_times) or
-            len(online_wall_times) != len(control_wall_times)):
-        raise ValueError("online and feedback wall-time samples must align")
-    if not online_wall_times:
-        return {}
-
-    candidate_wall_times = [
-        max(0.0, online - safety - terminal - control)
-        for online, safety, terminal, control in zip(
-            online_wall_times, safety_wall_times, terminal_wall_times,
-            control_wall_times)
-    ]
-    online_total = float(sum(online_wall_times))
-    safety_total = float(sum(safety_wall_times))
-    terminal_total = float(sum(terminal_wall_times))
-    control_total = float(sum(control_wall_times))
-    candidate_total = float(sum(candidate_wall_times))
-    result = {
-        "wall_s_candidate_mean": float(np.mean(candidate_wall_times)),
-        "wall_s_candidate_std": float(np.std(candidate_wall_times)),
-        "wall_s_candidate_total": candidate_total,
-        "wall_s_safety_mean": float(np.mean(safety_wall_times)),
-        "wall_s_safety_total": safety_total,
-        "wall_s_terminal_mean": float(np.mean(terminal_wall_times)),
-        "wall_s_terminal_total": terminal_total,
-        "wall_s_control_mean": float(np.mean(control_wall_times)),
-        "wall_s_control_total": control_total,
-        "wall_s_online_mean": float(np.mean(online_wall_times)),
-        "wall_s_online_std": float(np.std(online_wall_times)),
-        "wall_s_online_total": online_total,
-        "speed_candidate_img_per_s": (
-            float(n_images / candidate_total) if candidate_total > 0 else 0.0),
-        "speed_online_img_per_s": (
-            float(n_images / online_total) if online_total > 0 else 0.0),
-        "safety_full_steps_mean_per_trajectory": (
-            float(safety_full_steps / len(online_wall_times))),
-        "terminal_full_steps_mean_per_trajectory": (
-            float(terminal_full_steps / len(online_wall_times))),
-    }
-
-    if (candidate_flops_T is not None and vanilla_flops_T is not None and
-            full_step_flops is not None):
-        safety_flops_T = (
-            safety_full_steps / len(online_wall_times) * full_step_flops / 1e12)
-        terminal_flops_T = (
-            terminal_full_steps / len(online_wall_times) * full_step_flops / 1e12)
-        online_flops_T = candidate_flops_T + safety_flops_T + terminal_flops_T
-        result.update({
-            "flops_candidate_T": float(candidate_flops_T),
-            "flops_safety_T": float(safety_flops_T),
-            "flops_terminal_T": float(terminal_flops_T),
-            "flops_online_T": float(online_flops_T),
-            "flops_reduction_candidate": (
-                1.0 - candidate_flops_T / vanilla_flops_T
-                if vanilla_flops_T > 0 else 0.0),
-            "flops_reduction_online": (
-                1.0 - online_flops_T / vanilla_flops_T
-                if vanilla_flops_T > 0 else 0.0),
-            "speedup_flops_candidate": (
-                vanilla_flops_T / candidate_flops_T
-                if candidate_flops_T > 0 else float("nan")),
-            "speedup_flops_online": (
-                vanilla_flops_T / online_flops_T
-                if online_flops_T > 0 else float("nan")),
-        })
-    return result
-
-
-def _load_forced_covr_template(path: str, template_id: str,
-                               version_key: str):
-    manifest = TemplateManifest.load(path)
-    if manifest.version_key != version_key:
-        raise ValueError(
-            "COVR template manifest version does not match the runtime: "
-            f"manifest={manifest.version_key}, runtime={version_key}")
-    for template in manifest.templates:
-        if template.template_id == template_id:
-            return manifest, template
-    raise ValueError(f"COVR template ID not found in manifest: {template_id}")
-
-
-def _covr_context(recorder, scheduler, timesteps, step_idx, timestep,
-                  current):
-    if current.activated_steps:
-        distance = abs(current.step - current.activated_steps[-1])
-    else:
-        distance = 0
-    alpha_t, alpha_prev = _covr_scheduler_alphas(
-        scheduler, timesteps, step_idx, timestep)
-    latent_coefficient, model_output_coefficient = (
-        ddim_epsilon_transition_coefficients(alpha_t, alpha_prev))
-    return ActionAuditContext(
-        step_idx=step_idx,
-        num_steps=len(timesteps),
-        timestep=_covr_scalar(timestep),
-        log_snr=_covr_log_snr(scheduler, timestep),
-        alpha_t=alpha_t,
-        alpha_prev=alpha_prev,
-        latent_coefficient=latent_coefficient,
-        model_output_coefficient=model_output_coefficient,
-        distance_since_refresh=distance,
-        previous_defect_mean=(
-            recorder.previous_defect if recorder is not None else 0.0),
-    )
-
-
-# ===========================================================================
 # DiTGenerator — orchestrator (no monkeypatching)
 # ===========================================================================
 
@@ -1396,14 +1062,6 @@ class DiTGenerator:
 # ===========================================================================
 # TTT plugin setup helper
 # ===========================================================================
-
-def _record_profile_stage(
-        totals: Dict[str, float], counts: Dict[str, int],
-        stage: str, elapsed_s: float) -> None:
-    """Accumulate a profiler stage in either dict or defaultdict mappings."""
-    totals[stage] = totals.get(stage, 0.0) + float(elapsed_s)
-    counts[stage] = counts.get(stage, 0) + 1
-
 
 def _setup_ttt(generator: "DiTGenerator", args):
     """Create TTT plugin and state for the full c2i pipeline."""
@@ -2950,25 +2608,6 @@ def _load_dit_coefficients(coef_path: Optional[str] = None):
             data = json.load(f)
             return data.get("coefficients", load_coefficients())
     return load_coefficients()
-
-
-def _clean(obj, _seen=None):
-    """Recursively make dicts JSON-safe."""
-    if _seen is None:
-        _seen = set()
-    if isinstance(obj, dict):
-        return {k: _clean(v, _seen) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [_clean(v, _seen) for v in obj]
-    elif isinstance(obj, (np.integer,)):
-        return int(obj)
-    elif isinstance(obj, (np.floating,)):
-        return float(obj)
-    elif isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, torch.Tensor):
-        return obj.detach().cpu().item()
-    return obj
 
 
 def _print_summary(results: Dict, selected: List[str], method: str):

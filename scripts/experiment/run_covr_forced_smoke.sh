@@ -54,7 +54,7 @@ PY
 echo "      version_key=${VERSION_KEY}"
 
 echo "[2/5] Building external TeaCache strategy manifest"
-python scripts/build_budget_manifest.py \
+python scripts/experiment/build_budget_manifest.py \
   --output "${MANIFEST}" \
   --method teacache \
   --num-steps "${NUM_STEPS}" \
@@ -93,6 +93,6 @@ python main.py "${COMMON_ARGS[@]}" \
   --output_dir "${RUN_DIR}"
 
 echo "[5/5] Validating forced COVR results"
-python scripts/check_covr_forced_smoke.py "${ROOT}" \
+python scripts/analyze/check_covr_forced_smoke.py "${ROOT}" \
   --manifest "${MANIFEST}" \
   --strategy-id "${STRATEGY_ID}"

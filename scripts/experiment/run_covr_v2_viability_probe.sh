@@ -133,7 +133,7 @@ if not value:
 print(value)
 PY
 )"
-  python scripts/build_budget_manifest.py \
+  python scripts/experiment/build_budget_manifest.py \
     --output "${MANIFEST}" \
     --num-steps "${NUM_STEPS}" \
     --refresh-count "${REFRESH_COUNT}" \

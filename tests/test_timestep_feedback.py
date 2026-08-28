@@ -7,7 +7,7 @@ from accelerators.covr import (
     TransitionDefectBatch,
 )
 from accelerators.timestep_feedback import TimestepFeedbackController
-from scripts.analyze_timestep_feedback import evaluate_prequential
+from scripts.analyze.analyze_timestep_feedback import evaluate_prequential
 
 
 def _controller(**kwargs):

@@ -35,7 +35,7 @@ from collections import defaultdict
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from analyze_conf_rank_validity import metrics_from_results_root  # noqa: E402
 
 

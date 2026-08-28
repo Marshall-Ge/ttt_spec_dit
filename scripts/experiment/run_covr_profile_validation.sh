@@ -91,7 +91,7 @@ env "${BASE_ENV[@]}" \
 log "audit ✓"
 
 log "building manifest → ${MANIFEST}"
-python "${ROOT_DIR}/scripts/build_covr_manifest.py" "${AUDIT_FILE}" \
+python "${ROOT_DIR}/scripts/experiment/build_covr_manifest.py" "${AUDIT_FILE}" \
   --output "${MANIFEST}" \
   --num-layers 28 \
   --template-count "${TEMPLATE_COUNT}" \

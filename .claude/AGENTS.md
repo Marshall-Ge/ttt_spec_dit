@@ -2,6 +2,10 @@
 
 > 本目录是本项目的工作记忆（对标 `lttta-main/.codex/`）。**先读本文件**，再按需深入 `memory/`、`skills/` 与仓库根 `CLAUDE.md`。
 
+## ⚠️ 强制:先读项目结构规范
+
+> **任何新增 / 修改 / 移动代码之前,必须先读 [project-structure.md](project-structure.md) 并遵守其中的分层、命名、依赖规则。** 违反规范(如反向 import、scripts 平铺、主逻辑堆巨型函数)的改动不应合入。新增文件 >600 行、函数 >300 行必须拆分。
+
 ## 一句话定位
 
 对 **DiT-2-256** 与 **PixArt-XL-2-512x512** 两种扩散生成模型做**推理加速**研究：评估 SpecA / TeaCache / DDIM 三种基础加速器对生成质量（FID/IS/CLIP）与效率（FLOPs/Latency）的影响，并在此基础上探索**在线学习改进缓存**的两条正交路线 —— **TTT**（改缓存内容，DiT-only）与 **VFL/COVR**（改缓存决策）。

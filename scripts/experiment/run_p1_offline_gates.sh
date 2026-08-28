@@ -40,14 +40,14 @@ K4_ARM="k4/equalflops/arm_pattern_uniform"
 fail() { echo "ERROR: $*" >&2; exit 2; }
 
 # --- preflight: scripts must be the 2026-08-21 toolchain ---------------------
-for f in scripts/extract_inception_conf.py scripts/analyze_conf_rank_validity.py \
-         scripts/simulate_conf_budget_controller.py scripts/build_conf_costs.py \
-         scripts/compute_mixture_fid.py; do
+for f in scripts/analyze/extract_inception_conf.py scripts/analyze/analyze_conf_rank_validity.py \
+         scripts/analyze/simulate_conf_budget_controller.py scripts/analyze/build_conf_costs.py \
+         scripts/analyze/compute_mixture_fid.py; do
   [ -f "$f" ] || fail "missing $f — sync the repo first (P1 scripts updated 2026-08-21)"
 done
-grep -q "mixture-out" scripts/simulate_conf_budget_controller.py \
+grep -q "mixture-out" scripts/analyze/simulate_conf_budget_controller.py \
   || fail "simulate_conf_budget_controller.py is the pre-2026-08-21 version — sync the repo"
-grep -q "PASS-FID-ONLY" scripts/analyze_conf_rank_validity.py \
+grep -q "PASS-FID-ONLY" scripts/analyze/analyze_conf_rank_validity.py \
   || fail "analyze_conf_rank_validity.py is the pre-2026-08-21 version — sync the repo"
 
 # --- preflight: data dirs ----------------------------------------------------
@@ -92,25 +92,25 @@ echo "  [P1-a] arm regex: ${ARM_REGEX}"
 CONF_STATIC="${OUT_DIR}/conf_k8static.csv"
 CONF_PROBE="${OUT_DIR}/conf_probe.csv"
 if [ -f "${CONF_STATIC}" ]; then echo "[skip] ${CONF_STATIC} exists"; else
-  "${PYTHON}" scripts/extract_inception_conf.py "${K8_STATIC_DIR}" \
+  "${PYTHON}" scripts/analyze/extract_inception_conf.py "${K8_STATIC_DIR}" \
       "${CONF_STATIC}" --device "${DEVICE}" --batch "${BATCH}"
 fi
 if [ "${RUN_PROBE}" = "1" ]; then
   if [ -f "${CONF_PROBE}" ]; then echo "[skip] ${CONF_PROBE} exists"; else
-    "${PYTHON}" scripts/extract_inception_conf.py "${PROBE_DIR}" \
+    "${PYTHON}" scripts/analyze/extract_inception_conf.py "${PROBE_DIR}" \
         "${CONF_PROBE}" --device "${DEVICE}" --batch "${BATCH}"
   fi
 fi
 
 # --- 1) Gate [P1-a]: 6 mask arms at offset 0 + free per-offset replications --
 echo; echo "######## Gate [P1-a] (offset 0) ########"
-"${PYTHON}" scripts/analyze_conf_rank_validity.py "${CONF_STATIC}" \
+"${PYTHON}" scripts/analyze/analyze_conf_rank_validity.py "${CONF_STATIC}" \
     --results-root "${K8_STATIC_DIR}" --arm-regex "${ARM_REGEX}" \
     | tee "${OUT_DIR}/gate_p1a.txt"
 for r in 1 2 3 4; do
   if compgen -G "${K8_STATIC_DIR}/*/equalflops/arm_pattern_*/rep_${r}" >/dev/null; then
     echo; echo "-- [P1-a] replication, latent offset ${r} (informational) --"
-    "${PYTHON}" scripts/analyze_conf_rank_validity.py "${CONF_STATIC}" \
+    "${PYTHON}" scripts/analyze/analyze_conf_rank_validity.py "${CONF_STATIC}" \
         --results-root "${K8_STATIC_DIR}" \
         --arm-regex "${ARM_BASE}/rep_${r}\$" \
         | tee "${OUT_DIR}/gate_p1a_rep${r}.txt"
@@ -127,17 +127,17 @@ if [ "${RUN_PROBE}" = "0" ]; then
 fi
 
 echo; echo "######## costs.json ########"
-"${PYTHON}" scripts/build_conf_costs.py "${PROBE_DIR}" \
+"${PYTHON}" scripts/analyze/build_conf_costs.py "${PROBE_DIR}" \
     --arm "8=${REF_ARM}" --arm "6=${K6_ARM}" --arm "4=${K4_ARM}" \
     -o "${OUT_DIR}/costs.json"
 
 echo; echo "######## conf separation (summary; Cohen's d) ########"
-"${PYTHON}" scripts/simulate_conf_budget_controller.py "${CONF_PROBE}" summary \
+"${PYTHON}" scripts/analyze/simulate_conf_budget_controller.py "${CONF_PROBE}" summary \
     --reference "${REF_ARM}" --headroom-arm "${K6_ARM}" \
     | tee "${OUT_DIR}/summary.txt"
 
 echo; echo "######## Gate [P1-b] (power) ########"
-"${PYTHON}" scripts/simulate_conf_budget_controller.py "${CONF_PROBE}" power \
+"${PYTHON}" scripts/analyze/simulate_conf_budget_controller.py "${CONF_PROBE}" power \
     --reference "${REF_ARM}" | tee "${OUT_DIR}/gate_p1b.txt"
 
 H_STAR="$(sed -n 's/.*h=[[:space:]]*\([0-9.]*\): .*<- selected.*/\1/p' \
@@ -151,12 +151,12 @@ echo "h* = ${H_STAR}"
 
 # --- 3) Gate [P1-c]: closed-loop sim (FLOPs leg) -> mixture FID (quality) ----
 echo; echo "######## Gate [P1-c] FLOPs leg (simulate) ########"
-"${PYTHON}" scripts/simulate_conf_budget_controller.py "${CONF_PROBE}" simulate \
+"${PYTHON}" scripts/analyze/simulate_conf_budget_controller.py "${CONF_PROBE}" simulate \
     --reference "${REF_ARM}" --costs "${OUT_DIR}/costs.json" --h "${H_STAR}" \
     --mixture-out "${OUT_DIR}/plan.json" | tee "${OUT_DIR}/gate_p1c_flops.txt"
 
 echo; echo "######## Gate [P1-c] quality leg (mixture FID) ########"
-if ! "${PYTHON}" scripts/compute_mixture_fid.py "${OUT_DIR}/plan.json" \
+if ! "${PYTHON}" scripts/analyze/compute_mixture_fid.py "${OUT_DIR}/plan.json" \
     --run-root "${PROBE_DIR}" --workdir "${OUT_DIR}/mixture_299" \
     ${REAL_DIR:+--real-dir "${REAL_DIR}"} \
     | tee "${OUT_DIR}/gate_p1c_quality.txt"; then

@@ -2,7 +2,7 @@ import copy
 import hashlib
 import json
 
-from scripts.check_covr_bandit_resume_smoke import validate_artifacts
+from scripts.analyze.check_covr_bandit_resume_smoke import validate_artifacts
 
 
 SESSION_ID = "resume-smoke"

@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from scripts.analyze_covr_teacache_bandit import analyze_state
+from scripts.analyze.analyze_covr_teacache_bandit import analyze_state
 
 
 ROOT = Path(__file__).resolve().parents[1]

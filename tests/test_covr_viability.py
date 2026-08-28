@@ -14,7 +14,7 @@ from accelerators.covr_viability import (
     COVRViabilityRecorder,
     extract_prefix_features,
 )
-from scripts.analyze_covr_v2_viability import analyze
+from scripts.analyze.analyze_covr_v2_viability import analyze
 
 
 def _write_image(path: Path, value: int) -> None:
