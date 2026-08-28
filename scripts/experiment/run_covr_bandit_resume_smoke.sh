@@ -5,7 +5,7 @@
 # adaptive policy improves quality or efficiency.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 NUM_STEPS="${COVR_NUM_STEPS:-50}"
 REFRESH_COUNT="${COVR_REFRESH_COUNT:-8}"

@@ -19,7 +19,7 @@ set -euo pipefail
 #   FOREGROUND=1 GPUS=0,1,2 bash scripts/run_covr_50k_cfg.sh
 # ============================================================================
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT_DIR}"
 
 RUN_ID="$(date +%Y%m%d-%H%M%S)"

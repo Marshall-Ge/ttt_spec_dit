@@ -24,7 +24,7 @@ set -euo pipefail
 #   FOREGROUND        — 设为 1 则前台运行 (默认后台 nohup)
 # ============================================================================
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT_DIR}"
 
 RUN_ID="$(date +%Y%m%d-%H%M%S)"

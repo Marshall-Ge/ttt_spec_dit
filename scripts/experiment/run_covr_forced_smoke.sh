@@ -7,7 +7,7 @@
 # real CLI entry point once.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 STRATEGY_ID="${1:-${COVR_STRATEGY_ID:-uniform}}"
 NUM_STEPS="${COVR_NUM_STEPS:-50}"

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ORCHESTRATOR="${ROOT_DIR}/scripts/run_covr_template_experiment.sh"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ORCHESTRATOR="${ROOT_DIR}/scripts/experiment/run_covr_template_experiment.sh"
 
 # ---- config (all overridable via env) ----
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"

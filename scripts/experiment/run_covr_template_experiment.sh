@@ -8,7 +8,7 @@ if [[ -z "${PHASE}" ]]; then
 fi
 shift
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SEED="${SEED:-42}"
 if [[ "${PHASE}" == "smoke" ]]; then
   RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"

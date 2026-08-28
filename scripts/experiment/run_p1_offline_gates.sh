@@ -23,7 +23,7 @@
 # 真跑；任一 FAIL → 停，不调参挽救。conf CSV 已存在时跳过重提取（安全重跑）。
 # =============================================================================
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 PYTHON="${PYTHON:-python3}"
 command -v "${PYTHON}" >/dev/null 2>&1 || PYTHON=python

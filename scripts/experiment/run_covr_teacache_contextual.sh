@@ -24,7 +24,7 @@
 #     bash scripts/run_covr_teacache_contextual.sh
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 MODE="${MODE:-run}"
 NUM_STEPS="${NUM_STEPS:-50}"
