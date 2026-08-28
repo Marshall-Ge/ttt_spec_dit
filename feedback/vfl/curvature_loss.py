@@ -119,7 +119,7 @@ def _run_transformer_forward(transformer,
     can read it without recomputing per Linear. Cleared in ``finally`` to
     avoid leaking across forwards.
     """
-    from verification_feedback_loop.lora_adapter import (
+    from feedback.vfl.lora_adapter import (
         set_lora_t_emb, clear_lora_t_emb,
         compute_timestep_emb_for_transformer,
     )
@@ -248,7 +248,7 @@ def compute_training_loss(
     def _get_pixart_t_emb(t_val, hidden_dtype):
         key = int(t_val[0].item()) if t_val.numel() > 0 else 0
         if key not in _pixart_t_emb_cache:
-            from verification_feedback_loop.lora_adapter import (
+            from feedback.vfl.lora_adapter import (
                 set_lora_t_emb, clear_lora_t_emb,
                 compute_timestep_emb_for_transformer,
             )

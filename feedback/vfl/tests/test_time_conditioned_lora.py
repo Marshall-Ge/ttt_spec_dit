@@ -23,7 +23,7 @@ Coverage:
   8. get_lora_params includes t_proj params.
 
 Run:
-    python verification_feedback_loop/tests/test_time_conditioned_lora.py
+    python feedback.vfl/tests/test_time_conditioned_lora.py
 """
 
 import os
@@ -35,7 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 import torch
 import torch.nn as nn
 
-from verification_feedback_loop.lora_adapter import (
+from feedback.vfl.lora_adapter import (
     LoRALinear,
     attach_lora,
     attach_lora_all_layers,
@@ -388,7 +388,7 @@ def test_old_scalar_gate_checkpoint_compat():
         torch.save(state, path)
 
         # Detach existing wrappers
-        from verification_feedback_loop.lora_adapter import detach_lora
+        from feedback.vfl.lora_adapter import detach_lora
         detach_lora(transformer, wrappers)
 
         # Load — should warn and skip t_proj
@@ -515,7 +515,7 @@ def test_legacy_checkpoint_loads_with_zero_t_proj():
         torch.save(state, path)
 
         # Detach vanilla wrappers so we can re-attach on a fresh transformer.
-        from verification_feedback_loop.lora_adapter import detach_lora
+        from feedback.vfl.lora_adapter import detach_lora
         detach_lora(transformer, wrappers_vanilla)
 
         tx2 = _StubTransformer(num_layers=2, dim=16, t_emb_dim=16)
@@ -591,7 +591,7 @@ def test_get_lora_params_includes_t_proj():
     print(f"  freeze_backbone → all {n_grad} LoRA params trainable ✓")
 
     # Vanilla variant: fewer params.
-    from verification_feedback_loop.lora_adapter import detach_lora
+    from feedback.vfl.lora_adapter import detach_lora
     detach_lora(transformer, wrappers)
     wrappers_vanilla = attach_lora_all_layers(
         transformer, rank=4, alpha=1.0, time_conditioned=False)

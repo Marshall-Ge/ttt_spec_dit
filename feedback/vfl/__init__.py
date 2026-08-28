@@ -11,20 +11,20 @@
   (threshold / rescale / backbone 轨迹平滑度)。两者互不依赖。
 """
 
-from verification_feedback_loop.verification_hook import (
+from feedback.vfl.verification_hook import (
     VerificationEvent,
     record_event,
     make_timestep_bucket,
     NUM_TIMESTEP_BUCKETS,
 )
-from verification_feedback_loop.replay_buffer import (
+from feedback.vfl.replay_buffer import (
     StratifiedReplayBuffer,
     AnchorSample,
 )
-from verification_feedback_loop.online_calibration import (
+from feedback.vfl.online_calibration import (
     OnlineCalibrator,
 )
-from verification_feedback_loop.lora_adapter import (
+from feedback.vfl.lora_adapter import (
     LoRALinear,
     attach_lora,
     attach_lora_all_layers,
@@ -42,25 +42,25 @@ from verification_feedback_loop.lora_adapter import (
     get_lora_t_emb,
     compute_timestep_emb_for_transformer,
 )
-from verification_feedback_loop.curvature_loss import (
+from feedback.vfl.curvature_loss import (
     compute_training_loss,
 )
-from verification_feedback_loop.async_trainer import (
+from feedback.vfl.async_trainer import (
     AsyncTrainer,
     AsyncTrainingWorker,
 )
-from verification_feedback_loop.eval_gate import (
+from feedback.vfl.eval_gate import (
     EvalGate,
     GateStatus,
     GateResult,
 )
-from verification_feedback_loop.version_registry import (
+from feedback.vfl.version_registry import (
     VersionRegistry,
     AdapterStatus,
     AdapterRecord,
 )
-from verification_feedback_loop.config import VFLConfig
-from verification_feedback_loop.vfl_state import (
+from feedback.vfl.config import VFLConfig
+from feedback.vfl.vfl_state import (
     set_vfl_buffer,
     set_vfl_calibrator,
     get_vfl_buffer,

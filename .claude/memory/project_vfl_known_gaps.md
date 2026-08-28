@@ -12,7 +12,7 @@ VFL 各层在 DiT 主流程"基本接通"，但以下缺陷截至 2026-07-10 未
 - CLAUDE.md §9 表格写 "PixArt + speca + VFL ✅" 与 "PixArt + speca + VFL 完整三层 ✅" 是**误导性描述**，实际是 ❌
 
 **D2 (P0 但非紧急): EvalGate canary 闸门未接主流程**
-- `EvalGate.evaluate()` 仅在 `verification_feedback_loop/demo_e2e.py` 中被调用
+- `EvalGate.evaluate()` 仅在 `feedback.vfl/demo_e2e.py` 中被调用
 - `run_dit.py` 主流程：AsyncTrainingWorker 训完直接 `save_lora_checkpoint`，下一轮通过 `find_latest_checkpoint`（按 mtime）直接加载，无质量校验
 - 后果：LoRA 越训越差也会被自动加载
 

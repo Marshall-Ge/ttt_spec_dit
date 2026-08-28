@@ -4,10 +4,10 @@
 
 Usage:
     # Synthetic mode (no GPU, no model checkpoint needed):
-    python verification_feedback_loop/demo_e2e.py --synthetic --n_images 20
+    python feedback.vfl/demo_e2e.py --synthetic --n_images 20
 
     # Real DiT mode (needs GPU + checkpoint):
-    python verification_feedback_loop/demo_e2e.py --n_images 20 --num_steps 20
+    python feedback.vfl/demo_e2e.py --n_images 20 --num_steps 20
 """
 
 import argparse
@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import torch
 import numpy as np
 
-from verification_feedback_loop import (
+from feedback.vfl import (
     VerificationEvent, record_event, make_timestep_bucket,
     StratifiedReplayBuffer, OnlineCalibrator, VFLConfig,
     AsyncTrainer, EvalGate, GateStatus, VersionRegistry,

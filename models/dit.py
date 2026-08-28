@@ -47,10 +47,10 @@ from accelerators.teacache import (
 )
 
 # VFL (Verification Feedback Loop) — delegates to shared module.
-# All globals and hooks live in ``verification_feedback_loop.vfl_state``.
+# All globals and hooks live in ``feedback.vfl.vfl_state``.
 # We re-export the public setters/getters for backward compatibility and keep
 # only DiT-specific constants + thin recording wrappers that pass ``model="dit"``.
-from verification_feedback_loop.vfl_state import (
+from feedback.vfl.vfl_state import (
     set_vfl_buffer,
     set_vfl_calibrator,
     get_vfl_buffer,
@@ -795,6 +795,6 @@ class DiTTransformer2D(nn.Module):
 
 def __getattr__(name):
     if name == 'DiTGenerator':
-        from run_dit import DiTGenerator as _Gen
+        from pipelines.dit import DiTGenerator as _Gen
         return _Gen
     raise AttributeError(f"module 'models.dit' has no attribute {name!r}")

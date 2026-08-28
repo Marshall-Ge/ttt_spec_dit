@@ -45,7 +45,7 @@ ttt_spec_dit/
 │   ├── strategy_dispatch.py   #   策略 → 加速器状态 分发
 │   ├── covr*.py               #   COVR runtime / bandit / viability
 │   └── timestep_feedback.py   #   session 级 per-timestep 缺陷学习
-├── feedback/                  # ★ 在线学习子系统(原 verification_feedback_loop)
+├── feedback/                  # ★ 在线学习子系统
 │   ├── vfl/                   #   Verification Feedback Loop(L1 校准 / L2 缓冲 / L3 LoRA)
 │   └── ...                    #   未来新增在线学习方向(如 TTT 训练器)放这里
 ├── eval/                      # 指标(不动):fid_is / latency / clip / lpips / mse ...
@@ -113,5 +113,5 @@ utils/    → 不依赖任何项目内模块(最底层)
 ## 6. 已知待迁移项(渐进,不阻塞新功能)
 
 - `run_dit.py` / `run_pixart.py` 的历史遗留 `_covr_*` 辅助函数正在迁移至 `utils/serialization.py` 与 `pipelines/hooks/covr_hook.py`(run_dit 顶部 ~350 行已迁完的标记见文件头注释)。
-- `verification_feedback_loop/` 包名计划更名为 `feedback/vfl/`(本次未动,新代码可先 import 旧名,后续统一迁移)。
+
 - `eval/latency.py` 内嵌的 tail-profiler 复制逻辑待抽至 `utils/flops.py`。

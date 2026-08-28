@@ -15,7 +15,7 @@
   - 不合并语义相反的代码块。
   - 不删除领域模型字段。
   - 不使用奇技淫巧简化（如位运算替代布尔）。
-- **每步验证**：删除后运行 `python -c "import main"` 做导入冒烟，并跑 `verification_feedback_loop/tests/` 下相关测试。
+- **每步验证**：删除后运行 `python -c "import main"` 做导入冒烟，并跑 `feedback.vfl/tests/` 下相关测试。
 
 ---
 
@@ -50,7 +50,7 @@ run_dit.py ─┬─ models/dit.py (DiTTransformer2D)
             ├─ eval/ (CLIPScorer, FIDISComputer, LatencyMetric, FLOPsMetric,
             │        LPIPSScorer, MSEMetric)
             ├─ models/ttt_plugin.py (SessionAdaLNModulator, ttt_state_init, ...)
-            ├─ verification_feedback_loop/ (StratifiedReplayBuffer, OnlineCalibrator,
+            ├─ feedback.vfl/ (StratifiedReplayBuffer, OnlineCalibrator,
             │                                AsyncTrainingWorker, VFLConfig,
             │                                load_lora_checkpoint, set_vfl_*, ...)
             └─ utils.py, config.py
@@ -60,17 +60,17 @@ run_pixart.py ─┬─ models/pixart.py (PixArtTransformer2D)
                ├─ dataset/ (COCO30KDataset, ImageNetDataset, DrawBenchDataset, GenEvalDataset)
                ├─ eval/ (CLIPScorer, FIDISComputer, GenEvalScorer, ImageRewardScorer,
                │        LatencyMetric, FLOPsMetric, LPIPSScorer, MSEMetric)
-               ├─ verification_feedback_loop/ (set_vfl_*, record_*_event, get_vfl_*)
+               ├─ feedback.vfl/ (set_vfl_*, record_*_event, get_vfl_*)
                └─ utils.py, config.py
 
 models/dit.py ─┬─ accelerators/ (teacache_*, speca_*, taylor_*, cache_step_dit, ...)
-               └─ verification_feedback_loop.vfl_state (get_vfl_*, record_*_event, set_vfl_sample_id)
+               └─ feedback.vfl.vfl_state (get_vfl_*, record_*_event, set_vfl_sample_id)
 
 models/pixart.py ─┬─ accelerators/ (同上但 cache_step_pixart)
-                  └─ verification_feedback_loop.vfl_state (同上但无 set_vfl_sample_id)
+                  └─ feedback.vfl.vfl_state (同上但无 set_vfl_sample_id)
 
-accelerators/speca.py ──→ verification_feedback_loop.OnlineCalibrator (类型注解)
-accelerators/teacache.py ──→ verification_feedback_loop.OnlineCalibrator (类型注解)
+accelerators/speca.py ──→ feedback.vfl.OnlineCalibrator (类型注解)
+accelerators/teacache.py ──→ feedback.vfl.OnlineCalibrator (类型注解)
 
 eval/latency.py ──→ models.dit.DiTGenerator (通过 models/dit.py 的 __getattr__ 延迟导入)
                   ──→ models.pixart.PixArtGenerator (直接 import)
@@ -79,7 +79,7 @@ eval/latency.py ──→ models.dit.DiTGenerator (通过 models/dit.py 的 __ge
 ### 1.3 VFL 包内部依赖
 
 ```
-verification_feedback_loop/
+feedback.vfl/
 ├── __init__.py             ← 批量 re-export（当前过度导出）
 ├── vfl_state.py            ← 全局 hooks（set_vfl_*, get_vfl_*, record_*_event）
 │                             被 models/dit.py, models/pixart.py, run_dit.py, run_pixart.py 使用
@@ -127,7 +127,7 @@ verification_feedback_loop/
 | # | 文件:行 | 类型 | 状态 | 不删原因 |
 |---|--------|------|------|---------|
 | A'1 | `eval/latency.py: SpeedupMetric` (line 329) | 未引用类 | 保留 | `eval/__init__.py` 显式导出 + README 提及；属于对外公共 API，删除需先确认无外部调用方依赖 |
-| A'2 | `verification_feedback_loop/curvature_loss.py: trajectory_curvature_loss_from_buffer` (line 118) | 未引用函数 | 保留 | `__init__.py` 显式导出的公共 API；包装 `trajectory_curvature_loss`，可能给外部调用方使用 |
+| A'2 | `feedback.vfl/curvature_loss.py: trajectory_curvature_loss_from_buffer` (line 118) | 未引用函数 | 保留 | `__init__.py` 显式导出的公共 API；包装 `trajectory_curvature_loss`，可能给外部调用方使用 |
 
 > 这两项如需清理，建议改为「标记 deprecated + 文档说明」而非直接删除。
 
@@ -137,9 +137,9 @@ verification_feedback_loop/
 
 | # | 位置 | 类型 | 行数 | 证据 |
 |---|------|------|------|------|
-| B1 | `verification_feedback_loop/eval_gate.py` 整文件 | 死模块 | 375 | 仅 `demo_e2e.py` 引用（4 处：line 26, 55, 250, 174/336）；无测试覆盖；无生产 runner 引用（已核实） |
-| B2 | `verification_feedback_loop/version_registry.py` 整文件 | 死模块 | 401 | 仅 `demo_e2e.py` 引用（2 处：line 26, 52, 248）；无测试覆盖；无生产 runner 引用（已核实） |
-| B3 | `verification_feedback_loop/demo_e2e.py` 整文件 | 死 demo | 371 | 仅 `async_trainer.py:35, 437` 注释提及，无任何 import（已核实） |
+| B1 | `feedback.vfl/eval_gate.py` 整文件 | 死模块 | 375 | 仅 `demo_e2e.py` 引用（4 处：line 26, 55, 250, 174/336）；无测试覆盖；无生产 runner 引用（已核实） |
+| B2 | `feedback.vfl/version_registry.py` 整文件 | 死模块 | 401 | 仅 `demo_e2e.py` 引用（2 处：line 26, 52, 248）；无测试覆盖；无生产 runner 引用（已核实） |
+| B3 | `feedback.vfl/demo_e2e.py` 整文件 | 死 demo | 371 | 仅 `async_trainer.py:35, 437` 注释提及，无任何 import（已核实） |
 
 **B 类合计：约 1147 行**（3 文件）
 
@@ -154,13 +154,13 @@ verification_feedback_loop/
 | `__init__.py` 行 | 移除内容 | 原因 |
 |-----------------|---------|------|
 | line 14-19 | 无需动 | `VerificationEvent`、`record_event`、`make_timestep_bucket`、`NUM_TIMESTEP_BUCKETS` 全部 alive（被 `vfl_state.py`、`verification_hook.py` 内部使用） |
-| line 48-52 | `from verification_feedback_loop.eval_gate import EvalGate, GateStatus, GateResult` | B1 文件删除后 import 失败 |
-| line 53-57 | `from verification_feedback_loop.version_registry import VersionRegistry, AdapterStatus, AdapterRecord` | B2 文件删除后 import 失败 |
+| line 48-52 | `from feedback.vfl.eval_gate import EvalGate, GateStatus, GateResult` | B1 文件删除后 import 失败 |
+| line 53-57 | `from feedback.vfl.version_registry import VersionRegistry, AdapterStatus, AdapterRecord` | B2 文件删除后 import 失败 |
 | line 44-47 中 `AsyncTrainer` | `AsyncTrainer` 的 import 和 `__all__` 项 | D1 类删除后无法 import |
 
 #### B'.2 可选精简（保守策略，**不强制**）
 
-以下 symbol 在 `__init__.py` 顶层导出但生产代码（`async_trainer.py`）通过子模块路径 `from verification_feedback_loop.lora_adapter import ...` 直接访问，不依赖顶层导出。从「公共 API 收窄」角度可移除，但**不属于死代码**，建议**保留**以维持 API 兼容性：
+以下 symbol 在 `__init__.py` 顶层导出但生产代码（`async_trainer.py`）通过子模块路径 `from feedback.vfl.lora_adapter import ...` 直接访问，不依赖顶层导出。从「公共 API 收窄」角度可移除，但**不属于死代码**，建议**保留**以维持 API 兼容性：
 
 | Symbol | 状态 | 生产调用方 |
 |--------|------|----------|
@@ -195,7 +195,7 @@ verification_feedback_loop/
 
 | # | 位置 | 行数 | 证据（已核实） |
 |---|------|------|--------------|
-| D1 | `verification_feedback_loop/async_trainer.py: AsyncTrainer`（line 445） | ~200 | 代码注释标记 `deprecated`；仅 `demo_e2e.py:138, 322` 和 `run_session2_flywheel.py:64` 使用；`AsyncTrainingWorker`（line 75）是替代品，已被 `run_dit.py` 采用 |
+| D1 | `feedback.vfl/async_trainer.py: AsyncTrainer`（line 445） | ~200 | 代码注释标记 `deprecated`；仅 `demo_e2e.py:138, 322` 和 `run_session2_flywheel.py:64` 使用；`AsyncTrainingWorker`（line 75）是替代品，已被 `run_dit.py` 采用 |
 
 **前置条件**：D1 删除需先确认 C2（`run_session2_flywheel.py`）和 B3（`demo_e2e.py`）都删除。
 
@@ -209,7 +209,7 @@ verification_feedback_loop/
 
 | # | 位置 | 操作 | 行数 |
 |---|------|------|------|
-| E1 | `verification_feedback_loop/__init__.py` | 移除 B'.1 表中 3 处失效 import（`eval_gate`、`version_registry`、`AsyncTrainer`） | ~6 |
+| E1 | `feedback.vfl/__init__.py` | 移除 B'.1 表中 3 处失效 import（`eval_gate`、`version_registry`、`AsyncTrainer`） | ~6 |
 | E2 | 全项目 | A 类删除后跑 `pyflakes` 清理未引用 import | ~10 |
 
 #### E1 后 `__all__` 实际改动
@@ -258,7 +258,7 @@ verification_feedback_loop/
 
 **验证**：
 ```bash
-python -c "import main; from config import *; import utils; import accelerators; import eval; from verification_feedback_loop import curvature_loss"
+python -c "import main; from config import *; import utils; import accelerators; import eval; from feedback.vfl import curvature_loss"
 python -m pyflakes config.py utils.py accelerators/teacache.py
 ```
 
@@ -271,14 +271,14 @@ python -m pyflakes config.py utils.py accelerators/teacache.py
 **前置确认**：B3（`demo_e2e.py`）是否还需要保留作为演示？
 
 **操作**：
-- 删除 `verification_feedback_loop/eval_gate.py`
-- 删除 `verification_feedback_loop/version_registry.py`
-- 删除 `verification_feedback_loop/demo_e2e.py`
+- 删除 `feedback.vfl/eval_gate.py`
+- 删除 `feedback.vfl/version_registry.py`
+- 删除 `feedback.vfl/demo_e2e.py`
 
 **验证**：
 ```bash
-python -c "import verification_feedback_loop"
-python -m pytest verification_feedback_loop/tests/ -x --tb=short
+python -c "import feedback.vfl"
+python -m pytest feedback.vfl/tests/ -x --tb=short
 ```
 
 **Commit**：`refactor(cleanup): remove dead VFL modules (eval_gate, version_registry, demo_e2e)`
@@ -308,13 +308,13 @@ python -c "import main"  # 确认主入口未受影响
 **前置**：Step 2（B3）和 Step 3（C2）均已执行。
 
 **操作**：
-- 删除 `verification_feedback_loop/async_trainer.py` 中 `AsyncTrainer` 类（line 445 起，约 200 行）
-- 删除 `verification_feedback_loop/__init__.py` 中 `AsyncTrainer` 的 import 和 `__all__` 项
+- 删除 `feedback.vfl/async_trainer.py` 中 `AsyncTrainer` 类（line 445 起，约 200 行）
+- 删除 `feedback.vfl/__init__.py` 中 `AsyncTrainer` 的 import 和 `__all__` 项
 
 **验证**：
 ```bash
-python -c "from verification_feedback_loop import AsyncTrainingWorker"
-python -m pytest verification_feedback_loop/tests/ -x --tb=short
+python -c "from feedback.vfl import AsyncTrainingWorker"
+python -m pytest feedback.vfl/tests/ -x --tb=short
 ```
 
 **Commit**：`refactor(cleanup): remove deprecated AsyncTrainer class`
@@ -324,16 +324,16 @@ python -m pytest verification_feedback_loop/tests/ -x --tb=short
 ### Step 5 — E1 精简（`__init__.py` 失效 import 清理）
 
 **操作**（仅强制 3 处，不收窄其他 export）：
-- 移除 `verification_feedback_loop/__init__.py` 中：
-  - `from verification_feedback_loop.eval_gate import EvalGate, GateStatus, GateResult`（line 48-52）
-  - `from verification_feedback_loop.version_registry import VersionRegistry, AdapterStatus, AdapterRecord`（line 53-57）
+- 移除 `feedback.vfl/__init__.py` 中：
+  - `from feedback.vfl.eval_gate import EvalGate, GateStatus, GateResult`（line 48-52）
+  - `from feedback.vfl.version_registry import VersionRegistry, AdapterStatus, AdapterRecord`（line 53-57）
   - `AsyncTrainer` 的 import 和 `__all__` 项（line 45 + line 97）
 - 其余 27 项 export 全部保留
 
 **验证**：
 ```bash
-python -c "import verification_feedback_loop; print(verification_feedback_loop.__all__)"
-python -m pytest verification_feedback_loop/tests/ -x --tb=short
+python -c "import feedback.vfl; print(feedback.vfl.__all__)"
+python -m pytest feedback.vfl/tests/ -x --tb=short
 ```
 
 **Commit**：`refactor(cleanup): remove broken VFL __init__ imports after module deletion`
@@ -348,8 +348,8 @@ python -m pytest verification_feedback_loop/tests/ -x --tb=short
 
 **验证**：
 ```bash
-python -m pyflakes *.py accelerators/ models/ eval/ dataset/ verification_feedback_loop/*.py
-python -m pytest verification_feedback_loop/tests/ -x --tb=short
+python -m pyflakes *.py accelerators/ models/ eval/ dataset/ feedback.vfl/*.py
+python -m pytest feedback.vfl/tests/ -x --tb=short
 ```
 
 **Commit**：`refactor(cleanup): purge unused imports post-cleanup`
@@ -365,11 +365,11 @@ python -m pytest verification_feedback_loop/tests/ -x --tb=short
 | 测试 | 命令 | 预期 |
 |------|------|------|
 | 主入口导入 | `python -c "import main"` | 无报错 |
-| VFL 包导入 | `python -c "import verification_feedback_loop"` | 无报错 |
+| VFL 包导入 | `python -c "import feedback.vfl"` | 无报错 |
 | 加速器导入 | `python -c "import accelerators; from accelerators import speca_init, teacache_init"` | 无报错 |
 | 模型导入 | `python -c "from models import DiTTransformer2D, PixArtTransformer2D"` | 无报错 |
 | eval 导入 | `python -c "import eval; from eval import FIDISComputer, FLOPsMetric, LatencyMetric"` | 无报错 |
-| VFL 测试套件 | `python -m pytest verification_feedback_loop/tests/ -x --tb=short` | 全绿 |
+| VFL 测试套件 | `python -m pytest feedback.vfl/tests/ -x --tb=short` | 全绿 |
 
 ### 5.2 端到端冒烟（最终步骤后）
 
@@ -428,9 +428,9 @@ python main.py --model pixart --task t2i --dataset drawbench \
 - [ ] **A5** `accelerators/teacache.py: teacache_export_trace` 删除？
 
 ### B 类（死模块，~1147 行，3 文件）
-- [ ] **B1** `verification_feedback_loop/eval_gate.py` 删除？
-- [ ] **B2** `verification_feedback_loop/version_registry.py` 删除？
-- [ ] **B3** `verification_feedback_loop/demo_e2e.py` 删除？
+- [ ] **B1** `feedback.vfl/eval_gate.py` 删除？
+- [ ] **B2** `feedback.vfl/version_registry.py` 删除？
+- [ ] **B3** `feedback.vfl/demo_e2e.py` 删除？
 
 ### C 类（孤立脚本，~1007 行，3 文件，待人工确认）
 - [ ] **C1** `ttt_baseline.py` 删除？

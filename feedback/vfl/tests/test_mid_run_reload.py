@@ -5,7 +5,7 @@ Verifies that the training daemon can snapshot LoRA weights, the inference
 thread can pull and swap them, and that failures are handled gracefully.
 
 Run:
-    python verification_feedback_loop/tests/test_mid_run_reload.py
+    python feedback.vfl/tests/test_mid_run_reload.py
 """
 
 import os
@@ -19,16 +19,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 import torch
 import torch.nn as nn
 
-from verification_feedback_loop.lora_adapter import (
+from feedback.vfl.lora_adapter import (
     LoRALinear,
     attach_lora_all_layers,
     save_lora_checkpoint,
     _swap_lora_weights,
     _load_state_into_wrappers,
 )
-from verification_feedback_loop.async_trainer import AsyncTrainingWorker
-from verification_feedback_loop.config import VFLConfig
-from verification_feedback_loop.replay_buffer import StratifiedReplayBuffer
+from feedback.vfl.async_trainer import AsyncTrainingWorker
+from feedback.vfl.config import VFLConfig
+from feedback.vfl.replay_buffer import StratifiedReplayBuffer
 
 
 # ===========================================================================

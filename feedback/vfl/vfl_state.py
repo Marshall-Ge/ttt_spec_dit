@@ -212,7 +212,7 @@ def record_speca_event(layer_id: int,
         return
 
     # Buffer registered → build full VerificationEvent + write to buffer.
-    import verification_feedback_loop.verification_hook as vh
+    import feedback.vfl.verification_hook as vh
     event = vh.make_speca_event(
         layer_id=layer_id, timestep_val=timestep_val,
         step_idx=step_idx, num_steps=num_steps,
@@ -263,7 +263,7 @@ def record_teacache_event(layer_id: int,
                 cal, layer_id, step_idx, num_steps, float(raw_diff))
         return
 
-    import verification_feedback_loop.verification_hook as vh
+    import feedback.vfl.verification_hook as vh
     event = vh.make_teacache_probe_event(
         layer_id=layer_id, timestep_val=timestep_val,
         step_idx=step_idx, num_steps=num_steps,

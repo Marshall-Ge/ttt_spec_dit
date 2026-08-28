@@ -27,7 +27,7 @@ description: TTT-DiT 扩散推理加速项目的标准工作流（开发 / 评�
 ### 3. 代码改动原则
 
 - **无 monkeypatch**：加速逻辑只走两条路 —— 模型内部显式 forward 分支（SpecA `current`/`cache_dic`、TeaCache `teacache_state`、TTT `ttt_state` 作为可选参数传入 `forward()`），或采样循环层（`teacache_step()` / `ttt_train_step` / `ttt_record_skip`）。
-- **VFL 不走 forward 参数**：通过 `verification_feedback_loop/vfl_state.py` 进程级单例钩入，不改 forward 签名。
+- **VFL 不走 forward 参数**：通过 `feedback.vfl/vfl_state.py` 进程级单例钩入，不改 forward 签名。
 - `eval/` 与 `dataset/` 目录不动（`dataset/imagenet.py` 的类 ID 翻译除外）。
 - Generator 职责缩小为管理 VAE/scheduler/device/dtype/encode_prompt，不参与 forward 逻辑。
 

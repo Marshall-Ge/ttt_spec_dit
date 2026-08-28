@@ -199,10 +199,10 @@ LoRA 只在 SpecA error_value 高的 step 激活（gating），正常 step 严�
 | 文件 | 作用 |
 |------|------|
 | `CLAUDE.md` | 项目全文档，§12 是 VFL |
-| `verification_feedback_loop/curvature_loss.py` | L3 loss（v5 实现） |
-| `verification_feedback_loop/async_trainer.py` | L3 daemon 线程 |
-| `verification_feedback_loop/replay_buffer.py` | L2 buffer 存储 |
-| `verification_feedback_loop/online_calibration.py` | L1 EMA 阈值 |
+| `feedback.vfl/curvature_loss.py` | L3 loss（v5 实现） |
+| `feedback.vfl/async_trainer.py` | L3 daemon 线程 |
+| `feedback.vfl/replay_buffer.py` | L2 buffer 存储 |
+| `feedback.vfl/online_calibration.py` | L1 EMA 阈值 |
 | `models/dit.py:370-411` | SpecA check_layer 录 `true_feature` 的位置 |
 | `run_dit.py:821` | 推理模型预 attach LoRA 的入口 |
 | `vfl.log` | v5 实验完整日志（4188 行） |

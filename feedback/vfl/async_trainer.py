@@ -51,9 +51,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from verification_feedback_loop.config import VFLConfig, DEFAULT_VFL_CONFIG
-from verification_feedback_loop.curvature_loss import compute_training_loss
-from verification_feedback_loop.lora_adapter import (
+from feedback.vfl.config import VFLConfig, DEFAULT_VFL_CONFIG
+from feedback.vfl.curvature_loss import compute_training_loss
+from feedback.vfl.lora_adapter import (
     attach_lora,
     attach_lora_all_layers,
     detach_lora,
@@ -64,7 +64,7 @@ from verification_feedback_loop.lora_adapter import (
     freeze_backbone,
     count_lora_params,
 )
-from verification_feedback_loop.replay_buffer import StratifiedReplayBuffer
+from feedback.vfl.replay_buffer import StratifiedReplayBuffer
 
 
 # ===========================================================================
@@ -121,7 +121,7 @@ def _collect_existing_lora_wrappers(transformer):
     LoRALinear（继承 nn.Module 而非 nn.Linear），TypeError 被
     attach_lora_to_block 的 except 吞掉。
     """
-    from verification_feedback_loop.lora_adapter import (
+    from feedback.vfl.lora_adapter import (
         _LORA_TARGET_PATHS, LoRALinear)
     wrappers: Dict[int, Dict[str, Any]] = {}
     for layer_idx, block in enumerate(transformer.transformer_blocks):
@@ -505,7 +505,7 @@ class AsyncTrainingWorker:
         # 若长期接近 0, 说明 supervised loss 在 no-op 起点退化 (信号源 bug 复现)。
         # 遍历 modules() 而非 _layer_wrappers：监控独立于字典填充状态，
         # 即使未来收集逻辑再次出问题也能直接反映训练副本的真实参数。
-        from verification_feedback_loop.lora_adapter import LoRALinear
+        from feedback.vfl.lora_adapter import LoRALinear
         b_norms = []
         for module in self._train_model.modules():
             if isinstance(module, LoRALinear):
@@ -620,7 +620,7 @@ class AsyncTrainingWorker:
 # spawn 线程; layer 选择走老的 select_top_k_layers 路径。
 
 
-from verification_feedback_loop.lora_adapter import select_top_k_layers  # noqa: E402
+from feedback.vfl.lora_adapter import select_top_k_layers  # noqa: E402
 
 
 class AsyncTrainer:

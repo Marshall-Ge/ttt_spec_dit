@@ -43,10 +43,10 @@ from accelerators.teacache import (
 )
 
 # VFL (Verification Feedback Loop) — delegates to shared module.
-# All globals and hooks live in ``verification_feedback_loop.vfl_state``.
+# All globals and hooks live in ``feedback.vfl.vfl_state``.
 # We re-export the public setters/getters for backward compatibility and keep
 # only PixArt-specific constants + thin recording wrappers that pass ``model="pixart"``.
-from verification_feedback_loop.vfl_state import (
+from feedback.vfl.vfl_state import (
     set_vfl_buffer,
     set_vfl_calibrator,
     get_vfl_buffer,

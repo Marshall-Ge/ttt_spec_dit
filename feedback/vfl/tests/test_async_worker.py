@@ -13,7 +13,7 @@ Verifies:
      ``get_latest_checkpoint`` still returns the last good one).
 
 Run:
-    python verification_feedback_loop/tests/test_async_worker.py
+    python feedback.vfl/tests/test_async_worker.py
 """
 
 import os
@@ -27,19 +27,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 import torch
 import torch.nn as nn
 
-from verification_feedback_loop.config import VFLConfig
-from verification_feedback_loop.replay_buffer import (
+from feedback.vfl.config import VFLConfig
+from feedback.vfl.replay_buffer import (
     StratifiedReplayBuffer,
     AnchorSample,
 )
-from verification_feedback_loop.verification_hook import make_speca_event
-from verification_feedback_loop.lora_adapter import (
+from feedback.vfl.verification_hook import make_speca_event
+from feedback.vfl.lora_adapter import (
     attach_lora_all_layers,
     find_latest_checkpoint,
     save_lora_checkpoint,
     LoRALinear,
 )
-from verification_feedback_loop.async_trainer import AsyncTrainingWorker
+from feedback.vfl.async_trainer import AsyncTrainingWorker
 
 
 # ===========================================================================
@@ -323,7 +323,7 @@ def test_train_once_crash_does_not_poison_worker():
             base_model_version="stub-v1",
         )
         # Force _train_once to raise by monkey-patching compute_training_loss
-        from verification_feedback_loop import async_trainer as at_mod
+        from feedback.vfl import async_trainer as at_mod
 
         def boom(*a, **kw):
             raise RuntimeError("simulated training crash")

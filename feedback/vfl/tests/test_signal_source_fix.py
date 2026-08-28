@@ -8,7 +8,7 @@ Verifies:
   4. Backward compat: events without block_input_hidden fall back to vanilla
 
 Run:
-    python verification_feedback_loop/tests/test_signal_source_fix.py
+    python feedback.vfl/tests/test_signal_source_fix.py
 """
 
 import os
@@ -22,16 +22,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from accelerators.speca import SpecACache, SpecAState, speca_init
-from verification_feedback_loop.curvature_loss import (
+from feedback.vfl.curvature_loss import (
     compute_training_loss,
     _run_block_dit,
     _run_block_pixart,
 )
-from verification_feedback_loop.verification_hook import (
+from feedback.vfl.verification_hook import (
     VerificationEvent,
     make_speca_event,
 )
-from verification_feedback_loop.lora_adapter import (
+from feedback.vfl.lora_adapter import (
     attach_lora_all_layers,
     LoRALinear,
 )

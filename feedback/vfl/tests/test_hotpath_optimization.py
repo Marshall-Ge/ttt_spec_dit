@@ -22,14 +22,14 @@ import time
 
 import torch
 
-from verification_feedback_loop import (
+from feedback.vfl import (
     OnlineCalibrator,
     StratifiedReplayBuffer,
     set_vfl_buffer,
     set_vfl_calibrator,
     record_speca_event,
 )
-from verification_feedback_loop.verification_hook import VerificationEvent
+from feedback.vfl.verification_hook import VerificationEvent
 
 
 # ===========================================================================

@@ -4,12 +4,12 @@
 import pytest
 import torch
 
-from verification_feedback_loop.replay_buffer import (
+from feedback.vfl.replay_buffer import (
     StratifiedReplayBuffer,
     AnchorSample,
     _Stratum,
 )
-from verification_feedback_loop.verification_hook import (
+from feedback.vfl.verification_hook import (
     VerificationEvent,
     make_timestep_bucket,
 )

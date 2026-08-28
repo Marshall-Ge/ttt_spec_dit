@@ -358,17 +358,17 @@ Taylor 预测在 layer 20 的误差，是 layers 0-19 累计 Taylor 近似误差
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
-| `verification_feedback_loop/__init__.py` | 119 | 公共 API 导出 |
-| `verification_feedback_loop/vfl_state.py` | 274 | 全局状态 + record_speca/teacache_event |
-| `verification_feedback_loop/verification_hook.py` | 269 | M1: VerificationEvent + make_*_event + record_event |
-| `verification_feedback_loop/online_calibration.py` | 344 | M2: _EMAThreshold + OnlineCalibrator |
-| `verification_feedback_loop/replay_buffer.py` | 392 | M3: _Stratum + StratifiedReplayBuffer |
-| `verification_feedback_loop/lora_adapter.py` | 447 | M4: LoRALinear + attach/detach/checkpoint |
-| `verification_feedback_loop/curvature_loss.py` | 407 | M5: trajectory_curvature_loss + compute_training_loss |
-| `verification_feedback_loop/async_trainer.py` | 691 | M6: AsyncTrainingWorker (Phase 2) + AsyncTrainer (legacy) |
-| `verification_feedback_loop/config.py` | 113 | VFLConfig dataclass |
-| `verification_feedback_loop/eval_gate.py` | ~120 | M7: EvalGate (not wired) |
-| `verification_feedback_loop/version_registry.py` | ~120 | M8: VersionRegistry (not wired) |
+| `feedback.vfl/__init__.py` | 119 | 公共 API 导出 |
+| `feedback.vfl/vfl_state.py` | 274 | 全局状态 + record_speca/teacache_event |
+| `feedback.vfl/verification_hook.py` | 269 | M1: VerificationEvent + make_*_event + record_event |
+| `feedback.vfl/online_calibration.py` | 344 | M2: _EMAThreshold + OnlineCalibrator |
+| `feedback.vfl/replay_buffer.py` | 392 | M3: _Stratum + StratifiedReplayBuffer |
+| `feedback.vfl/lora_adapter.py` | 447 | M4: LoRALinear + attach/detach/checkpoint |
+| `feedback.vfl/curvature_loss.py` | 407 | M5: trajectory_curvature_loss + compute_training_loss |
+| `feedback.vfl/async_trainer.py` | 691 | M6: AsyncTrainingWorker (Phase 2) + AsyncTrainer (legacy) |
+| `feedback.vfl/config.py` | 113 | VFLConfig dataclass |
+| `feedback.vfl/eval_gate.py` | ~120 | M7: EvalGate (not wired) |
+| `feedback.vfl/version_registry.py` | ~120 | M8: VersionRegistry (not wired) |
 | `models/dit.py` | 716 | DiT forward 中的 VFL hook 点 + _vfl_record_* helpers |
 | `run_dit.py` | 1208 | VFL 初始化的入口 + anchor 收集 + VFL stats 聚合 |
 | `config.py` (root) | 101 | SPECA_DEFAULTS 等全局默认值 |

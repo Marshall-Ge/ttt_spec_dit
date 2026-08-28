@@ -36,11 +36,13 @@
 │   ├── timing.py              #   CudaTimer, _GenerationProfiler, _record_profile_stage
 │   ├── serialization.py       #   _clean, _covr_* canonical JSON / hash / sentinel / accounting
 │   └── common.py             #   latent_seed_for_index, get_vfl_checkpoint_dir, prune_checkpoints
-├── pipelines/                 # 编排层(结构规范 §2;Generator 迁移中)
+├── pipelines/                 # 编排层(结构规范 §2)
+│   ├── dit.py                 #   DiTGenerator(类条件;含 TTT 训练路径)
+│   ├── pixart.py              #   PixArtGenerator(t2i/c2i;T5 编码)
 │   └── hooks/covr_hook.py     #   COVR 采样循环钩子(需要 transformer/scheduler 的 _covr_* 函数)
-├── run_dit.py                 # DiTGenerator + run_c2i(args) — DiT 编排器/采样入口，集成 TTT/VFL/COVR
+├── run_dit.py                 # run_c2i(args) — DiT 编排入口(Generator 在 pipelines/dit.py)，集成 TTT/VFL/COVR
 ├── run_dit_shared.py          # 兼容 shim: 历史 _covr_* / _GenerationProfiler 名字 re-export(新代码 import utils)
-├── run_pixart.py              # PixArtGenerator + run_t2i/run_c2i — 集成 VFL（无 TTT）
+├── run_pixart.py              # run_t2i/run_c2i — PixArt 编排入口(Generator 在 pipelines/pixart.py)，集成 VFL（无 TTT）
 ├── dit_coef.json              # DiT TeaCache 标定系数 (poly4, 50 步标定)
 ├── pixart_coef.json           # PixArt TeaCache 标定系数
 ├── continual_inference_runner.py  # Session 3 入口: 单类 N 图流 TTT session, γ 课表 + CSV 遥测
@@ -72,7 +74,7 @@
 │   ├── conf_budget_controller.py # P1 运行时: Cusum + ConfBudgetController (session 级预算梯决策,
 │   │                          #   无 tensor/模型依赖; 离线 gate harness 消费同一份代码)
 │   └── timestep_feedback.py   # Session-level per-timestep defect learner: clipped IPW, p_min, hard budget, state gate
-├── verification_feedback_loop/    # VFL 子系统 (三层架构, 详见 §12; 计划迁至 feedback/vfl/)
+├── feedback/vfl/    # VFL 子系统 (三层架构, 详见 §12)
 │   ├── __init__.py            # 导出所有公共符号
 │   ├── config.py              # VFLConfig: accept_sample_rate, buffer_capacity_per_stratum, loRA_rank...
 │   ├── verification_hook.py   # VerificationEvent + record_event + make_timestep_bucket (3 桶)
@@ -116,7 +118,7 @@
 1. **模型内部显式分支** — SpecA 的 `current`/`cache_dic`、TeaCache 的 `teacache_state`、TTT 的 `ttt_state` 都作为可选参数传入 `forward()`，在 pos_embed 和 blocks 之间做决策
 2. **采样循环层** — `teacache_step()` 在循环中计数；TTT 的 `ttt_train_step` / `ttt_record_skip` 也在循环层调用
 
-**VFL 不走 forward 参数**，而是通过 `verification_feedback_loop/vfl_state.py` 的进程级全局单例（`_vfl_buffer` / `_vfl_calibrator` / `_vfl_step_idx`）钩入。`models/dit.py` 和 `models/pixart.py` 在 SpecA check_layer 和 TeaCache calc 步后直接调用 `_vfl_record_speca_event` / `_vfl_record_teacache_event`（通过 vfl_state 全局 hook），不改 forward 签名。这是有意为之：VFL 是旁路观测/校准，不参与前向计算。
+**VFL 不走 forward 参数**，而是通过 `feedback/vfl/vfl_state.py` 的进程级全局单例（`_vfl_buffer` / `_vfl_calibrator` / `_vfl_step_idx`）钩入。`models/dit.py` 和 `models/pixart.py` 在 SpecA check_layer 和 TeaCache calc 步后直接调用 `_vfl_record_speca_event` / `_vfl_record_teacache_event`（通过 vfl_state 全局 hook），不改 forward 签名。这是有意为之：VFL 是旁路观测/校准，不参与前向计算。
 
 **Generator 保留**，但职责缩小为：管理 VAE/scheduler/device/dtype/encode_prompt。不参与 forward 逻辑。
 
@@ -307,7 +309,7 @@ Cross-attention 入口是 raw hidden_states（不是 norm2 调制后的），输
 `run_dit.py:977-991`：每个 micro-epoch 约 19M FLOPs (fwd~6M + bwd~12M + opt~1M)。`--ttt` 启用后 FLOPs 数值会比纯 TeaCache 略高。
 
 ### 8.13 VFL checkpoint 自动加载但不经 EvalGate
-`run_dit.py:759-769`：推理启动时 `find_latest_checkpoint()` 加载历史 LoRA，但主流程未调用 `EvalGate.evaluate()` 验证。生产化前需补 canary 闸门（参考 `verification_feedback_loop/demo_e2e.py`）。
+`run_dit.py:759-769`：推理启动时 `find_latest_checkpoint()` 加载历史 LoRA，但主流程未调用 `EvalGate.evaluate()` 验证。生产化前需补 canary 闸门（参考 `feedback/vfl/demo_e2e.py`）。
 
 ### 8.14 VFL 与 TTT 可同时启用
 两者互不依赖：TTT 改进缓存**内容**，VFL 改进缓存**决策**。`run_dit.py:920` 检查 `args.ttt` 和 `vfl_buf` 可组合使用。但实测组合较小，建议先单独验证。
@@ -529,7 +531,7 @@ use_ttt = use_teacache and ttt_state is not None    # 必须叠加在 TeaCache �
 
 ### 12.6 L3 canary 发布现状
 
-`EvalGate` 定义了双闸门，但 `run_dit.py` 主流程中**未实际调用 `EvalGate.evaluate()`** 自动发布——当前 checkpoint 自动加载 (`find_latest_checkpoint()`) 但跳过 gate 验证。完整 canary 自动发布流程仅在 `verification_feedback_loop/demo_e2e.py` 中实现，是参考代码。生产化时需要补这个环节。
+`EvalGate` 定义了双闸门，但 `run_dit.py` 主流程中**未实际调用 `EvalGate.evaluate()`** 自动发布——当前 checkpoint 自动加载 (`find_latest_checkpoint()`) 但跳过 gate 验证。完整 canary 自动发布流程仅在 `feedback/vfl/demo_e2e.py` 中实现，是参考代码。生产化时需要补这个环节。
 
 ## 13. COVR runtime 边界（可选插件）
 

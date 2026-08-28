@@ -4,11 +4,11 @@
 import math
 import torch
 
-from verification_feedback_loop.online_calibration import (
+from feedback.vfl.online_calibration import (
     OnlineCalibrator,
     _EMAThreshold,
 )
-from verification_feedback_loop.verification_hook import (
+from feedback.vfl.verification_hook import (
     VerificationEvent,
     make_timestep_bucket,
 )

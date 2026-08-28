@@ -10,7 +10,7 @@ Verifies:
   6. Optimizer step changes parameters through the new loss.
 
 Run:
-    python verification_feedback_loop/tests/test_compute_training_loss.py
+    python feedback.vfl/tests/test_compute_training_loss.py
 """
 
 import os
@@ -21,9 +21,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 import torch
 import torch.nn as nn
 
-from verification_feedback_loop.curvature_loss import compute_training_loss
-from verification_feedback_loop.replay_buffer import AnchorSample
-from verification_feedback_loop.verification_hook import (
+from feedback.vfl.curvature_loss import compute_training_loss
+from feedback.vfl.replay_buffer import AnchorSample
+from feedback.vfl.verification_hook import (
     make_speca_event,
     make_teacache_probe_event,
 )

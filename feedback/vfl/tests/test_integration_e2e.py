@@ -7,7 +7,7 @@ Verifies:
   3. No import errors, no signature mismatches
 
 Run:
-    python verification_feedback_loop/tests/test_integration_e2e.py
+    python feedback.vfl/tests/test_integration_e2e.py
 """
 
 import sys
@@ -30,7 +30,7 @@ def test_synthetic_event_flow():
     print("Test 1: Synthetic Event Flow")
     print("=" * 60)
 
-    from verification_feedback_loop import (
+    from feedback.vfl import (
         VerificationEvent, record_event, make_timestep_bucket,
         StratifiedReplayBuffer, OnlineCalibrator,
     )
@@ -172,7 +172,7 @@ def test_real_dit_generation():
         DiTTransformer2D, set_vfl_buffer, set_vfl_calibrator,
         get_vfl_buffer, set_vfl_step_info,
     )
-    from verification_feedback_loop import StratifiedReplayBuffer, OnlineCalibrator
+    from feedback.vfl import StratifiedReplayBuffer, OnlineCalibrator
 
     # Check model availability
     model_path = os.path.join(DIT_REPO, "transformer", "diffusion_pytorch_model.bin")

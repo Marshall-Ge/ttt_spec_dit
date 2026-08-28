@@ -19,7 +19,7 @@ from diffusers import DDIMScheduler
 from config import DIT_REPO
 from models.dit import DiTTransformer2D, set_vfl_buffer, set_vfl_calibrator, set_vfl_step_info
 from accelerators.speca import speca_init
-from verification_feedback_loop import (
+from feedback.vfl import (
     StratifiedReplayBuffer, OnlineCalibrator, VFLConfig, AsyncTrainer,
 )
 from dataset.imagenet import ImageNetDataset
